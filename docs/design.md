@@ -70,6 +70,10 @@ fsync errors are data loss: fail the write or quarantine the disk, never retry-a
 (fsyncgate — the kernel marks pages clean after a failed fsync). Directory fsync after rename
 is mandatory. "Acknowledged" is precisely defined in the commit-point rule above.
 
+The harness (`test/crash_test.go`) SIGKILLs a real `kavod` process mid-flight under 100
+concurrent uploads, restarts it on the same data directory, and asserts that every
+acknowledged write is byte-identical and that nothing is readable in a partial state.
+
 ## S3 subset (milestone 9)
 
 PUT, GET, DELETE, LIST, multipart upload, SigV4 — nothing else (no IAM/ACLs/versioning/
@@ -97,6 +101,12 @@ External validation: Ceph `s3-tests` via config file + tox; report the pass coun
   mismatch is found. The transfer then aborts short of the promised `Content-Length`, so the
   client always sees a failed transfer — but it may have received corrupt bytes. Verifying
   before sending would mean buffering a whole chunk per request. Same trade-off MinIO makes.
+- **Killing a process is not killing a machine**: SIGKILL proves commit ordering and rename
+  atomicity, but the page cache survives it, so the harness cannot prove fsync actually
+  reached the platter. That needs power-loss or filesystem fault injection (milestone 10).
+- **Interrupted uploads leak chunks**: chunks committed before a crash whose manifest never
+  landed are unreachable and never reclaimed. Harmless but unbounded until a GC pass exists
+  (manifests are the only roots, so a mark-and-sweep is straightforward).
 - **Metadata ceiling**: per-object manifests in etcd cap object count (etcd practical limit
   ~2–8 GB). Fine for the ~100 GB working set; the at-scale answer is volume/needle packing
   (SeaweedFS/Haystack).

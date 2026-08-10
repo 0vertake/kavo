@@ -62,6 +62,8 @@ Rules that make these structural:
 - Modular branches and PRs, one logical component each.
 - Branches: `feat/<technical-description>` (also `fix/`, `chore/`, `refactor/`).
 - Commits: conventional — `feat: <description>` (also `fix:`, `chore:`, `refactor:`).
+- After finishing a piece of work, end the response with ready-to-run `git add` +
+  `git commit` commands naming the exact files. The user runs them.
 
 ## Boundaries
 
