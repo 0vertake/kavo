@@ -5,6 +5,7 @@ package peer_test
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"errors"
 	"hash/crc32"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/0vertake/kavo/internal/api"
+	"github.com/0vertake/kavo/internal/meta"
 	"github.com/0vertake/kavo/internal/peer"
 	"github.com/0vertake/kavo/internal/store"
 )
@@ -23,7 +25,8 @@ import (
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
 // newPeer starts a node serving the peer protocol and returns its address and
-// data root.
+// data root. It is a whole node, manifest store included, because that is what a
+// peer pushes chunks to in production.
 func newPeer(t *testing.T) (addr, root string) {
 	t.Helper()
 	root = t.TempDir()
@@ -31,7 +34,13 @@ func newPeer(t *testing.T) (addr, root string) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	srv := httptest.NewServer(api.New(s, 1024))
+	m, err := meta.Open([]string{meta.EndpointFromEnv()}, "/kavo-test/"+rand.Text())
+	if err != nil {
+		t.Fatalf("meta.Open (is etcd up? try `make etcd`): %v", err)
+	}
+	t.Cleanup(func() { m.Close() })
+
+	srv := httptest.NewServer(api.New(s, m, 1024))
 	t.Cleanup(srv.Close)
 	return strings.TrimPrefix(srv.URL, "http://"), root
 }

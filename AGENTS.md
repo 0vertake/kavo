@@ -13,9 +13,12 @@ not API surface. Full design and milestones: `docs/design.md`. Research notes wi
 ## Commands
 
 - `make build` — build all binaries
-- `make test` — unit + integration tests (always runs with `-race`)
+- `make test` — unit + integration tests (always runs with `-race`); starts etcd first, so
+ Docker must be running. Tests that touch metadata use a real etcd, never a fake.
 - `make lint` — `go vet` + `gofmt` check
-- `make up` / `make down` — 6-node dev cluster + etcd via Docker Compose (once `deploy/compose.yaml` exists)
+- `make etcd` — start just etcd (idempotent)
+- `make up` / `make down` — dev dependencies via Docker Compose (`deploy/compose.yaml`).
+ Currently etcd only; kavod nodes join it once replication lands.
 
 Run `make test` before declaring any task done.
 
@@ -29,8 +32,11 @@ Run `make test` before declaring any task done.
 Rules that make these structural:
 
 - **Commit point**: a write is acknowledged only when W chunk replicas (or the required EC
-  shards) are fsynced on distinct nodes AND the object manifest is committed to etcd via a
-  compare-and-swap transaction. Readers resolve objects only through committed manifests.
+ shards) are fsynced on distinct nodes AND the object manifest is committed to etcd. Readers
+ resolve objects only through committed manifests. A plain etcd `Put` is enough for this: it
+ is atomic and serialized, so a concurrent overwrite yields one manifest or the other, never a
+ mix. Compare-and-swap arrives with chunk garbage collection, which needs to know which
+ revision it superseded.
 - **fsync discipline**: chunk commit is write temp → fsync file → rename → fsync directory.
   An fsync error means the data is gone — fail the write or quarantine the disk. Never
   retry-and-trust fsync (fsyncgate: the kernel marks pages clean after a failed fsync).
