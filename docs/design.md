@@ -92,6 +92,11 @@ External validation: Ceph `s3-tests` via config file + tox; report the pass coun
 
 - **Small objects**: at 1 KB, etcd round-trips and manifest overhead dominate. MinIO inlines
   small objects into metadata for this reason; kavo documents the trade-off.
+- **Corruption is detected at chunk end, not before**: a streamed GET verifies each chunk's
+  checksum as it finishes, so bytes from a corrupt chunk can already be on the wire when the
+  mismatch is found. The transfer then aborts short of the promised `Content-Length`, so the
+  client always sees a failed transfer — but it may have received corrupt bytes. Verifying
+  before sending would mean buffering a whole chunk per request. Same trade-off MinIO makes.
 - **Metadata ceiling**: per-object manifests in etcd cap object count (etcd practical limit
   ~2–8 GB). Fine for the ~100 GB working set; the at-scale answer is volume/needle packing
   (SeaweedFS/Haystack).
