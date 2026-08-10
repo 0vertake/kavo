@@ -57,6 +57,12 @@ Rules that make these structural:
   S3 API surface beyond the locked subset (no IAM, ACLs, versioning, lifecycle) — that is
   an explicit anti-goal.
 
+## Git conventions
+
+- Modular branches and PRs, one logical component each.
+- Branches: `feat/<technical-description>` (also `fix/`, `chore/`, `refactor/`).
+- Commits: conventional — `feat: <description>` (also `fix:`, `chore:`, `refactor:`).
+
 ## Boundaries
 
 - Never create git commits, push, or open PRs unless explicitly asked.
