@@ -1,15 +1,22 @@
 package api
 
 import (
+	"bufio"
 	"bytes"
+	"cmp"
+	"fmt"
+	"hash/crc32"
 	"io"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/0vertake/kavo/internal/peer"
 	"github.com/0vertake/kavo/internal/store"
 )
 
@@ -154,6 +161,114 @@ func TestCorruptChunkFailsDownload(t *testing.T) {
 	if err == nil {
 		t.Fatalf("GET returned %d and %d bytes with no error, want a failed transfer",
 			resp.StatusCode, len(got))
+	}
+}
+
+// The peer endpoint is the door other nodes push data through, so its rejections
+// have to be precise. A 5xx tells a coordinator this node is faulty and may take
+// it out of rotation; malformed or short input from the sender must never do that.
+func TestPeerChunkPushRejections(t *testing.T) {
+	data := []byte("a chunk from a peer")
+	crc := crc32.Checksum(data, crc32.MakeTable(crc32.Castagnoli))
+
+	tests := []struct {
+		name      string
+		id        string // defaults to a valid id
+		crcHeader string
+		chunked   bool
+		want      int
+	}{
+		{name: "valid", crcHeader: fmt.Sprintf("%08x", crc), want: http.StatusOK},
+		{name: "missing checksum header", want: http.StatusBadRequest},
+		{name: "malformed checksum header", crcHeader: "not-hex", want: http.StatusBadRequest},
+		{name: "wrong checksum", crcHeader: "deadbeef", want: http.StatusBadRequest},
+		{name: "unknown length", crcHeader: fmt.Sprintf("%08x", crc), chunked: true, want: http.StatusLengthRequired},
+		// A bare ".." is normalised away by the HTTP stack before it arrives;
+		// percent-encoded, it reaches the handler and must be rejected as the
+		// caller's error rather than as this node being unhealthy.
+		{name: "escaped path traversal in id", id: "%2e%2e%2fescape", crcHeader: fmt.Sprintf("%08x", crc), want: http.StatusBadRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			id := cmp.Or(tt.id, "chunk1")
+			srv := newServer(t, t.TempDir())
+			req, err := http.NewRequest(http.MethodPut, srv.URL+"/peer/chunks/"+id, bytes.NewReader(data))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.crcHeader != "" {
+				req.Header.Set(peer.CRCHeader, tt.crcHeader)
+			}
+			if tt.chunked {
+				// An unknown-length body forces chunked encoding, which leaves
+				// the receiver with nothing to check the length against.
+				req.Body = io.NopCloser(bytes.NewReader(data))
+				req.ContentLength = -1
+			}
+
+			resp, err := srv.Client().Do(req)
+			if err != nil {
+				t.Fatalf("PUT: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tt.want {
+				body, _ := io.ReadAll(resp.Body)
+				t.Errorf("status = %d (%s), want %d", resp.StatusCode, bytes.TrimSpace(body), tt.want)
+			}
+		})
+	}
+}
+
+// A transfer cut off partway through must be blamed on the sender, not on this
+// node. Go's client refuses to send a body shorter than the length it declares,
+// so this speaks HTTP over a raw connection to produce the truncation a dropped
+// network link would.
+func TestPeerChunkPushTruncatedTransfer(t *testing.T) {
+	srv := newServer(t, t.TempDir())
+	data := []byte("a chunk from a peer")
+	crc := crc32.Checksum(data, crc32.MakeTable(crc32.Castagnoli))
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	sent := data[:len(data)-8]
+	req := fmt.Sprintf("PUT /peer/chunks/chunk1 HTTP/1.1\r\nHost: kavo\r\n"+
+		"X-Kavo-Crc32c: %08x\r\nContent-Length: %d\r\n\r\n%s", crc, len(data), sent)
+	if _, err := conn.Write([]byte(req)); err != nil {
+		t.Fatal(err)
+	}
+	// Half-close so the server reads EOF where it expected eight more bytes.
+	if err := conn.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Errorf("status = %d (%s), want 400: a truncated transfer is the sender's fault",
+			resp.StatusCode, bytes.TrimSpace(body))
+	}
+
+	// And the half-written chunk must not exist at all.
+	check, err := http.NewRequest(http.MethodGet, srv.URL+"/peer/chunks/chunk1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check.Header.Set(peer.CRCHeader, fmt.Sprintf("%08x", crc))
+	got, err := srv.Client().Do(check)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Body.Close()
+	if got.StatusCode != http.StatusNotFound {
+		t.Errorf("GET after a truncated push = %d, want 404", got.StatusCode)
 	}
 }
 
