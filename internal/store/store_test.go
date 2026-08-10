@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"errors"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -138,6 +139,78 @@ func TestReopenAfterCrash(t *testing.T) {
 	}
 }
 
+// A chunk arriving from a peer is only committed if it matches what the sender
+// declared. Anything else must leave no trace: a committed-but-wrong chunk would
+// be counted towards a write quorum and only found to be bad much later.
+func TestWriteChunkVerified(t *testing.T) {
+	data := []byte("chunk from a peer")
+	goodCRC := crc32.Checksum(data, castagnoli)
+	goodSize := int64(len(data))
+
+	tests := []struct {
+		name   string
+		crc    uint32
+		size   int64
+		reject bool
+	}{
+		{name: "matching", crc: goodCRC, size: goodSize},
+		{name: "corrupted in transit", crc: goodCRC ^ 0xffff, size: goodSize, reject: true},
+		{name: "truncated in transit", crc: goodCRC, size: goodSize + 10, reject: true},
+		{name: "longer than declared", crc: goodCRC, size: goodSize - 1, reject: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := mustOpen(t)
+			err := s.WriteChunkVerified("peer01", bytes.NewReader(data), tt.crc, tt.size)
+
+			if !tt.reject {
+				if err != nil {
+					t.Fatalf("WriteChunkVerified: %v", err)
+				}
+				got, err := readChunk(t, s, "peer01", goodCRC)
+				if err != nil || !bytes.Equal(got, data) {
+					t.Fatalf("read = (%q, %v), want (%q, nil)", got, err, data)
+				}
+				return
+			}
+
+			if !errors.Is(err, ErrVerificationFailed) {
+				t.Fatalf("WriteChunkVerified error = %v, want ErrVerificationFailed", err)
+			}
+			// Whatever the reason for rejection, nothing may be readable and no
+			// staged file may be left behind.
+			if _, err := s.ReadChunk("peer01", goodCRC); !errors.Is(err, ErrNotFound) {
+				t.Errorf("chunk is visible after a rejected write: %v", err)
+			}
+			entries, err := os.ReadDir(s.tmpDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 0 {
+				t.Errorf("tmp dir has %d leftover files after a rejected write", len(entries))
+			}
+		})
+	}
+}
+
+func TestVerifyRejectsAlteredStream(t *testing.T) {
+	data := []byte("bytes on the wire")
+	crc := crc32.Checksum(data, castagnoli)
+	altered := append([]byte(nil), data...)
+	altered[3] ^= 0xff
+
+	read := func(b []byte) error {
+		_, err := io.ReadAll(Verify(io.NopCloser(bytes.NewReader(b)), crc))
+		return err
+	}
+	if err := read(altered); !errors.Is(err, ErrChecksumMismatch) {
+		t.Fatalf("Verify error = %v, want ErrChecksumMismatch", err)
+	}
+	if err := read(data); err != nil {
+		t.Fatalf("Verify rejected intact data: %v", err)
+	}
+}
+
 func TestReadMissingChunk(t *testing.T) {
 	s := mustOpen(t)
 	if _, err := s.ReadChunk("nosuch", 0); !errors.Is(err, ErrNotFound) {
@@ -150,11 +223,11 @@ func TestReadMissingChunk(t *testing.T) {
 func TestInvalidIDs(t *testing.T) {
 	s := mustOpen(t)
 	for _, id := range []string{"", "a", "../escape", "a/b", `a\b`, "dot.dot"} {
-		if _, _, err := s.WriteChunk(id, strings.NewReader("x")); err == nil {
-			t.Errorf("WriteChunk(%q) accepted invalid id", id)
+		if _, _, err := s.WriteChunk(id, strings.NewReader("x")); !errors.Is(err, ErrInvalidID) {
+			t.Errorf("WriteChunk(%q) error = %v, want ErrInvalidID", id, err)
 		}
-		if _, err := s.ReadChunk(id, 0); err == nil {
-			t.Errorf("ReadChunk(%q) accepted invalid id", id)
+		if _, err := s.ReadChunk(id, 0); !errors.Is(err, ErrInvalidID) {
+			t.Errorf("ReadChunk(%q) error = %v, want ErrInvalidID", id, err)
 		}
 	}
 }
