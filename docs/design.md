@@ -44,10 +44,26 @@ of 3×; the rebuild-cost penalty is measured and reported honestly.
 ## Placement
 
 Object key → hash → one of **256 partitions** → nodes via a consistent-hash ring with
-**~128 vnodes per node** (the ~100–150 sweet spot; the milestone-3 distribution test verifies
-the choice). The partition indirection is what Ceph (placement groups), MinIO (erasure sets),
-and Garage (partitions) all do: rebalance tracking, repair queues, and "% of data moved" are
-per-partition, not per-object.
+**128 vnodes per node**. The partition indirection is what Ceph (placement groups), MinIO
+(erasure sets), and Garage (partitions) all do: rebalance tracking, repair queues, and "% of
+data moved" are per-partition, not per-object.
+
+A partition is the top 8 bits of the key hash, so it is also a contiguous span of the ring:
+one hash gives both the partition and where to start walking for its owners. Owners are the
+next N distinct nodes clockwise from the start of the span.
+
+The milestone-3 distribution test (`internal/ring/ring_test.go`) measures what 128 vnodes buys
+— worst per-node deviation from an even share of all 256×N ownership slots:
+
+| vnodes/node | 1 | 8 | 32 | 128 | 512 |
+|---|---|---|---|---|---|
+| 6 nodes | 53% | 35% | 15% | **8%** | 12% |
+| 12 nodes | 34% | 28% | 20% | **6%** | 22% |
+
+The curve flattens past roughly one vnode per partition: with only 256 partitions to hand out,
+the residual imbalance is set by partition count, not vnode count, and more vnodes merely
+reshuffle the same variance. 128 sits at the knee. At exactly N nodes the split is trivially
+perfect (every node owns every partition), so that case cannot judge the ring.
 
 ## Consistency model
 
@@ -101,6 +117,10 @@ External validation: Ceph `s3-tests` via config file + tox; report the pass coun
   mismatch is found. The transfer then aborts short of the promised `Content-Length`, so the
   client always sees a failed transfer — but it may have received corrupt bytes. Verifying
   before sending would mean buffering a whole chunk per request. Same trade-off MinIO makes.
+- **Capacity is balanced to ~±8%, and vnodes cannot fix it**: 256 partitions over 6 nodes
+  leaves a worst-case per-node deviation around 8% (measured above). The lever is more
+  partitions, not more vnodes — but partition count is fixed for the life of a cluster, so
+  kavo publishes the number instead of pretending the split is even.
 - **Killing a process is not killing a machine**: SIGKILL proves commit ordering and rename
   atomicity, but the page cache survives it, so the harness cannot prove fsync actually
   reached the platter. That needs power-loss or filesystem fault injection (milestone 10).
