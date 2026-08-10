@@ -33,6 +33,24 @@ Resolve the committed manifest from etcd, stream chunks from any live replica (R
 freshness checks), verify CRC32C per chunk, return data or an explicit error. Readers never
 see uncommitted state, so torn objects are structurally impossible.
 
+### Inter-node chunk transfer
+
+Plain HTTP with streaming bodies, no gRPC: a chunk transfer is one request with a body.
+
+- `PUT /peer/chunks/{id}` — `X-Kavo-Crc32c` and `Content-Length` are both mandatory. The
+  receiver verifies the staged data against them **before** committing, so a 200 means a
+  checked, fsynced replica exists and the coordinator may count it towards W. Committing an
+  unverified chunk would make the quorum a promise about data nobody validated.
+- `GET /peer/chunks/{id}` — the same header declares what the caller expects. Both ends
+  verify: the sender checks its disk copy as it streams, the receiver checks what came off the
+  wire. TCP's 16-bit checksum is not strong enough to be the only thing between a flipped bit
+  and a committed replica.
+
+**Fault attribution is part of the protocol.** Only a node's own failures may be reported as
+5xx, because a coordinator reading 5xx may take that node out of rotation. A bad checksum, a
+missing header, an unknown length, or a body that ends early are all the sender's fault and
+answered with 4xx.
+
 ### Erasure-coded mode (milestone 7)
 
 Per-chunk encoding: each 32–64 MB chunk is encoded in memory into 6 data + 3 parity shards
