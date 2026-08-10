@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"cmp"
+	crand "crypto/rand"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -16,19 +17,34 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/0vertake/kavo/internal/meta"
 	"github.com/0vertake/kavo/internal/peer"
 	"github.com/0vertake/kavo/internal/store"
 )
 
 const chunkSize = 1024
 
+// newServer starts a node whose chunks live under root. Manifests go to a real
+// etcd under a per-test prefix, so tests are isolated without faking the commit
+// point that everything else depends on.
 func newServer(t *testing.T, root string) *httptest.Server {
+	t.Helper()
+	return newServerWithPrefix(t, root, "/kavo-test/"+crand.Text())
+}
+
+func newServerWithPrefix(t *testing.T, root, prefix string) *httptest.Server {
 	t.Helper()
 	s, err := store.Open(root)
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	srv := httptest.NewServer(New(s, chunkSize))
+	m, err := meta.Open([]string{meta.EndpointFromEnv()}, prefix)
+	if err != nil {
+		t.Fatalf("meta.Open (is etcd up? try `make etcd`): %v", err)
+	}
+	t.Cleanup(func() { m.Close() })
+
+	srv := httptest.NewServer(New(s, m, chunkSize))
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -128,14 +144,14 @@ func TestOverwrite(t *testing.T) {
 	}
 }
 
-// The manifest commit is the durability point: an acknowledged PUT must still
-// be readable by a freshly opened store.
+// The manifest commit is the durability point: an acknowledged PUT must still be
+// readable by a node that reopens the same chunks and the same cluster prefix.
 func TestSurvivesRestart(t *testing.T) {
-	root := t.TempDir()
+	root, prefix := t.TempDir(), "/kavo-test/"+crand.Text()
 	data := randBytes(2 * chunkSize)
-	put(t, newServer(t, root), "persisted", data)
+	put(t, newServerWithPrefix(t, root, prefix), "persisted", data)
 
-	_, got, err := get(t, newServer(t, root), "persisted")
+	_, got, err := get(t, newServerWithPrefix(t, root, prefix), "persisted")
 	if err != nil {
 		t.Fatalf("read body: %v", err)
 	}

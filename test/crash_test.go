@@ -11,9 +11,9 @@ import (
 )
 
 const (
-	crashChunkSize = 16 << 10
-	uploaders      = 100
-	killAfterAcks  = 10
+	testChunkSize = 16 << 10
+	uploaders     = 100
+	killAfterAcks = 10
 )
 
 // payloadFor derives each object's bytes from its index so the verifier can
@@ -39,8 +39,8 @@ func key(i int) string { return fmt.Sprintf("bucket/obj%03d", i) }
 // it must be complete and correct.
 func TestCrashDuringConcurrentUploads(t *testing.T) {
 	bin := buildKavod(t)
-	dataDir := t.TempDir()
-	n := startNode(t, bin, dataDir, crashChunkSize)
+	dataDir, prefix := t.TempDir(), clusterPrefix()
+	n := startNode(t, bin, dataDir, prefix, testChunkSize)
 
 	var (
 		acked    [uploaders]bool
@@ -80,8 +80,8 @@ func TestCrashDuringConcurrentUploads(t *testing.T) {
 		t.Fatal("every upload finished before the kill landed: the crash path was never exercised")
 	}
 
-	// Restart on the same data directory.
-	restarted := startNode(t, bin, dataDir, crashChunkSize)
+	// Restart on the same data directory and cluster prefix.
+	restarted := startNode(t, bin, dataDir, prefix, testChunkSize)
 	verifyClient := &http.Client{}
 
 	survived, absent := 0, 0

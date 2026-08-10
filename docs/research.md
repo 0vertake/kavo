@@ -34,7 +34,8 @@ object/partition-scoped, throttled, resumable.
 
 - W + R > N gives read/write overlap ([Dynamo literature](https://www.unskewdata.com/blog/leaderless-replication)).
   Sloppy quorums + LWW lose acknowledged writes (Jepsen measured 28% loss on Cassandra QUORUM
-  under partition). kavo avoids the whole class: immutable chunks + etcd CAS commit point.
+  under partition). kavo avoids the whole class: immutable chunks + a single serialized etcd
+  commit point.
 
 ## Erasure coding
 

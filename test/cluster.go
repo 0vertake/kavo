@@ -3,6 +3,7 @@ package test
 
 import (
 	"bytes"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +12,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/0vertake/kavo/internal/meta"
 )
 
 // node is a kavod process under test.
@@ -23,9 +26,14 @@ type node struct {
 	logs    *bytes.Buffer
 }
 
-// startNode builds kavod once per test and launches it against dataDir. The
-// same dataDir can be handed to a later startNode call to simulate a restart.
-func startNode(t *testing.T, bin, dataDir string, chunkSize int) *node {
+// clusterPrefix isolates a test's manifests in etcd. It has to be unique per
+// run: etcd outlives the test, so a reused prefix would resolve objects whose
+// chunks were left behind in a previous run's data directory.
+func clusterPrefix() string { return "/kavo-test/" + rand.Text() }
+
+// startNode builds kavod once per test and launches it against dataDir. Handing
+// the same dataDir and prefix to a later startNode call simulates a restart.
+func startNode(t *testing.T, bin, dataDir, prefix string, chunkSize int) *node {
 	t.Helper()
 	n := &node{
 		t:       t,
@@ -38,6 +46,8 @@ func startNode(t *testing.T, bin, dataDir string, chunkSize int) *node {
 		"-addr", n.addr,
 		"-data", dataDir,
 		"-chunk-size", fmt.Sprint(chunkSize),
+		"-etcd", meta.EndpointFromEnv(),
+		"-cluster", prefix,
 	)
 	n.cmd.Stdout = n.logs
 	n.cmd.Stderr = n.logs

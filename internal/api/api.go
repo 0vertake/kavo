@@ -3,7 +3,6 @@
 package api
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,15 +10,17 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/0vertake/kavo/internal/meta"
 	"github.com/0vertake/kavo/internal/object"
 	"github.com/0vertake/kavo/internal/peer"
 	"github.com/0vertake/kavo/internal/store"
 )
 
 // New returns a handler serving objects on /objects/{key...} for clients, and
-// chunks on /peer/chunks/{id} for other nodes.
-func New(s *store.Store, chunkSize int64) http.Handler {
-	h := &handler{store: s, chunkSize: chunkSize}
+// chunks on /peer/chunks/{id} for other nodes. Chunks live in s; the manifests
+// that make them an object live in m.
+func New(s *store.Store, m *meta.Store, chunkSize int64) http.Handler {
+	h := &handler{store: s, meta: m, chunkSize: chunkSize}
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /objects/{key...}", h.put)
 	mux.HandleFunc("GET /objects/{key...}", h.get)
@@ -30,11 +31,12 @@ func New(s *store.Store, chunkSize int64) http.Handler {
 
 type handler struct {
 	store     *store.Store
+	meta      *meta.Store
 	chunkSize int64
 }
 
-// put streams the body into chunks and then commits the manifest. The commit
-// is the acknowledgement point: until PutMeta returns, the chunks on disk are
+// put streams the body into chunks and then commits the manifest to etcd. The
+// commit is the acknowledgement point: until it returns, the chunks on disk are
 // unreferenced and the object does not exist.
 func (h *handler) put(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
@@ -48,13 +50,7 @@ func (h *handler) put(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "write failed", http.StatusInternalServerError)
 		return
 	}
-	data, err := json.Marshal(m)
-	if err != nil {
-		log.Printf("put %s: marshal manifest: %v", key, err)
-		http.Error(w, "write failed", http.StatusInternalServerError)
-		return
-	}
-	if err := h.store.PutMeta(key, data); err != nil {
+	if err := h.meta.Commit(r.Context(), key, m); err != nil {
 		log.Printf("put %s: commit manifest: %v", key, err)
 		http.Error(w, "write failed", http.StatusInternalServerError)
 		return
@@ -146,19 +142,13 @@ func declaredCRC(r *http.Request) (uint32, error) {
 
 func (h *handler) get(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
-	data, err := h.store.GetMeta(key)
+	m, err := h.meta.Get(r.Context(), key)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
+		if errors.Is(err, meta.ErrNotFound) {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
-		log.Printf("get %s: read manifest: %v", key, err)
-		http.Error(w, "read failed", http.StatusInternalServerError)
-		return
-	}
-	var m object.Manifest
-	if err := json.Unmarshal(data, &m); err != nil {
-		log.Printf("get %s: corrupt manifest: %v", key, err)
+		log.Printf("get %s: resolve manifest: %v", key, err)
 		http.Error(w, "read failed", http.StatusInternalServerError)
 		return
 	}

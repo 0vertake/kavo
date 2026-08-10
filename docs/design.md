@@ -23,7 +23,10 @@ node is healed automatically — with published numbers behind each claim.
 2. Each chunk fans out to the N=3 nodes owning the object's partition; each node persists via
    write temp → fsync file → rename → fsync directory, then acks.
 3. After W=2 acks per chunk, and all chunks done, the gateway commits the object manifest
-   (chunk list, locations, checksums, size, version) to etcd in one compare-and-swap txn.
+   (chunk list, locations, checksums, size, version) to etcd in one atomic `Put`. That is
+   enough: etcd serializes it, so a concurrent overwrite of the same key resolves to one
+   manifest or the other and never a mix of both. Compare-and-swap is only needed to reclaim
+   the chunks of the manifest being replaced, so it lands with garbage collection.
 4. Only then is the client acked. **The etcd commit is the commit point** — the same model as
    S3's `CompleteMultipartUpload`: parts are invisible until atomically assembled.
 
@@ -135,6 +138,9 @@ External validation: Ceph `s3-tests` via config file + tox; report the pass coun
   mismatch is found. The transfer then aborts short of the promised `Content-Length`, so the
   client always sees a failed transfer — but it may have received corrupt bytes. Verifying
   before sending would mean buffering a whole chunk per request. Same trade-off MinIO makes.
+- **Objects are readable only from the node that stored them, until fanout lands**: manifests
+  are cluster-wide in etcd, but chunks are still local, so another node resolves the manifest
+  and then cannot find the chunks. Replication (milestone 4) is what closes this.
 - **Capacity is balanced to ~±8%, and vnodes cannot fix it**: 256 partitions over 6 nodes
   leaves a worst-case per-node deviation around 8% (measured above). The lever is more
   partitions, not more vnodes — but partition count is fixed for the life of a cluster, so

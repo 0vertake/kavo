@@ -5,7 +5,6 @@
 //
 //	tmp/                 in-flight writes; wiped on Open
 //	chunks/<id[:2]>/<id> committed chunks (raw bytes, no header)
-//	meta/<sha256(key)>   object metadata blobs, keyed by object key
 //
 // Chunk files hold raw data only. Checksums (CRC32C) are computed here but
 // persisted by the caller in the object manifest; reads verify against the
@@ -13,9 +12,6 @@
 package store
 
 import (
-	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -52,7 +48,6 @@ var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 type Store struct {
 	tmpDir    string
 	chunksDir string
-	metaDir   string
 }
 
 // Open initializes the store layout under root and discards any leftover
@@ -61,13 +56,12 @@ func Open(root string) (*Store, error) {
 	s := &Store{
 		tmpDir:    filepath.Join(root, "tmp"),
 		chunksDir: filepath.Join(root, "chunks"),
-		metaDir:   filepath.Join(root, "meta"),
 	}
 	// Files in tmp/ were never acknowledged, so dropping them is always safe.
 	if err := os.RemoveAll(s.tmpDir); err != nil {
 		return nil, fmt.Errorf("store: clean tmp: %w", err)
 	}
-	for _, dir := range []string{s.tmpDir, s.chunksDir, s.metaDir} {
+	for _, dir := range []string{s.tmpDir, s.chunksDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, fmt.Errorf("store: init %s: %w", dir, err)
 		}
@@ -197,35 +191,8 @@ func Verify(r io.ReadCloser, want uint32) io.ReadCloser {
 	return &verifyingReader{r: r, want: want}
 }
 
-// PutMeta durably stores a metadata blob for an object key, replacing any
-// previous one atomically. This is the local stand-in for the etcd commit: the
-// object becomes readable exactly when this returns nil.
-func (s *Store) PutMeta(key string, data []byte) error {
-	_, _, err := s.durableWrite(s.metaPath(key), bytes.NewReader(data), nil)
-	return err
-}
-
-// GetMeta returns the metadata blob stored for key, or ErrNotFound.
-func (s *Store) GetMeta(key string) ([]byte, error) {
-	data, err := os.ReadFile(s.metaPath(key))
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("%w: %s", ErrNotFound, key)
-		}
-		return nil, fmt.Errorf("store: read meta %s: %w", key, err)
-	}
-	return data, nil
-}
-
 func (s *Store) chunkPath(id string) string {
 	return filepath.Join(s.chunksDir, id[:2], id)
-}
-
-// metaPath hashes the key so that any legal object key — slashes, dots,
-// unicode, up to 1 KiB — maps to a safe fixed-length filename.
-func (s *Store) metaPath(key string) string {
-	sum := sha256.Sum256([]byte(key))
-	return filepath.Join(s.metaDir, hex.EncodeToString(sum[:]))
 }
 
 func validateID(id string) error {
