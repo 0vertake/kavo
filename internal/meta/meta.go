@@ -151,23 +151,46 @@ func (s *Store) CommitIfUnchanged(ctx context.Context, key string, m object.Mani
 	return nil
 }
 
-// ScanObjects returns up to limit objects whose keys sort after the given key, in
-// key order. Passing "" starts at the beginning.
+// After is the smallest key that sorts strictly after key, for a caller that has
+// finished with one key and wants the scan to resume past it.
+func After(key string) string { return key + "\x00" }
+
+// PastPrefix is the smallest key that sorts after everything beginning with
+// prefix, which is how a listing steps over a whole group of keys without reading
+// them. It is empty for the empty prefix, since nothing sorts past everything.
+func PastPrefix(prefix string) string {
+	for i := len(prefix) - 1; i >= 0; i-- {
+		if prefix[i] < 0xff {
+			return prefix[:i] + string(prefix[i]+1)
+		}
+	}
+	return ""
+}
+
+// ScanObjects returns up to limit objects whose keys start with prefix, starting
+// at from and in key order. Empty strings mean "no prefix" and "from the
+// beginning"; use After to resume past a key already handled.
 //
-// Repair walks every object this way rather than holding them all in memory: the
-// scan is what finds missing copies, and a cluster's manifest list outgrows a
-// single response long before its data outgrows its disks.
-func (s *Store) ScanObjects(ctx context.Context, after string, limit int64) ([]Object, error) {
-	// A key sorts after `after` if it is greater; \x00 is the smallest possible
-	// successor, so this skips exactly the key already seen.
-	from := s.key(after) + "\x00"
-	resp, err := s.client.Get(ctx, from,
-		clientv3.WithRange(clientv3.GetPrefixRangeEnd(s.objectPrefix())),
+// Repair walks every object this way rather than holding them all in memory, and
+// a listing pages through one bucket's worth: the scan is what finds missing
+// copies, and a cluster's manifest list outgrows a single response long before its
+// data outgrows its disks.
+func (s *Store) ScanObjects(ctx context.Context, prefix, from string, limit int64) ([]Object, error) {
+	start := s.key(prefix)
+	if from > prefix {
+		start = s.key(from)
+	}
+	end := clientv3.GetPrefixRangeEnd(s.key(prefix))
+	if start >= end {
+		return nil, nil // the scan starts past everything the prefix covers
+	}
+	resp, err := s.client.Get(ctx, start,
+		clientv3.WithRange(end),
 		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend),
 		clientv3.WithLimit(limit),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("meta: scan objects after %q: %w", after, err)
+		return nil, fmt.Errorf("meta: scan objects with prefix %q from %q: %w", prefix, from, err)
 	}
 
 	objects := make([]Object, 0, len(resp.Kvs))

@@ -39,9 +39,10 @@ func New(c *cluster.Coordinator, creds sigv4.Credentials) http.Handler {
 	mux.HandleFunc("DELETE /{bucket}/{key...}", h.authed(h.deleteObject))
 	// A bucket is a prefix, so it exists as soon as it is named. Clients ask
 	// before uploading, and answering "no such bucket" would be a lie that stops
-	// them. "/{bucket}/" reaches the object route with an empty key, which
+	// them. "/{bucket}/" reaches the object routes with an empty key, which
 	// getObject sends here.
 	mux.HandleFunc("HEAD /{bucket}", h.authed(h.headBucket))
+	mux.HandleFunc("GET /{bucket}", h.authed(h.listObjects))
 	mux.HandleFunc("/", h.authed(h.unsupported))
 	return mux
 }
@@ -98,14 +99,13 @@ func (h *handler) putObject(w http.ResponseWriter, r *http.Request) {
 func (h *handler) getObject(w http.ResponseWriter, r *http.Request) {
 	key, ok := objectKey(r)
 	if !ok {
-		// A trailing slash names the bucket. HEAD of one is the existence check
-		// clients make before uploading; GET of one is a listing, which is the
-		// next milestone.
+		// A trailing slash names the bucket: HEAD is the existence check clients
+		// make before uploading, GET is a listing.
 		if r.Method == http.MethodHead {
 			h.headBucket(w, r)
 			return
 		}
-		fail(w, r, errNotImplemented, nil)
+		h.listObjects(w, r)
 		return
 	}
 	m, err := h.cluster.Resolve(r.Context(), key)

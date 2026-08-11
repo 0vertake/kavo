@@ -123,6 +123,93 @@ func TestTheAWSCLIRoundTripsObjects(t *testing.T) {
 	}
 }
 
+// `aws s3 ls` is what a listing is for, and it exercises the parts of one no unit
+// test reaches: the CLI asks with a delimiter and encoding-type=url, and renders
+// grouped prefixes as directories. `sync` and `rm --recursive` list first too, so
+// this is also the check that they can find anything at all.
+func TestTheAWSCLIListsAndSyncs(t *testing.T) {
+	requireAWSCLI(t)
+	bin := buildKavod(t)
+	nodes := startCluster(t, bin, clusterPrefix(), 1<<20, clusterSize)
+
+	// A small tree, so that a listing has both a file at the top and directories.
+	// The awkward name is deliberate: the CLI asks for encoding-type=url and
+	// decodes what comes back, so a key whose raw form is itself a valid escape
+	// sequence is the one that catches a server that did not encode.
+	local := t.TempDir()
+	files := []string{"top.txt", "dir/a.txt", "dir/b.txt", "dir/sub/c.txt", "dir/50%25 off + more.txt"}
+	for _, name := range files {
+		path := filepath.Join(local, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("contents of "+name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// sync uploads the tree, and lists to work out what to upload.
+	if out, err := nodes[0].aws(t, "s3", "sync", local, "s3://bucket/tree"); err != nil {
+		t.Fatalf("sync up: %v\n%s", err, out)
+	}
+
+	// The top level shows one file and one directory, which is the delimiter
+	// working: without it every key below dir/ would be listed here.
+	out, err := nodes[1].aws(t, "s3", "ls", "s3://bucket/tree/")
+	if err != nil {
+		t.Fatalf("ls: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "PRE dir/") {
+		t.Errorf("ls did not group dir/ as a prefix:\n%s", out)
+	}
+	if !strings.Contains(out, "top.txt") {
+		t.Errorf("ls did not list top.txt:\n%s", out)
+	}
+	if strings.Contains(out, "a.txt") {
+		t.Errorf("ls listed a key from inside dir/ at the top level:\n%s", out)
+	}
+
+	// Recursive listing reaches every key, and only this bucket's keys.
+	out, err = nodes[2].aws(t, "s3", "ls", "--recursive", "s3://bucket/")
+	if err != nil {
+		t.Fatalf("ls --recursive: %v\n%s", err, out)
+	}
+	for _, name := range files {
+		if !strings.Contains(out, "tree/"+name) {
+			t.Errorf("ls --recursive did not list tree/%s:\n%s", name, out)
+		}
+	}
+
+	// And back down again: sync writes the tree to a new directory, which only
+	// works if the listing named keys that can be fetched.
+	back := t.TempDir()
+	if out, err := nodes[0].aws(t, "s3", "sync", "s3://bucket/tree", back); err != nil {
+		t.Fatalf("sync down: %v\n%s", err, out)
+	}
+	for _, name := range files {
+		got, err := os.ReadFile(filepath.Join(back, name))
+		if err != nil {
+			t.Errorf("sync down did not restore %s: %v", name, err)
+			continue
+		}
+		if want := "contents of " + name; string(got) != want {
+			t.Errorf("%s came back as %q, want %q", name, got, want)
+		}
+	}
+
+	// rm --recursive lists, deletes what it found, and leaves an empty bucket.
+	if out, err := nodes[1].aws(t, "s3", "rm", "--recursive", "s3://bucket/tree"); err != nil {
+		t.Fatalf("rm --recursive: %v\n%s", err, out)
+	}
+	out, err = nodes[2].aws(t, "s3", "ls", "--recursive", "s3://bucket/")
+	if err != nil {
+		t.Fatalf("ls after rm: %v\n%s", err, out)
+	}
+	if strings.TrimSpace(out) != "" {
+		t.Errorf("objects survived rm --recursive:\n%s", out)
+	}
+}
+
 // The other operations a client leans on: describing an object without reading it,
 // and deleting it. `s3api` rather than `s3` so that the failure names the request
 // rather than a copy that gave up.

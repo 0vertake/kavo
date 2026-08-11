@@ -265,7 +265,7 @@ func TestAClientOverwriteBeatsARebalance(t *testing.T) {
 // carries the revision it was read at.
 func scanFor(t testing.TB, n *node, key string) meta.Object {
 	t.Helper()
-	objs, err := n.m.ScanObjects(context.Background(), "", 64)
+	objs, err := n.m.ScanObjects(context.Background(), "", "", 64)
 	if err != nil {
 		t.Fatal(err)
 	}

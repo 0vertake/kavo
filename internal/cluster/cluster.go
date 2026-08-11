@@ -166,9 +166,11 @@ func (c *Coordinator) Put(ctx context.Context, key string, body io.Reader, opts 
 	m.Coding = c.scheme
 	m.ETag = cmp.Or(opts.ETag, hex.EncodeToString(sum.Sum(nil)))
 	m.ContentType = opts.ContentType
-	// Truncated to the millisecond S3 reports, so that what a client is told and
-	// what a later listing says are the same instant.
-	m.Modified = time.Now().UTC().Truncate(time.Millisecond)
+	// Truncated to the second, because that is all the Last-Modified header can
+	// carry. A listing reports the same field to the millisecond, so keeping any
+	// finer resolution would have a HEAD and a listing disagree about when the same
+	// object was written.
+	m.Modified = time.Now().UTC().Truncate(time.Second)
 
 	if err := c.meta.Commit(ctx, key, m); err != nil {
 		return object.Manifest{}, err
