@@ -11,7 +11,7 @@ import (
 	"github.com/0vertake/kavo/internal/cluster"
 )
 
-func mustRepair(t *testing.T, n *node, rate int64) cluster.Stats {
+func mustRepair(t testing.TB, n *node, rate int64) cluster.Stats {
 	t.Helper()
 	st, err := n.c.Repair(context.Background(), rate)
 	if err != nil {
