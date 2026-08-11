@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/0vertake/kavo/internal/api"
 	"github.com/0vertake/kavo/internal/cluster"
+	"github.com/0vertake/kavo/internal/ec"
 	"github.com/0vertake/kavo/internal/meta"
 	"github.com/0vertake/kavo/internal/object"
 	"github.com/0vertake/kavo/internal/store"
@@ -31,6 +33,7 @@ func main() {
 	repairRate := flag.Int64("repair-rate", cluster.DefaultRepairRate, "bytes per second this node may use to restore missing copies (0 for unlimited)")
 	repairInterval := flag.Duration("repair-interval", cluster.DefaultRepairInterval, "pause between repair passes")
 	scrubInterval := flag.Duration("scrub-interval", cluster.DefaultScrubInterval, "pause between scrub passes, which re-read this node's chunks to find rot")
+	erasure := flag.String("ec", "", `erasure-code new objects as "data+parity" (for example 6+3) instead of replicating them`)
 	flag.Parse()
 
 	// Peers dial this address, so a bind address like ":8080" is not enough:
@@ -57,6 +60,16 @@ func main() {
 	ctx := context.Background()
 
 	c := cluster.New(*id, self, s, m, *chunkSize)
+	// Only new writes are affected. Every object records the code it was written
+	// with, so switching modes — or getting the flag wrong on one node — cannot
+	// strand data that is already stored.
+	scheme, err := parseScheme(*erasure)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := c.EncodeWith(scheme); err != nil {
+		log.Fatal(err)
+	}
 	if err := m.Join(ctx, *id, self, *leaseTTL); err != nil {
 		log.Fatalf("join cluster: %v", err)
 	}
@@ -88,12 +101,28 @@ func main() {
 	// which is far too late for that to be the first time anyone looked.
 	go c.ScrubLoop(ctx, *repairRate, *scrubInterval)
 
-	log.Printf("kavod %s node %s listening on %s (advertising %s, data %s, chunk size %d, etcd %s%s, lease %v)",
-		version.Version, *id, *addr, self, *dataDir, *chunkSize, *etcd, *prefix, *leaseTTL)
+	redundancy := "replicated"
+	if scheme != (ec.Scheme{}) {
+		redundancy = "erasure-coded " + scheme.String()
+	}
+	log.Printf("kavod %s node %s listening on %s (advertising %s, data %s, chunk size %d, %s, etcd %s%s, lease %v)",
+		version.Version, *id, *addr, self, *dataDir, *chunkSize, redundancy, *etcd, *prefix, *leaseTTL)
 
 	// No read/write timeouts: uploads are multi-gigabyte streams, so any
 	// wall-clock deadline would kill legitimate transfers.
 	if err := http.ListenAndServe(*addr, api.New(c, s)); err != nil {
 		log.Fatalf("serve: %v", err)
 	}
+}
+
+// parseScheme reads "data+parity", or "" for replication.
+func parseScheme(s string) (ec.Scheme, error) {
+	if s == "" {
+		return ec.Scheme{}, nil
+	}
+	var scheme ec.Scheme
+	if _, err := fmt.Sscanf(s, "%d+%d", &scheme.Data, &scheme.Parity); err != nil {
+		return ec.Scheme{}, fmt.Errorf("erasure code %q is not in data+parity form, for example 6+3", s)
+	}
+	return scheme, nil
 }

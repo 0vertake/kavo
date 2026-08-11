@@ -63,6 +63,34 @@ The default repair cap of 32 MB/s is ~10× below what a heal can actually do, wh
 relationship: the cap, not the hardware, decides how much a heal disturbs clients. Scrubbing is
 checksum-bound and effectively free at any sane interval.
 
+## Replication against erasure coding
+
+4+2 rather than the 6+3 default, because a `k+m` code needs `k+m` nodes and the test cluster has
+six. Same tolerance as three copies in both cases: two nodes may be lost.
+
+| | replicated (3 copies) | coded (4+2) |
+| --- | --- | --- |
+| stored per byte of object | 3.00x | 1.50x |
+| PUT 4 KB | 26 ms | 41 ms |
+| PUT 1 MB | 26 ms / 41 MB/s | 43 ms / 25 MB/s |
+| PUT 64 MB | 141 ms / 477 MB/s | 166 ms / 404 MB/s |
+| GET 64 MB | 44 ms / 1.5 GB/s | 57 ms / 1.2 GB/s |
+| GET 64 MB, two shards gone | — | 54 ms / 1.2 GB/s |
+| allocated per 64 MB GET | 132 KB | 168 MB |
+
+A large coded write costs 15% more wall time and stores half the bytes, which is the trade the mode
+exists to make. Reads are ~23% slower, and **a degraded read is no slower than a healthy one** —
+reconstruction arithmetic is not the expensive part, moving the shards is, and a degraded read moves
+the same number of shards.
+
+Small writes are where coding hurts: 41 ms against 26 ms, because a 4 KB object still becomes six
+shards on six nodes, so it pays six disk barriers instead of three to store 4 KB.
+
+The memory column is the honest cost. A replicated read streams a chunk through; a coded read has to
+hold a chunk's shards *and* the reconstructed chunk before any of it is valid. Sizing each shard
+read from the manifest instead of growing it took this from 315 MB to 168 MB per 64 MB object.
+Still flat in object size — the invariant — but ~2.6x a chunk rather than ~1x.
+
 ## What the numbers changed
 
 **A 4 KB object was allocating 34 MB.** The write path allocated one full chunk up front, so

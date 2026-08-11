@@ -268,6 +268,75 @@ func BenchmarkScrub(b *testing.B) {
 	}
 }
 
+// The two redundancy modes side by side, which is the comparison the mode exists
+// to win: 4+2 stores 1.5x the object where replication stores 3x, and this is
+// what that costs on the read and write paths. Reads are measured with every
+// shard present and again with the code's full tolerance missing, since a decode
+// that has to solve for missing shards is the case erasure coding is judged on.
+func BenchmarkRedundancyModes(b *testing.B) {
+	for _, size := range []int64{4 << 10, 1 << 20, 64 << 20} {
+		data := randBytes(int(size))
+
+		b.Run("replicated/put/"+sizeName(size), func(b *testing.B) {
+			tc := benchCluster(b)
+			b.SetBytes(size)
+			b.ReportAllocs()
+			for i := 0; b.Loop(); i++ {
+				putHTTP(b, tc.nodes["n1"], "bench/rep/"+strconv.Itoa(i), data)
+			}
+		})
+		b.Run("coded/put/"+sizeName(size), func(b *testing.B) {
+			tc := newECCluster(b, benchNodes, object.DefaultChunkSize)
+			b.SetBytes(size)
+			b.ReportAllocs()
+			for i := 0; b.Loop(); i++ {
+				putHTTP(b, tc.nodes["n1"], "bench/ec/"+strconv.Itoa(i), data)
+			}
+		})
+
+		b.Run("replicated/get/"+sizeName(size), func(b *testing.B) {
+			tc := benchCluster(b)
+			const key = "bench/rep/read"
+			owners, outsider := tc.owners(b, key)
+			putHTTP(b, owners[0], key, data)
+			b.SetBytes(size)
+			b.ReportAllocs()
+			for b.Loop() {
+				getHTTP(b, outsider, key)
+			}
+		})
+		b.Run("coded/get/"+sizeName(size), func(b *testing.B) {
+			tc := newECCluster(b, benchNodes, object.DefaultChunkSize)
+			const key = "bench/ec/read"
+			putHTTP(b, tc.nodes["n1"], key, data)
+			b.SetBytes(size)
+			b.ReportAllocs()
+			for b.Loop() {
+				getHTTP(b, tc.nodes["n1"], key)
+			}
+		})
+		b.Run("coded/get-degraded/"+sizeName(size), func(b *testing.B) {
+			tc := newECCluster(b, benchNodes, object.DefaultChunkSize)
+			const key = "bench/ec/degraded"
+			putHTTP(b, tc.nodes["n1"], key, data)
+			m, err := tc.nodes["n1"].c.Resolve(context.Background(), key)
+			if err != nil {
+				b.Fatal(err)
+			}
+			for i := range testScheme.Parity {
+				for _, ref := range m.Chunks {
+					tc.nodes[m.Nodes[i]].hide(b, ref.ShardID(i))
+				}
+			}
+			b.SetBytes(size)
+			b.ReportAllocs()
+			for b.Loop() {
+				getHTTP(b, tc.nodes["n1"], key)
+			}
+		})
+	}
+}
+
 // Chunking on its own, with no network and no disk, to separate the cost of
 // splitting a stream from the cost of storing it. If this is slow, nothing
 // downstream can be fast.
@@ -280,7 +349,7 @@ func BenchmarkChunking(b *testing.B) {
 			b.ResetTimer()
 			for b.Loop() {
 				_, err := object.Write(bytes.NewReader(data), object.DefaultChunkSize,
-					func(object.ChunkRef, []byte) error { return nil })
+					func(*object.ChunkRef, []byte) error { return nil })
 				if err != nil {
 					b.Fatal(err)
 				}

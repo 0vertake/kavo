@@ -26,8 +26,8 @@ func mustOpen(t *testing.T) (*store.Store, string) {
 
 // commitTo and fetchFrom place chunks on a local store, which is the simplest
 // backing there is; the cluster supplies replicated versions of the same pair.
-func commitTo(s *store.Store) func(ChunkRef, []byte) error {
-	return func(ref ChunkRef, data []byte) error {
+func commitTo(s *store.Store) func(*ChunkRef, []byte) error {
+	return func(ref *ChunkRef, data []byte) error {
 		return s.WriteChunkVerified(ref.ID, bytes.NewReader(data), ref.CRC, ref.Size)
 	}
 }
