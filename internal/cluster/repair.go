@@ -106,7 +106,12 @@ func (c *Coordinator) walk(ctx context.Context, task string, visit func(meta.Obj
 		return err
 	}
 	for {
-		objects, err := c.meta.ScanObjects(ctx, cursor, scanPage)
+		// The cursor names the last object handled, so the walk resumes past it.
+		from := ""
+		if cursor != "" {
+			from = meta.After(cursor)
+		}
+		objects, err := c.meta.ScanObjects(ctx, "", from, scanPage)
 		if err != nil {
 			return err
 		}

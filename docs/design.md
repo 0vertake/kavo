@@ -303,6 +303,31 @@ then reclaims chunks. The reverse order would drop chunks a live manifest still 
 key that is not there succeeds, because S3 promises an idempotent delete and clients build
 cleanup loops on it.
 
+### Listing
+
+`ListObjectsV2` only. Every current client uses it, and v1 differs in how it carries the resume
+point, so answering a v1 request with a v2 body would be worse than refusing it.
+
+Keys are stored as `bucket/key`, so a listing is a prefix scan and etcd returns it already
+sorted — which is the whole reason a listing is cheap. Paging reads etcd in fixed batches
+independent of the page the client asked for, because a page of entries and a page of keys are
+not the same thing once a delimiter is involved.
+
+**The delimiter is where listings go wrong.** A grouped prefix must be reported once, and the
+keys inside it must not be looked at again — including by the *next* page, which is the part that
+is easy to miss: a resume point that names the last key seen restarts inside the group and reports
+it a second time, so a client paging through a bucket sees the same directory over and over. The
+continuation token is therefore a *position*, not a key: for a page that ended inside a group it
+is the point just past everything the group covers. Within a page already fetched, the group's
+remaining keys are skipped in memory; across pages, they are never read at all.
+
+**`encoding-type=url` is correctness, not cosmetics.** Encoding down to the unreserved set, not
+`url.QueryEscape` and not `url.PathEscape`: the first turns a space into `+`, which a client
+unescaping paths hands back as a literal plus, and the second leaves `+` alone, which a client
+unescaping queries hands back as a space. Either mistake renames the key. A key whose raw form is
+itself a valid escape sequence — `100%25.txt` — is the one that proves it: sent unencoded, the
+`aws` CLI asks for `100%.txt` and gets a 404 for a key the listing had just named. That is a test.
+
 Error bodies are S3's XML with S3's codes, because the code is the part clients act on: an SDK
 retries `SlowDown`, refuses to retry `SignatureDoesNotMatch`, and turns `NoSuchKey` into a typed
 error applications branch on. A quorum failure is `SlowDown` — it says the write may succeed
@@ -413,6 +438,10 @@ implementation disagreeing is the only thing that catches a misreading.
   delete does not come back for it. Same GC pass fixes it.
 - **Multi-range requests are answered with the whole object**: `bytes=0-9,20-29` returns everything
   rather than a `multipart/byteranges` body. Allowed by HTTP, matches S3, and no S3 client asks.
+- **`ListObjects` v1 is refused**: only v2 is served. Every current client uses v2; a v1 client gets
+  `NotImplemented` rather than a body in the wrong shape.
+- **A listing is not a snapshot**: it pages through etcd, so an object written or deleted mid-listing
+  may or may not appear. S3 makes the same non-promise.
 - **Metadata ceiling**: per-object manifests in etcd cap object count (etcd practical limit
   ~2–8 GB). Fine for the ~100 GB working set; the at-scale answer is volume/needle packing
   (SeaweedFS/Haystack).
