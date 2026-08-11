@@ -288,10 +288,13 @@ empties a bucket by listing versions and bulk-deleting what it finds. None of th
 new: a bucket is still a prefix, and the version listing reports every object once with the id
 `null`, which is S3's own answer for a bucket that was never versioned.
 
-External validation: Ceph `s3-tests`. **169 of 886 pass, nothing errors**, and every failure is
+External validation: Ceph `s3-tests`. **151 of 886 pass, nothing errors**, and every failure is
 classified in `docs/s3-compatibility.md` — as an anti-goal, a consequence of buckets being prefixes,
 or a named gap. The suite found four real defects, three of which kavo's own tests could not see;
-they are listed there too.
+they are listed there too. It also found eighteen passes that were not real: a `PUT` to any bucket
+subresource reached the create-bucket handler and answered 200, so kavo was claiming to have
+configured lifecycle rules, policies and encryption it has no code for. Refusing them is what took
+the count from 169 to 151.
 
 ### Object API
 
