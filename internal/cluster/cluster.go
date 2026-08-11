@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/0vertake/kavo/internal/ec"
 	"github.com/0vertake/kavo/internal/meta"
 	"github.com/0vertake/kavo/internal/object"
 	"github.com/0vertake/kavo/internal/peer"
@@ -50,6 +51,10 @@ type Coordinator struct {
 	store     *store.Store
 	meta      *meta.Store
 	chunkSize int64
+	// scheme is how new objects are written: the zero Scheme replicates, and
+	// anything else erasure-codes. Only writes consult it — a reader follows the
+	// manifest, so changing the mode never strands data written under the old one.
+	scheme ec.Scheme
 }
 
 // New builds a coordinator that initially knows only about itself. Callers feed
@@ -58,6 +63,29 @@ func New(self, addr string, s *store.Store, m *meta.Store, chunkSize int64) *Coo
 	c := &Coordinator{self: self, addr: addr, store: s, meta: m, chunkSize: chunkSize}
 	c.SetMembers(nil)
 	return c
+}
+
+// EncodeWith switches new writes to an erasure code. The zero Scheme means
+// replication, which is the default.
+//
+// Call it before serving requests. It is not synchronised, because the redundancy
+// mode is configuration and configuration does not change under load — unlike
+// membership, which does and is.
+func (c *Coordinator) EncodeWith(s ec.Scheme) error {
+	if s != (ec.Scheme{}) && !s.Valid() {
+		return fmt.Errorf("cluster: %s is not a usable erasure code", s)
+	}
+	c.scheme = s
+	return nil
+}
+
+// width is how many nodes an object's chunks are spread over: N copies on N
+// nodes, or one shard each on as many nodes as the code has shards.
+func (c *Coordinator) width() int {
+	if c.scheme == (ec.Scheme{}) {
+		return Replicas
+	}
+	return c.scheme.Shards()
 }
 
 // SetMembers replaces this node's view of the cluster. Self is always included:
@@ -91,18 +119,31 @@ func (c *Coordinator) Put(ctx context.Context, key string, body io.Reader) (obje
 	// spreading an object's chunks over two different rings would leave later
 	// chunks on nodes the manifest does not name.
 	live := c.live.Load()
-	owners := live.ring.Owners(ring.PartitionFor(key), Replicas)
+	width := c.width()
+	owners := live.ring.Owners(ring.PartitionFor(key), width)
 	if len(owners) == 0 {
 		return object.Manifest{}, fmt.Errorf("cluster: no nodes available to place %q", key)
 	}
+	// A shard is identified by position, so a cluster smaller than the code has
+	// nowhere to put the rest. Replication can narrow to the nodes that exist;
+	// erasure coding cannot, and writing a chunk it can never rebuild would be
+	// worse than refusing it.
+	if c.scheme != (ec.Scheme{}) && len(owners) < width {
+		return object.Manifest{}, fmt.Errorf("cluster: %s needs %d nodes, cluster has %d",
+			c.scheme, width, len(owners))
+	}
 
-	m, err := object.Write(body, c.chunkSize, func(ref object.ChunkRef, data []byte) error {
-		return c.replicate(ctx, ref, data, owners, live)
+	m, err := object.Write(body, c.chunkSize, func(ref *object.ChunkRef, data []byte) error {
+		if c.scheme != (ec.Scheme{}) {
+			return c.encode(ctx, ref, data, owners, live)
+		}
+		return c.replicate(ctx, *ref, data, owners, live)
 	})
 	if err != nil {
 		return object.Manifest{}, err
 	}
 	m.Nodes = owners
+	m.Coding = c.scheme
 
 	if err := c.meta.Commit(ctx, key, m); err != nil {
 		return object.Manifest{}, err
@@ -120,7 +161,17 @@ func (c *Coordinator) Resolve(ctx context.Context, key string) (object.Manifest,
 // still has it.
 func (c *Coordinator) Stream(ctx context.Context, m object.Manifest, w io.Writer) error {
 	return object.Read(m, w, func(ref object.ChunkRef) (io.ReadCloser, error) {
-		return c.fetch(ctx, ref, m.Nodes)
+		if m.Coding == (ec.Scheme{}) {
+			return c.fetch(ctx, ref, m.Nodes)
+		}
+		// An erasure-coded chunk has to be whole before any of it is valid, so
+		// it is decoded into memory and then streamed. One chunk at a time
+		// either way: the object's size still does not decide the footprint.
+		chunk, err := c.decode(ctx, ref, m.Nodes, m.Coding)
+		if err != nil {
+			return nil, err
+		}
+		return io.NopCloser(bytes.NewReader(chunk)), nil
 	})
 }
 

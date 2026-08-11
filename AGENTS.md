@@ -52,7 +52,8 @@ Rules that make these structural:
   Any node coordinates any request.
 - Placement: object key → one of 256 partitions → nodes, via a consistent-hash ring with
   ~128 vnodes per node. Rebalance/repair bookkeeping is per-partition, never per-object.
-- Defaults: N=3, W=2, R=2 replication; EC mode is 6 data + 3 parity, encoded per chunk.
+- Defaults: N=3, W=2, R=2 replication; EC mode (`-ec=6+3`) is 6 data + 3 parity, encoded per
+ chunk, acknowledged at k+1 shards. The code is recorded per object, so both modes coexist.
 - Metadata: etcd only (manifests, membership leases, partition layout). Chunks are immutable —
   no vector clocks, no sloppy quorums, no read repair for correctness.
 - Inter-node chunk transfer: plain HTTP with streaming bodies. No gRPC.

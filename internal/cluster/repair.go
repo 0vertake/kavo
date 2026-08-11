@@ -7,6 +7,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/0vertake/kavo/internal/ec"
 	"github.com/0vertake/kavo/internal/meta"
 	"github.com/0vertake/kavo/internal/object"
 	"github.com/0vertake/kavo/internal/peer"
@@ -134,11 +135,17 @@ func (c *Coordinator) repairObject(ctx context.Context, o meta.Object, st *Stats
 	// would survey every object — N times the work — and several would race to
 	// push the same chunk to the same node.
 	live := c.live.Load()
-	owners := live.ring.Owners(ring.PartitionFor(o.Key), Replicas)
+	// One owner is all this asks for: the ring walks the same nodes in the same
+	// order whatever the width, so the first of three is the first of nine.
+	owners := live.ring.Owners(ring.PartitionFor(o.Key), 1)
 	if len(owners) == 0 || owners[0] != c.self {
 		return nil
 	}
 	st.Objects++
+
+	if o.Manifest.Coding != (ec.Scheme{}) {
+		return c.repairShards(ctx, o, st, pace, live)
+	}
 
 	var errs []error
 	for _, ref := range o.Manifest.Chunks {
@@ -167,6 +174,49 @@ func (c *Coordinator) repairObject(ctx context.Context, o meta.Object, st *Stats
 			st.Restored++
 			st.BytesRestored += ref.Size
 		}
+	}
+	return errors.Join(errs...)
+}
+
+// repairShards restores the shards of an erasure-coded object that their nodes no
+// longer have.
+//
+// The survey is per chunk rather than per shard, because rebuilding is per chunk:
+// one decode produces every missing shard of that chunk, so finding two gone
+// costs the same as finding one.
+func (c *Coordinator) repairShards(ctx context.Context, o meta.Object, st *Stats, pace *pacer, live *membership) error {
+	nodes := o.Manifest.Nodes
+	var errs []error
+	for _, ref := range o.Manifest.Chunks {
+		var missing []int
+		for i, node := range nodes {
+			// A shard's node is fixed by its position, so a node the cluster has
+			// lost cannot be substituted: putting shard 4 somewhere else would
+			// mean rewriting the manifest, which is rebalancing, not repair.
+			if _, member := live.peers[node]; !member {
+				continue
+			}
+			st.CopiesChecked++
+
+			held, err := c.holdsShard(ctx, node, ref, i, live)
+			if err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			if !held {
+				missing = append(missing, i)
+			}
+		}
+		if len(missing) == 0 {
+			continue
+		}
+		if err := c.restoreShards(ctx, ref, nodes, missing, o.Manifest.Coding, live, pace); err != nil {
+			st.Unrepairable += len(missing)
+			errs = append(errs, err)
+			continue
+		}
+		st.Restored += len(missing)
+		st.BytesRestored += int64(len(missing)) * shardSize(ref.Size, o.Manifest.Coding)
 	}
 	return errors.Join(errs...)
 }

@@ -2,13 +2,17 @@ module github.com/0vertake/kavo
 
 go 1.26.5
 
-require go.etcd.io/etcd/client/v3 v3.7.1
+require (
+	github.com/klauspost/reedsolomon v1.14.1
+	go.etcd.io/etcd/client/v3 v3.7.1
+)
 
 require (
 	github.com/coreos/go-semver v0.3.1 // indirect
 	github.com/coreos/go-systemd/v22 v22.7.0 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 // indirect
+	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	go.etcd.io/etcd/api/v3 v3.7.1 // indirect
 	go.etcd.io/etcd/client/pkg/v3 v3.7.1 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
