@@ -2,11 +2,14 @@
 package main
 
 import (
+	"cmp"
+	"context"
 	"flag"
-	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/0vertake/kavo/internal/api"
 	"github.com/0vertake/kavo/internal/cluster"
@@ -19,17 +22,22 @@ import (
 func main() {
 	id := flag.String("id", "n1", "this node's id in the cluster")
 	addr := flag.String("addr", ":8080", "address to listen on")
-	peerList := flag.String("peers", "", "every node as id=host:port, comma separated, including this one")
+	advertise := flag.String("advertise", "", "host:port other nodes should dial (default: -addr)")
 	dataDir := flag.String("data", "./data", "directory for chunks")
 	chunkSize := flag.Int64("chunk-size", object.DefaultChunkSize, "chunk size in bytes")
 	etcd := flag.String("etcd", meta.EndpointFromEnv(), "comma-separated etcd endpoints for manifests")
 	prefix := flag.String("cluster", "/kavo", "etcd key prefix identifying this cluster")
+	leaseTTL := flag.Duration("lease-ttl", meta.DefaultLeaseTTL, "how long this node may go unheard before the cluster declares it dead")
 	flag.Parse()
 
-	peers, err := parsePeers(*peerList, *id, *addr)
-	if err != nil {
-		log.Fatalf("peers: %v", err)
+	// Peers dial this address, so a bind address like ":8080" is not enough:
+	// discovering that at the first chunk transfer instead of at startup would
+	// mean a node that joins the ring and then fails every write sent to it.
+	self := cmp.Or(*advertise, *addr)
+	if host, _, err := net.SplitHostPort(self); err != nil || host == "" {
+		log.Fatalf("advertise address %q has no host for peers to dial; pass -advertise host:port", self)
 	}
+
 	s, err := store.Open(*dataDir)
 	if err != nil {
 		log.Fatalf("open store: %v", err)
@@ -40,35 +48,40 @@ func main() {
 	}
 	defer m.Close()
 
-	c, err := cluster.New(*id, peers, s, m, *chunkSize)
-	if err != nil {
-		log.Fatalf("cluster: %v", err)
+	// No signal handling: the store is crash-safe by construction, so dying
+	// abruptly is a tested path and a graceful shutdown would add nothing except
+	// a window where the node is out of the membership but still serving.
+	ctx := context.Background()
+
+	c := cluster.New(*id, self, s, m, *chunkSize)
+	if err := m.Join(ctx, *id, self, *leaseTTL); err != nil {
+		log.Fatalf("join cluster: %v", err)
 	}
 
-	log.Printf("kavod %s node %s listening on %s (data %s, chunk size %d, peers %v, etcd %s%s)",
-		version.Version, *id, *addr, *dataDir, *chunkSize, peers, *etcd, *prefix)
+	// Serving starts only once the real membership is known. Placing data on a
+	// view of the cluster that is just this node would acknowledge writes with
+	// fewer copies than the cluster could actually make.
+	updates := m.WatchMembers(ctx)
+	select {
+	case peers := <-updates:
+		c.SetMembers(peers)
+		log.Printf("kavod %s node %s is a member of %v", version.Version, *id, peers)
+	case <-time.After(*leaseTTL + 5*time.Second):
+		log.Fatalf("no membership from etcd %s within %v", *etcd, *leaseTTL+5*time.Second)
+	}
+	go func() {
+		for peers := range updates {
+			c.SetMembers(peers)
+			log.Printf("membership changed: %v", peers)
+		}
+	}()
+
+	log.Printf("kavod %s node %s listening on %s (advertising %s, data %s, chunk size %d, etcd %s%s, lease %v)",
+		version.Version, *id, *addr, self, *dataDir, *chunkSize, *etcd, *prefix, *leaseTTL)
 
 	// No read/write timeouts: uploads are multi-gigabyte streams, so any
 	// wall-clock deadline would kill legitimate transfers.
 	if err := http.ListenAndServe(*addr, api.New(c, s)); err != nil {
 		log.Fatalf("serve: %v", err)
 	}
-}
-
-// parsePeers turns id=host:port pairs into a membership map. A node given no
-// peers is a cluster of one, which is how a single-node install and the unit
-// tests run. Real membership arrives with etcd leases.
-func parsePeers(list, self, addr string) (map[string]string, error) {
-	if list == "" {
-		return map[string]string{self: addr}, nil
-	}
-	peers := make(map[string]string)
-	for entry := range strings.SplitSeq(list, ",") {
-		id, hostport, ok := strings.Cut(entry, "=")
-		if !ok || id == "" || hostport == "" {
-			return nil, fmt.Errorf("bad entry %q, want id=host:port", entry)
-		}
-		peers[id] = hostport
-	}
-	return peers, nil
 }

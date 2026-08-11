@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/0vertake/kavo/internal/cluster"
 	"github.com/0vertake/kavo/internal/ring"
@@ -83,28 +84,110 @@ func TestObjectSurvivesOwnerCrash(t *testing.T) {
 	}
 }
 
-// A write that cannot reach W owners must be refused, not acknowledged and lost.
-// The client has to be told, and told with a status it can retry on.
-func TestWriteIsRefusedWhenTooFewOwnersSurvive(t *testing.T) {
+// A write that cannot reach W owners must be refused rather than acknowledged and
+// lost — and then, once the cluster has noticed the nodes are gone, the same
+// write must succeed on the smaller ring. Refusing forever would make one dead
+// node enough to stop accepting data for the keys it owned.
+func TestWritesAreRefusedUntilMembershipCatchesUp(t *testing.T) {
 	bin := buildKavod(t)
 	nodes := startCluster(t, bin, clusterPrefix(), testChunkSize, clusterSize)
 
-	const key = "refused/write"
+	const key = "refused/then/accepted"
+	data := payloadFor(2)
+	client := &http.Client{}
 	owners, outsider := ownersOf(nodes, key)
 	owners[1].kill()
 	owners[2].kill()
 
-	status, err := outsider.put(&http.Client{}, key, payloadFor(2))
+	// Immediately: the leases have not expired, so the coordinator still counts
+	// the dead nodes as owners and cannot reach W.
+	status, err := outsider.put(client, key, data)
 	if err != nil {
 		t.Fatalf("PUT: %v", err)
 	}
 	if status != http.StatusServiceUnavailable {
-		t.Fatalf("PUT with %d of %d owners down = %d, want 503",
+		t.Fatalf("PUT with %d of %d owners just killed = %d, want 503",
 			cluster.Replicas-1, cluster.Replicas, status)
 	}
-
 	// Refusing is only half of it: nothing may be left that a reader can find.
-	if status, _, err := outsider.get(&http.Client{}, key); err != nil || status != http.StatusNotFound {
+	if status, _, err := outsider.get(client, key); err != nil || status != http.StatusNotFound {
 		t.Fatalf("GET after a refused write = (%d, %v), want (404, nil)", status, err)
+	}
+
+	// Once the leases expire the ring holds only live nodes, and the write has
+	// somewhere to go again.
+	outsider.waitForMembers(clusterSize - 2)
+	if status, err := outsider.put(client, key, data); err != nil || status != http.StatusOK {
+		t.Fatalf("PUT after membership converged = (%d, %v), want (200, nil)", status, err)
+	}
+	status, got, err := outsider.get(client, key)
+	if err != nil || status != http.StatusOK || !bytes.Equal(got, data) {
+		t.Fatalf("GET = (%d, %d bytes, %v), want (200, %d, nil)", status, len(got), err, len(data))
+	}
+}
+
+// Failure detection has to be bounded, or "the cluster notices" is not a
+// guarantee. The bound is the lease: a node that stops renewing is gone from
+// every other node's view within it, plus etcd's expiry sweep.
+func TestFailureIsDetectedWithinTheLease(t *testing.T) {
+	bin := buildKavod(t)
+	nodes := startCluster(t, bin, clusterPrefix(), testChunkSize, clusterSize)
+
+	dead, survivors := nodes[0], nodes[1:]
+	start := time.Now()
+	dead.kill()
+
+	const slack = 3 * time.Second
+	for _, n := range survivors {
+		gone := func(members map[string]string) bool {
+			_, still := members[dead.id]
+			return !still
+		}
+		if !n.awaitMembers(gone, testLeaseTTL+slack) {
+			t.Fatalf("%s still lists %s as a member %v after it was killed, want gone within %v",
+				n.id, dead.id, time.Since(start), testLeaseTTL+slack)
+		}
+	}
+	t.Logf("every survivor dropped the dead node within %v (lease %v)", time.Since(start), testLeaseTTL)
+
+	// The survivors must also agree on who is left, since disagreement about
+	// membership is disagreement about placement.
+	want := len(nodes) - 1
+	for _, n := range survivors {
+		members, err := n.members()
+		if err != nil {
+			t.Fatalf("members from %s: %v", n.id, err)
+		}
+		if len(members) != want {
+			t.Errorf("%s sees %d members, want %d: %v", n.id, len(members), want, members)
+		}
+	}
+}
+
+// A node joining an existing cluster must be picked up without restarting anyone,
+// and must be able to serve objects written before it arrived.
+func TestANewNodeJoinsAndServesExistingObjects(t *testing.T) {
+	bin := buildKavod(t)
+	prefix := clusterPrefix()
+	nodes := startCluster(t, bin, prefix, testChunkSize, clusterSize)
+
+	const key = "written/before/the/join"
+	data := payloadFor(3)
+	client := &http.Client{}
+	if status, err := nodes[0].put(client, key, data); err != nil || status != http.StatusOK {
+		t.Fatalf("PUT = (%d, %v), want (200, nil)", status, err)
+	}
+
+	joiner := launch(t, bin, "joiner", freePort(t), t.TempDir(), prefix, testChunkSize)
+	for _, n := range append([]*node{joiner}, nodes...) {
+		n.waitForMembers(clusterSize + 1)
+	}
+
+	// The joiner holds none of the object's chunks, so serving it means resolving
+	// the manifest from etcd and fetching from the owners it names.
+	status, got, err := joiner.get(client, key)
+	if err != nil || status != http.StatusOK || !bytes.Equal(got, data) {
+		t.Fatalf("GET from the new node = (%d, %d bytes, %v), want (200, %d, nil)",
+			status, len(got), err, len(data))
 	}
 }

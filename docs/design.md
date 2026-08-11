@@ -114,8 +114,28 @@ exactly one question: are enough copies durably on disk before the manifest comm
 
 ## Membership and repair
 
-- Nodes register in etcd with a lease (TTL ~5–10 s, keepalive at TTL/3); every node watches
-  the membership prefix. Lease expiry = failure detection within bounded time.
+Nodes register in etcd under a lease (default TTL 5 s, keepalive at TTL/3) and every node
+watches the membership prefix. The lease **is** the failure detector: a node that stops
+renewing — crashed, partitioned, or too wedged to heartbeat — has its key dropped by etcd, and
+every other node learns it left. No separate heartbeat protocol and no argument about who is
+up, because the same etcd that decides which manifests are committed decides who is a member.
+
+Two consequences that fall out of it:
+
+- **Detection is bounded, not merely eventual.** Measured with a 1-second lease, every
+  surviving node dropped a SIGKILLed node within 2.3 s — the lease plus etcd's expiry sweep.
+- **The ring holds only live nodes**, so writes for a dead node's keys continue on a smaller
+  ring instead of being refused until an operator intervenes. In the window before detection
+  they are refused with 503, since the coordinator still counts the dead owners and cannot
+  reach W. Existing objects are unaffected: their manifests name the nodes their chunks were
+  written to, so reads do not depend on the current ring.
+
+A node is always a member of its own ring, even before its registration lands, and a node that
+loses its lease re-registers itself. Serving starts only after the first membership arrives from
+etcd: a node that placed data while believing it was alone would acknowledge writes with fewer
+copies than the cluster could actually make.
+
+Repair:
 - The repair coordinator (own code, the interesting part) scans for under-replicated
   partitions, queues rebuilds, and is **rate-limited and resumable** — heal time is measured
   at several rate limits while serving client load (heal-time vs client-latency chart).
@@ -161,9 +181,13 @@ External validation: Ceph `s3-tests` via config file + tox; report the pass coun
 - **A degraded write stays degraded until repair runs**: acknowledging at W=2 of N=3 means the
   third copy is genuinely missing, and nothing yet notices. Reads still succeed because owners
   are tried in turn, but redundancy is below the configured level until milestone 6 restores it.
-- **Membership is a static flag**: every node is handed the same `-peers` list, so a node that
-  dies stays in the ring and a new one requires a restart everywhere. Nodes disagreeing about
-  the list would scatter chunks. etcd leases (milestone 5) make membership dynamic.
+- **A node that cannot reach etcd is out, even if it is healthy**: it cannot renew its lease, so
+  the cluster drops it, and it cannot commit manifests anyway. This makes etcd a hard dependency
+  for availability, which is the deliberate trade for having one place that decides what is true.
+- **Placement follows the live ring, so a flapping node moves where new objects go**: objects
+  written while it was out live on a different owner set. Reads are unaffected because manifests
+  record placement, but a node that flaps repeatedly spreads a key's objects over several sets,
+  which makes the eventual rebalance (milestone 8) more work.
 - **Capacity is balanced to ~±8%, and vnodes cannot fix it**: 256 partitions over 6 nodes
   leaves a worst-case per-node deviation around 8% (measured above). The lever is more
   partitions, not more vnodes — but partition count is fixed for the life of a cluster, so
