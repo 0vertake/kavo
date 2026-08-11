@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -28,20 +30,56 @@ import (
 const testChunkSize = 1024
 
 type node struct {
-	id   string
-	root string
-	srv  *httptest.Server
-	c    *cluster.Coordinator
+	id      string
+	root    string
+	addr    string
+	handler http.Handler
+	srv     *httptest.Server
+	revived *http.Server
+	m       *meta.Store
+	c       *cluster.Coordinator
 }
 
 // kill takes the node off the network. Its chunks stay on disk, so this is a
 // crashed or partitioned node rather than a lost disk.
-func (n *node) kill() { n.srv.Close() }
+func (n *node) kill() {
+	if n.revived != nil {
+		n.revived.Close()
+		n.revived = nil
+		return
+	}
+	n.srv.Close()
+}
+
+// revive brings a killed node back on the same address, which is what a restarted
+// process is: same id, same disk, same place in the ring.
+func (n *node) revive(t *testing.T) {
+	t.Helper()
+	l, err := net.Listen("tcp", n.addr)
+	if err != nil {
+		t.Fatalf("relisten on %s: %v", n.addr, err)
+	}
+	srv := &http.Server{Handler: n.handler}
+	n.revived = srv
+	go srv.Serve(l)
+	t.Cleanup(func() { srv.Close() })
+}
 
 // has reports whether this node's disk holds the chunk.
 func (n *node) has(ref object.ChunkRef) bool {
 	_, err := os.Stat(filepath.Join(n.root, "chunks", ref.ID[:2], ref.ID))
 	return err == nil
+}
+
+// loseChunks deletes this node's copies, which is what a replaced disk looks
+// like: the node is healthy and answers, it simply has nothing.
+func (n *node) loseChunks(t *testing.T, refs []object.ChunkRef) {
+	t.Helper()
+	for _, ref := range refs {
+		if err := os.Remove(filepath.Join(n.root, "chunks", ref.ID[:2], ref.ID)); err != nil {
+			t.Fatalf("remove chunk %s from %s: %v", ref.ID, n.id, err)
+		}
+	}
 }
 
 type testCluster struct {
@@ -86,11 +124,20 @@ func newClusterChunked(t *testing.T, n int, chunkSize int64) *testCluster {
 
 		c := cluster.New(id, peers[id], s, m, chunkSize)
 		c.SetMembers(peers)
-		srvs[i].Config.Handler = api.New(c, s)
+		handler := api.New(c, s)
+		srvs[i].Config.Handler = handler
 		srvs[i].Start()
 		t.Cleanup(srvs[i].Close)
 
-		tc.nodes[id] = &node{id: id, root: root, srv: srvs[i], c: c}
+		tc.nodes[id] = &node{
+			id:      id,
+			root:    root,
+			addr:    peers[id],
+			handler: handler,
+			srv:     srvs[i],
+			m:       m,
+			c:       c,
+		}
 	}
 	return tc
 }

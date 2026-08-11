@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"strings"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -95,9 +96,73 @@ func (s *Store) Get(ctx context.Context, key string) (object.Manifest, error) {
 	return m, nil
 }
 
+// Object is a manifest together with the key it is committed under.
+type Object struct {
+	Key      string
+	Manifest object.Manifest
+}
+
+// ScanObjects returns up to limit objects whose keys sort after the given key, in
+// key order. Passing "" starts at the beginning.
+//
+// Repair walks every object this way rather than holding them all in memory: the
+// scan is what finds missing copies, and a cluster's manifest list outgrows a
+// single response long before its data outgrows its disks.
+func (s *Store) ScanObjects(ctx context.Context, after string, limit int64) ([]Object, error) {
+	// A key sorts after `after` if it is greater; \x00 is the smallest possible
+	// successor, so this skips exactly the key already seen.
+	from := s.key(after) + "\x00"
+	resp, err := s.client.Get(ctx, from,
+		clientv3.WithRange(clientv3.GetPrefixRangeEnd(s.objectPrefix())),
+		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend),
+		clientv3.WithLimit(limit),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("meta: scan objects after %q: %w", after, err)
+	}
+
+	objects := make([]Object, 0, len(resp.Kvs))
+	for _, kv := range resp.Kvs {
+		key := strings.TrimPrefix(string(kv.Key), s.objectPrefix())
+		var m object.Manifest
+		if err := json.Unmarshal(kv.Value, &m); err != nil {
+			return nil, fmt.Errorf("meta: corrupt manifest for %s: %w", key, err)
+		}
+		objects = append(objects, Object{Key: key, Manifest: m})
+	}
+	return objects, nil
+}
+
+// SaveRepairCursor records how far a node's repair pass got, so that a restart
+// resumes instead of starting over. A heal that begins again from the first
+// object every time a process restarts never reaches the last one.
+func (s *Store) SaveRepairCursor(ctx context.Context, node, key string) error {
+	if _, err := s.client.Put(ctx, s.cursorKey(node), key); err != nil {
+		return fmt.Errorf("meta: save repair cursor for %s: %w", node, err)
+	}
+	return nil
+}
+
+// RepairCursor returns where this node's repair pass should resume, or "" to
+// start from the beginning.
+func (s *Store) RepairCursor(ctx context.Context, node string) (string, error) {
+	resp, err := s.client.Get(ctx, s.cursorKey(node))
+	if err != nil {
+		return "", fmt.Errorf("meta: read repair cursor for %s: %w", node, err)
+	}
+	if len(resp.Kvs) == 0 {
+		return "", nil
+	}
+	return string(resp.Kvs[0].Value), nil
+}
+
 // key namespaces an object key. Object keys may contain anything, including
 // slashes, which is fine: etcd keys are opaque byte strings, so the only thing
 // that matters is that the mapping is unambiguous.
-func (s *Store) key(objectKey string) string {
-	return path.Join(s.prefix, "objects") + "/" + objectKey
+func (s *Store) key(objectKey string) string { return s.objectPrefix() + objectKey }
+
+func (s *Store) objectPrefix() string { return path.Join(s.prefix, "objects") + "/" }
+
+func (s *Store) cursorKey(node string) string {
+	return path.Join(s.prefix, "repair", node, "cursor")
 }

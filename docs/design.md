@@ -135,11 +135,38 @@ loses its lease re-registers itself. Serving starts only after the first members
 etcd: a node that placed data while believing it was alone would acknowledge writes with fewer
 copies than the cluster could actually make.
 
-Repair:
-- The repair coordinator (own code, the interesting part) scans for under-replicated
-  partitions, queues rebuilds, and is **rate-limited and resumable** — heal time is measured
-  at several rate limits while serving client load (heal-time vs client-latency chart).
-- A background scrubber re-reads chunks, verifies checksums, and repairs bit rot from peers.
+### Repair
+
+Under-replication is a state to keep converging out of, not an event to react to. Two things
+cause it and neither announces itself: a write acknowledged at W=2 of N=3 leaves a copy that
+never existed, and a disk that comes back empty leaves copies that did. So every node runs a
+repair loop, forever.
+
+A pass walks the cluster's manifests in key order and restores every copy each manifest promises:
+
+- **One node repairs each partition** — the first owner in the current ring. Without that rule
+  every node would survey every object, N times the work, and several would race to push the
+  same chunk to the same place. If that node dies, membership changes, the ring's first owner
+  changes with it, and the new one takes over: no election and no repair leader. Two nodes
+  briefly disagreeing about membership is harmless, because a push is idempotent — both would
+  write and verify the same bytes.
+- **Rate-limited** to a byte-per-second cap (default 32 MB/s per node). Repair competes with
+  clients for the same disks and the same network; an unthrottled heal turns one dead node into
+  a cluster-wide latency spike.
+- **Resumable**, with a cursor in etcd per node. A heal that started over every time a process
+  restarted would never reach the last object.
+- **Idempotent**: a pass over a healthy cluster moves nothing. Missing copies are found with
+  `HEAD /peer/chunks/{id}`, because surveying by fetching would move the cluster's data to
+  answer a yes-or-no question.
+- **Verified**: a rebuilt copy is streamed from a source that checks its own disk into a receiver
+  that checks the wire and refuses to commit anything not matching the manifest's checksum.
+  Repair cannot spread corruption.
+- **Loud about data loss**: a pass that finds copies missing everywhere still finishes, because
+  the rest of the cluster needs repairing, but reports `ErrUnrepairable` rather than success.
+
+Still missing: a background scrubber that re-reads chunks and verifies checksums, so rot is found
+before a reader trips over it. Repair asks whether a copy is *there*, which is a different
+question from whether it is still *good*.
 
 ## Crash safety
 
@@ -178,9 +205,16 @@ External validation: Ceph `s3-tests` via config file + tox; report the pass coun
   mismatch is found. The transfer then aborts short of the promised `Content-Length`, so the
   client always sees a failed transfer — but it may have received corrupt bytes. Verifying
   before sending would mean buffering a whole chunk per request. Same trade-off MinIO makes.
-- **A degraded write stays degraded until repair runs**: acknowledging at W=2 of N=3 means the
-  third copy is genuinely missing, and nothing yet notices. Reads still succeed because owners
-  are tried in turn, but redundancy is below the configured level until milestone 6 restores it.
+- **Repair restores copies, it does not re-place them**: it rebuilds every copy a manifest
+  promises on owners that are still members. A node that is gone for good leaves a copy with
+  nowhere to go, since putting it elsewhere means rewriting the manifest — that is rebalancing
+  (milestone 8), not repair. So redundancy returns to N after a crash or a lost disk, but not
+  after a permanent node loss.
+- **Repair sees presence, not integrity**: a chunk that has rotted still answers the survey as
+  present. Readers catch it by checksum, and the scrubber will, but repair does not.
+- **Surveying costs a round trip per copy**: one `HEAD` per chunk per owner, so a pass over a
+  large cluster is many small requests. Batching the question ("which of these ids do you have?")
+  is the obvious fix, and waits for a benchmark that shows it matters.
 - **A node that cannot reach etcd is out, even if it is healthy**: it cannot renew its lease, so
   the cluster drops it, and it cannot commit manifests anyway. This makes etcd a hard dependency
   for availability, which is the deliberate trade for having one place that decides what is true.

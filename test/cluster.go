@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
@@ -28,9 +29,16 @@ type node struct {
 	logs    *bytes.Buffer
 }
 
-// testLeaseTTL is etcd's floor. Detection is then as fast as the design allows,
-// which keeps these tests short; production defaults are longer.
-const testLeaseTTL = time.Second
+const (
+	// testLeaseTTL is etcd's floor. Detection is then as fast as the design
+	// allows, which keeps these tests short; production defaults are longer.
+	testLeaseTTL = time.Second
+
+	// Repair runs constantly in every process test, unthrottled. That is both
+	// what makes automatic healing observable in seconds and a standing check
+	// that a repair loop in the background disturbs nothing else.
+	testRepairInterval = 200 * time.Millisecond
+)
 
 // clusterPrefix isolates a test's manifests in etcd. It has to be unique per
 // run: etcd outlives the test, so a reused prefix would resolve objects whose
@@ -79,6 +87,8 @@ func launch(t *testing.T, bin, id, addr, dataDir, prefix string, chunkSize int) 
 		"-etcd", meta.EndpointFromEnv(),
 		"-cluster", prefix,
 		"-lease-ttl", testLeaseTTL.String(),
+		"-repair-interval", testRepairInterval.String(),
+		"-repair-rate", "0",
 	)
 	n.cmd.Stdout = n.logs
 	n.cmd.Stderr = n.logs
@@ -123,6 +133,39 @@ func (n *node) stop() {
 
 func (n *node) url(key string) string {
 	return "http://" + n.addr + "/objects/" + key
+}
+
+// chunkFiles lists the chunks on this node's disk.
+func (n *node) chunkFiles() []string {
+	files, err := filepath.Glob(filepath.Join(n.dataDir, "chunks", "*", "*"))
+	if err != nil {
+		n.t.Fatalf("list chunks of %s: %v", n.id, err)
+	}
+	return files
+}
+
+// loseChunks deletes everything this node holds, which is what a replaced disk
+// looks like: the process is healthy and answering, it simply has nothing.
+func (n *node) loseChunks() {
+	n.t.Helper()
+	for _, f := range n.chunkFiles() {
+		if err := os.Remove(f); err != nil {
+			n.t.Fatalf("remove %s: %v", f, err)
+		}
+	}
+}
+
+// waitForChunks blocks until this node holds want chunks, reporting whether it
+// got there in time.
+func (n *node) waitForChunks(want int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if len(n.chunkFiles()) == want {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return false
 }
 
 // members reports this node's view of the cluster.

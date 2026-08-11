@@ -164,6 +164,45 @@ func TestFailureIsDetectedWithinTheLease(t *testing.T) {
 	}
 }
 
+// Healing has to happen on its own. Nobody calls repair here: the nodes are
+// running with a repair loop, one loses its disk, and redundancy comes back.
+func TestALostDiskIsHealedWithoutBeingAskedTo(t *testing.T) {
+	bin := buildKavod(t)
+	nodes := startCluster(t, bin, clusterPrefix(), testChunkSize, clusterSize)
+
+	const key = "healed/object"
+	data := payloadFor(3)
+	client := &http.Client{}
+	if status, err := nodes[0].put(client, key, data); err != nil || status != http.StatusOK {
+		t.Fatalf("PUT = (%d, %v), want (200, nil)", status, err)
+	}
+
+	owners, outsider := ownersOf(nodes, key)
+	victim := owners[1]
+	held := len(victim.chunkFiles())
+	if held == 0 {
+		t.Fatalf("%s holds no chunks of an object it owns", victim.id)
+	}
+	victim.loseChunks()
+
+	if !victim.waitForChunks(held, 15*time.Second) {
+		t.Fatalf("%s has %d of %d chunks back, want all of them restored by repair",
+			victim.id, len(victim.chunkFiles()), held)
+	}
+
+	// Restored, and restored correctly: the object still reads back byte-identical
+	// from the node whose copies were rebuilt.
+	status, got, err := victim.get(client, key)
+	if err != nil || status != http.StatusOK || !bytes.Equal(got, data) {
+		t.Fatalf("GET from the healed node = (%d, %d bytes, %v), want (200, %d, nil)",
+			status, len(got), err, len(data))
+	}
+	if status, got, err := outsider.get(client, key); err != nil || status != http.StatusOK || !bytes.Equal(got, data) {
+		t.Fatalf("GET after healing = (%d, %d bytes, %v), want (200, %d, nil)",
+			status, len(got), err, len(data))
+	}
+}
+
 // A node joining an existing cluster must be picked up without restarting anyone,
 // and must be able to serve objects written before it arrived.
 func TestANewNodeJoinsAndServesExistingObjects(t *testing.T) {

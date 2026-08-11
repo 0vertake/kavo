@@ -86,6 +86,32 @@ func FetchChunk(ctx context.Context, addr, id string, crc uint32) (io.ReadCloser
 	}
 }
 
+// HasChunk asks whether the node at addr holds chunk id, without transferring
+// it. Repair needs to survey every copy of every chunk, and doing that by
+// fetching them would move the whole cluster's data to ask a yes-or-no question.
+//
+// Presence, not integrity: a rotted chunk answers yes. Finding missing copies and
+// finding bad ones are different jobs.
+func HasChunk(ctx context.Context, addr, id string) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, chunkURL(addr, id), nil)
+	if err != nil {
+		return false, fmt.Errorf("peer: probe chunk %s on %s: %w", id, addr, err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("peer: probe chunk %s on %s: %w", id, addr, err)
+	}
+	resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return true, nil
+	case http.StatusNotFound:
+		return false, nil
+	default:
+		return false, fmt.Errorf("peer: probe chunk %s on %s: %s", id, addr, resp.Status)
+	}
+}
+
 func chunkURL(addr, id string) string {
 	return "http://" + addr + "/peer/chunks/" + id
 }
