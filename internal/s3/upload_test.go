@@ -1,0 +1,383 @@
+package s3_test
+
+// Multipart upload, checked with the SDK's own multipart calls and with its
+// high-level uploader — the thing `aws s3 cp` uses for anything large. The claims
+// worth testing are the invariants, not the plumbing: the object does not exist
+// until completion, it is exactly the parts concatenated, its ETag is the one a
+// client recomputes, and a completion that names the wrong parts changes nothing.
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"strconv"
+	"sync"
+	"testing"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
+)
+
+// A multipart upload's parts arrive independently and become one object at one
+// instant. The bytes must be the parts in order, and the ETag must be the one a
+// client computes from the parts' ETags — that is the value `aws s3 cp` compares.
+func TestMultipartUploadAssemblesTheObject(t *testing.T) {
+	client := newGateway(t)
+	const bucket, key = "bucket", "assembled.bin"
+
+	create, err := client.CreateMultipartUpload(t.Context(), &awss3.CreateMultipartUploadInput{
+		Bucket:      aws.String(bucket),
+		Key:         aws.String(key),
+		ContentType: aws.String("application/x-kavo-multipart"),
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	id := create.UploadId
+
+	// Deliberately uneven, and not a multiple of the chunk size: an object made of
+	// parts that each end mid-chunk is where a naive concatenation shows up.
+	sizes := []int{testChunkSize + 11, 3 * testChunkSize, 7}
+	var want []byte
+	var parts []types.CompletedPart
+	var sums []byte
+	for i, size := range sizes {
+		data := randBytes(size)
+		want = append(want, data...)
+		up, err := client.UploadPart(t.Context(), &awss3.UploadPartInput{
+			Bucket:     aws.String(bucket),
+			Key:        aws.String(key),
+			UploadId:   id,
+			PartNumber: aws.Int32(int32(i + 1)),
+			Body:       bytes.NewReader(data),
+		})
+		if err != nil {
+			t.Fatalf("upload part %d: %v", i+1, err)
+		}
+		sum := md5sum(data)
+		if got, want := aws.ToString(up.ETag), fmt.Sprintf("%q", fmt.Sprintf("%x", sum)); got != want {
+			t.Errorf("part %d ETag = %s, want the part's MD5 %s", i+1, got, want)
+		}
+		sums = append(sums, sum...)
+		parts = append(parts, types.CompletedPart{ETag: up.ETag, PartNumber: aws.Int32(int32(i + 1))})
+	}
+
+	// Until the completion the object does not exist. A part visible as an object
+	// is a partially written object, which invariant 2 forbids.
+	if _, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(key),
+	}); err == nil {
+		t.Fatal("the object exists before the upload was completed")
+	}
+
+	done, err := client.CompleteMultipartUpload(t.Context(), &awss3.CompleteMultipartUploadInput{
+		Bucket:          aws.String(bucket),
+		Key:             aws.String(key),
+		UploadId:        id,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
+	})
+	if err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	wantETag := fmt.Sprintf("%q", fmt.Sprintf("%x-%d", md5sum(sums), len(parts)))
+	if got := aws.ToString(done.ETag); got != wantETag {
+		t.Errorf("ETag = %s, want the MD5 of the part MD5s %s", got, wantETag)
+	}
+
+	get, err := client.GetObject(t.Context(), &awss3.GetObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(key),
+	})
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer get.Body.Close()
+	got, err := io.ReadAll(get.Body)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("read %d bytes, want the %d uploaded, concatenated in part order", len(got), len(want))
+	}
+	if aws.ToString(get.ETag) != wantETag {
+		t.Errorf("GET says ETag %s, completion said %s", aws.ToString(get.ETag), wantETag)
+	}
+	if aws.ToString(get.ContentType) != "application/x-kavo-multipart" {
+		t.Errorf("Content-Type = %q, want the one set when the upload started",
+			aws.ToString(get.ContentType))
+	}
+	// A completed object is an object like any other: ranges work, which is what
+	// the CLI immediately uses to download it again.
+	rng, err := client.GetObject(t.Context(), &awss3.GetObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(key),
+		Range: aws.String("bytes=" + strconv.Itoa(testChunkSize) + "-" + strconv.Itoa(testChunkSize+99)),
+	})
+	if err != nil {
+		t.Fatalf("ranged get: %v", err)
+	}
+	defer rng.Body.Close()
+	window, err := io.ReadAll(rng.Body)
+	if err != nil {
+		t.Fatalf("read range: %v", err)
+	}
+	if !bytes.Equal(window, want[testChunkSize:testChunkSize+100]) {
+		t.Error("a range of the completed object is not the same window of the uploaded bytes")
+	}
+}
+
+// Real clients send parts concurrently, so they arrive in no particular order and
+// several are in flight at once. The object still has to be the parts in the order
+// the completion names, which is the property a per-upload ordering bug hides
+// behind when parts happen to arrive in sequence.
+func TestPartsArrivingConcurrentlyAndOutOfOrder(t *testing.T) {
+	client := newGateway(t)
+	const bucket, key = "bucket", "concurrent.bin"
+
+	create, err := client.CreateMultipartUpload(t.Context(), &awss3.CreateMultipartUploadInput{
+		Bucket: aws.String(bucket), Key: aws.String(key),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 6
+	bodies := make([][]byte, n)
+	parts := make([]types.CompletedPart, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		bodies[i] = randBytes(testChunkSize + i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			up, err := client.UploadPart(t.Context(), &awss3.UploadPartInput{
+				Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
+				PartNumber: aws.Int32(int32(i + 1)), Body: bytes.NewReader(bodies[i]),
+			})
+			if err != nil {
+				t.Errorf("upload part %d: %v", i+1, err)
+				return
+			}
+			parts[i] = types.CompletedPart{ETag: up.ETag, PartNumber: aws.Int32(int32(i + 1))}
+		}()
+	}
+	wg.Wait()
+	if t.Failed() {
+		t.FailNow()
+	}
+
+	if _, err := client.CompleteMultipartUpload(t.Context(), &awss3.CompleteMultipartUploadInput{
+		Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
+	}); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	data := bytes.Join(bodies, nil)
+	get, err := client.GetObject(t.Context(), &awss3.GetObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(key),
+	})
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer get.Body.Close()
+	got, err := io.ReadAll(get.Body)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Errorf("read %d bytes, want the %d uploaded", len(got), len(data))
+	}
+}
+
+// An abort has to leave nothing behind: no object, and an upload id that no longer
+// works. The chunks are dropped too, but the observable claim is that the upload
+// is gone.
+func TestAbortingAnUploadLeavesNothing(t *testing.T) {
+	client := newGateway(t)
+	const bucket, key = "bucket", "abandoned.bin"
+
+	create, err := client.CreateMultipartUpload(t.Context(), &awss3.CreateMultipartUploadInput{
+		Bucket: aws.String(bucket), Key: aws.String(key),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := randBytes(testChunkSize + 3)
+	part, err := client.UploadPart(t.Context(), &awss3.UploadPartInput{
+		Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
+		PartNumber: aws.Int32(1), Body: bytes.NewReader(data),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := client.AbortMultipartUpload(t.Context(), &awss3.AbortMultipartUploadInput{
+		Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
+	}); err != nil {
+		t.Fatalf("abort: %v", err)
+	}
+	if _, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(key),
+	}); err == nil {
+		t.Error("the object exists after the upload was aborted")
+	}
+
+	// Completing an aborted upload must not resurrect it, or an abort would be
+	// advisory rather than final.
+	_, err = client.CompleteMultipartUpload(t.Context(), &awss3.CompleteMultipartUploadInput{
+		Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
+		MultipartUpload: &types.CompletedMultipartUpload{
+			Parts: []types.CompletedPart{{ETag: part.ETag, PartNumber: aws.Int32(1)}},
+		},
+	})
+	if code := errorCode(err); code != "NoSuchUpload" {
+		t.Errorf("completing an aborted upload: error code %q, want NoSuchUpload", code)
+	}
+	// Aborting twice is what a client's cleanup loop does. It must not become an
+	// error the second time round.
+	if _, err := client.AbortMultipartUpload(t.Context(), &awss3.AbortMultipartUploadInput{
+		Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
+	}); err != nil {
+		t.Errorf("aborting twice: %v", err)
+	}
+}
+
+// A completion that does not describe what was uploaded must change nothing. The
+// alternative is an object that is readable, checksum-valid, and not what anybody
+// sent — the worst outcome available, since nothing downstream can detect it.
+func TestABadCompletionCommitsNothing(t *testing.T) {
+	client := newGateway(t)
+	const bucket = "bucket"
+
+	start := func(t *testing.T, key string) (*string, *string) {
+		t.Helper()
+		create, err := client.CreateMultipartUpload(t.Context(), &awss3.CreateMultipartUploadInput{
+			Bucket: aws.String(bucket), Key: aws.String(key),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		part, err := client.UploadPart(t.Context(), &awss3.UploadPartInput{
+			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
+			PartNumber: aws.Int32(1), Body: bytes.NewReader(randBytes(1024)),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return create.UploadId, part.ETag
+	}
+
+	tests := []struct {
+		name  string
+		key   string
+		parts func(etag *string) []types.CompletedPart
+		code  string
+	}{
+		{
+			name:  "no parts at all",
+			key:   "empty-completion",
+			parts: func(*string) []types.CompletedPart { return nil },
+			code:  "InvalidPart",
+		},
+		{
+			name: "a part that was never uploaded",
+			key:  "missing-part",
+			parts: func(etag *string) []types.CompletedPart {
+				return []types.CompletedPart{
+					{ETag: etag, PartNumber: aws.Int32(1)},
+					{ETag: etag, PartNumber: aws.Int32(2)},
+				}
+			},
+			code: "InvalidPart",
+		},
+		{
+			name: "an etag that is not the part's",
+			key:  "wrong-etag",
+			parts: func(*string) []types.CompletedPart {
+				return []types.CompletedPart{
+					{ETag: aws.String(`"00000000000000000000000000000000"`), PartNumber: aws.Int32(1)},
+				}
+			},
+			code: "InvalidPart",
+		},
+		{
+			name: "the same part twice",
+			key:  "repeated-part",
+			parts: func(etag *string) []types.CompletedPart {
+				return []types.CompletedPart{
+					{ETag: etag, PartNumber: aws.Int32(1)},
+					{ETag: etag, PartNumber: aws.Int32(1)},
+				}
+			},
+			code: "InvalidPartOrder",
+		},
+		{
+			// The client believes it knows what order its bytes go in. Sorting
+			// this for it would accept a request whose meaning is a guess.
+			name: "parts listed descending",
+			key:  "descending-parts",
+			parts: func(etag *string) []types.CompletedPart {
+				return []types.CompletedPart{
+					{ETag: etag, PartNumber: aws.Int32(2)},
+					{ETag: etag, PartNumber: aws.Int32(1)},
+				}
+			},
+			code: "InvalidPartOrder",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			id, etag := start(t, tt.key)
+			_, err := client.CompleteMultipartUpload(t.Context(), &awss3.CompleteMultipartUploadInput{
+				Bucket: aws.String(bucket), Key: aws.String(tt.key), UploadId: id,
+				MultipartUpload: &types.CompletedMultipartUpload{Parts: tt.parts(etag)},
+			})
+			if code := errorCode(err); code != tt.code {
+				t.Errorf("error code %q, want %q (err: %v)", code, tt.code, err)
+			}
+			if _, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+				Bucket: aws.String(bucket), Key: aws.String(tt.key),
+			}); err == nil {
+				t.Error("the object exists after a completion that should have been refused")
+			}
+			// The upload survives a refused completion, so the client can fix its
+			// request and try again. Aborting for it would lose the parts.
+			if _, err := client.UploadPart(t.Context(), &awss3.UploadPartInput{
+				Bucket: aws.String(bucket), Key: aws.String(tt.key), UploadId: id,
+				PartNumber: aws.Int32(2), Body: bytes.NewReader(randBytes(16)),
+			}); err != nil {
+				t.Errorf("the upload did not survive a refused completion: %v", err)
+			}
+		})
+	}
+}
+
+// An upload id nobody issued must be refused. Accepting one would let a client
+// invent an id, upload parts under it, and complete an object — the signature is
+// the only authority here, and it says nothing about which uploads exist.
+func TestAnInventedUploadIDIsRefused(t *testing.T) {
+	client := newGateway(t)
+	_, err := client.UploadPart(t.Context(), &awss3.UploadPartInput{
+		Bucket: aws.String("bucket"), Key: aws.String("invented"),
+		UploadId: aws.String("not-an-upload-id"), PartNumber: aws.Int32(1),
+		Body: bytes.NewReader(randBytes(16)),
+	})
+	if code := errorCode(err); code != "NoSuchUpload" {
+		t.Errorf("uploading a part to an invented id: code %q, want NoSuchUpload (err: %v)", code, err)
+	}
+}
+
+// errorCode is the S3 error code an SDK call failed with, which is the part a
+// client branches on.
+func errorCode(err error) string {
+	var api smithy.APIError
+	if errors.As(err, &api) {
+		return api.ErrorCode()
+	}
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
