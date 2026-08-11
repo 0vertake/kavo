@@ -49,14 +49,25 @@ const scanPageSize = 256
 // page of reads, not a million.
 func (c *Coordinator) List(ctx context.Context, req ListRequest) (ListPage, error) {
 	var page ListPage
+	if req.Limit <= 0 {
+		return page, nil // a page of nothing is complete, and reads nothing to say so
+	}
 	from := req.From
+	// A full page is not a truncated one. The scan goes on until it either finds
+	// something reportable past the page — which is what truncated means — or runs
+	// out, and only then is the answer known. Stopping at a full page and handing
+	// back a resume point instead claims there is more whenever the keyspace ends
+	// exactly on the boundary: one wasted round trip, and a page of nothing for a
+	// client that trusts IsTruncated.
+	full := func() bool { return len(page.Objects)+len(page.Prefixes) == req.Limit }
 	for {
-		// Without a delimiter every key read becomes an entry, so what is left to
-		// fill is exactly what to ask etcd for: a page of 1000 is one round trip
-		// rather than four.
+		// Without a delimiter every key read becomes an entry, so the page a client
+		// asked for is the page to ask etcd for — one round trip rather than four —
+		// plus one key, whose existence is the answer to whether more follows. That
+		// makes this loop run exactly once when there is no delimiter.
 		want := int64(scanPageSize)
 		if req.Delimiter == "" {
-			want = int64(req.Limit - len(page.Objects))
+			want = int64(req.Limit) + 1
 		}
 		objects, err := c.meta.ScanEntries(ctx, req.Prefix, from, want)
 		if err != nil {
@@ -77,6 +88,12 @@ func (c *Coordinator) List(ctx context.Context, req ListRequest) (ListPage, erro
 			if group != "" && strings.HasPrefix(o.Key, group) {
 				continue
 			}
+			if full() {
+				// Something reportable past the end of the page, so there is a next
+				// page, and from has not moved since the page filled.
+				page.Next = from
+				return page, nil
+			}
 			var grouped bool
 			if group, grouped = groupOf(o.Key, req.Prefix, req.Delimiter); grouped {
 				page.Prefixes = append(page.Prefixes, group)
@@ -86,13 +103,6 @@ func (c *Coordinator) List(ctx context.Context, req ListRequest) (ListPage, erro
 			} else {
 				page.Objects = append(page.Objects, o)
 				from = meta.After(o.Key)
-			}
-
-			if len(page.Objects)+len(page.Prefixes) == req.Limit {
-				// Whether anything follows is not known yet, so the caller gets a
-				// resume point and finds out by asking.
-				page.Next = from
-				return page, nil
 			}
 		}
 		if exhausted || from == "" {

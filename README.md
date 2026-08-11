@@ -1,5 +1,7 @@
 # kavo
 
+[![ci](https://github.com/0vertake/kavo/actions/workflows/ci.yml/badge.svg)](https://github.com/0vertake/kavo/actions/workflows/ci.yml)
+
 A distributed, S3-compatible object store in Go. Symmetric nodes, consistent-hash placement,
 quorum replication or Reed–Solomon erasure coding, etcd as the commit point, automatic repair — and
 a chaos suite whose job is to break the guarantees below rather than to demonstrate them.
@@ -48,6 +50,12 @@ Three things those numbers say, none of them about the code being fast:
 - **The S3 gateway is free.** Signing, parsing and XML are within noise of the internal API.
   Compatibility is not where a store's time goes.
 
+Those are kavo timing itself. MinIO's `warp`, which is not, driving the same cluster through
+minio-go: 731 `PUT`/s at 4 KiB (median 9.1 ms) and 4,235 `GET`/s (median 1.5 ms) at 8 concurrent
+clients, 118 MiB/s writing 64 MiB objects and 130 MiB/s reading them at 4. Same shape, measured by
+something this repo did not choose — and at N=3 that 118 MiB/s is ~354 MiB/s of fsynced writes to one
+consumer drive.
+
 Erasure coding (`-ec=6+3`) tolerates three losses at 1.5x the bytes where three copies need 3x. It
 costs ~30% on a large write and ~45% on a large read, measured at 4+2 so that replication and coding
 are compared at the same two-node tolerance on a six-node cluster. A degraded read is no slower than
@@ -87,11 +95,34 @@ write is refused. Once their leases expire the ring shrinks to the four survivor
 succeeds. Failure detection is a window, and inside it kavo would rather refuse a write than
 acknowledge one it cannot make durable.
 
+## How compatible is compatible
+
+Ceph's `s3-tests` is the suite S3 implementations are measured against, and nobody here chose what it
+asserts. **151 of its 886 tests pass and none error** — every failure is classified in
+[`docs/s3-compatibility.md`](docs/s3-compatibility.md), most of them features that are deliberately
+absent: ACLs, versioning, encryption, lifecycle, policy, v1 `ListObjects`, SigV2. Of the tests that
+cover `ListObjectsV2`, the operation kavo does claim, 37 of 40 pass.
+
+Running it was worth more than the number, twice over. It found four real defects, three of which
+kavo's own tests could not see — including a listing that reported itself truncated when it had ended
+exactly on a page boundary, which the in-repo test missed because it used three keys and a page size
+of two. And it started at 169: eighteen of those passes came from answering `PUT ?lifecycle`,
+`?policy` and `?encryption` with a 200, so kavo was passing by claiming to have configured things
+that exist nowhere in the code. Refusing them cost eighteen tests and is the right answer.
+
 ## What it does not do
 
 Deliberate anti-goals, not a roadmap: no IAM, no ACLs, no versioning, no lifecycle rules, no
 bucket policies, no `ListObjects` v1. The S3 subset is PUT, GET (including ranges), HEAD, DELETE,
-`ListObjectsV2` and multipart upload, with SigV4 verification.
+`ListObjectsV2` and multipart upload, with SigV4 verification — plus the handful of calls clients
+make without being asked, which answer for records that do not exist: `CreateBucket` succeeds
+because a bucket is a prefix, `ListBuckets` is a root listing, `DeleteBucket` refuses while objects
+remain, and `ListObjectVersions` reports every object once as version `null`.
+
+The gaps a client might actually notice are named in
+[`docs/s3-compatibility.md`](docs/s3-compatibility.md) rather than buried: no `CopyObject` (so no
+server-side `aws s3 mv`), no conditional requests, no `Content-MD5` verification, no
+`x-amz-meta-*` passthrough.
 
 Real limitations — leaked chunks with no GC pass yet, an etcd-bound object count, rot that can sit
 until the next scrub — are listed with their consequences in
