@@ -143,11 +143,11 @@ func (c *Coordinator) fetchShard(ctx context.Context, ref object.ChunkRef, i int
 
 	var rc io.ReadCloser
 	var err error
-	switch addr := c.live.Load().peers[node]; {
+	switch addr := c.live.Load().readAddr(node); {
 	case node == c.self:
 		rc, err = c.store.ReadChunk(id, crc)
 	case addr == "":
-		err = fmt.Errorf("cluster: node %s holding shard %s is not a member", node, id)
+		err = fmt.Errorf("cluster: node %s holding shard %s has never been a member", node, id)
 	default:
 		rc, err = peer.FetchChunk(ctx, addr, id, crc)
 	}

@@ -45,7 +45,22 @@ var ErrQuorum = errors.New("cluster: write quorum not met")
 // one coherent view of the cluster rather than a map changing underneath it.
 type membership struct {
 	peers map[string]string // node id -> host:port, including self
+	// known is every address this node has ever seen, including nodes that have
+	// since left. Reads fall back to it: a lease that lapsed under load does not
+	// move a chunk off the disk it is on, and an object that cannot be read is
+	// lost as far as the client is concerned. Placement never consults it, because
+	// acknowledging a write to a node the cluster has given up on would promise
+	// durability nobody is maintaining.
+	known map[string]string
 	ring  *ring.Ring
+}
+
+// readAddr is where to try reaching a node for a read: its current address, or the
+// last one it was known at. Reading from a node that has left is safe because
+// chunks are immutable and checksum-verified — a stale address either answers with
+// the bytes the manifest names or fails.
+func (m *membership) readAddr(node string) string {
+	return cmp.Or(m.peers[node], m.known[node])
 }
 
 // Coordinator handles client requests on behalf of the whole cluster.
@@ -102,8 +117,20 @@ func (c *Coordinator) SetMembers(peers map[string]string) {
 		next = make(map[string]string, 1)
 	}
 	next[c.self] = c.addr
+	// Addresses accumulate rather than being replaced, so that a node dropping out
+	// of the membership does not take the way to reach its copies with it. The
+	// snapshot stays immutable, so readers need no lock.
+	known := maps.Clone(next)
+	if was := c.live.Load(); was != nil {
+		for id, addr := range was.known {
+			if _, still := known[id]; !still {
+				known[id] = addr
+			}
+		}
+	}
 	c.live.Store(&membership{
 		peers: next,
+		known: known,
 		ring:  ring.New(slices.Sorted(maps.Keys(next)), ring.DefaultVNodes),
 	})
 }
@@ -297,13 +324,13 @@ func (c *Coordinator) fetch(ctx context.Context, ref object.ChunkRef, nodes []st
 	for _, node := range c.localFirst(nodes) {
 		var rc io.ReadCloser
 		var err error
-		switch addr := live.peers[node]; {
+		switch addr := live.readAddr(node); {
 		case node == c.self:
 			rc, err = c.store.ReadChunk(ref.ID, ref.CRC)
 		case addr == "":
-			// The manifest names a node that has since left the cluster, so
-			// there is no address left to try. Its copy may well still exist.
-			err = fmt.Errorf("cluster: node %s holding chunk %s is not a member", node, ref.ID)
+			// A node this cluster has never seen. There is nowhere to try, and
+			// guessing is not a thing a read can do.
+			err = fmt.Errorf("cluster: node %s holding chunk %s has never been a member", node, ref.ID)
 		default:
 			rc, err = peer.FetchChunk(ctx, addr, ref.ID, ref.CRC)
 		}
