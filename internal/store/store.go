@@ -200,6 +200,23 @@ func (s *Store) HasChunk(id string) (bool, error) {
 	return true, nil
 }
 
+// RemoveChunk deletes this node's copy of a chunk, reporting success if it was
+// already gone.
+//
+// Only for a chunk no manifest points at any more: after a rebalance has placed
+// it elsewhere and committed the manifest that says so. Deleting a chunk a
+// manifest still references is how an acknowledged write is lost, which is why
+// nothing on the read or repair paths calls this.
+func (s *Store) RemoveChunk(id string) error {
+	if err := validateID(id); err != nil {
+		return err
+	}
+	if err := os.Remove(s.chunkPath(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("store: remove chunk %s: %w", id, err)
+	}
+	return nil
+}
+
 // Verify wraps r so that reads fail with ErrChecksumMismatch instead of
 // returning a final EOF unless the bytes read match want.
 //

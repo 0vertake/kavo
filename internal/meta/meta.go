@@ -96,10 +96,45 @@ func (s *Store) Get(ctx context.Context, key string) (object.Manifest, error) {
 	return m, nil
 }
 
-// Object is a manifest together with the key it is committed under.
+// ErrChanged reports that a manifest was modified since it was read, so a
+// conditional commit did nothing.
+var ErrChanged = errors.New("meta: manifest changed since it was read")
+
+// Object is a manifest together with the key it is committed under and the
+// revision it was read at.
 type Object struct {
 	Key      string
 	Manifest object.Manifest
+	// Revision is what makes a read-modify-write safe. Rebalancing rewrites a
+	// manifest it read earlier, and a client may have overwritten the object in
+	// between: without the revision, moving the old object's chunks would
+	// clobber the new object's manifest and lose an acknowledged write.
+	Revision int64
+}
+
+// CommitIfUnchanged replaces a manifest only if it is still at revision, and
+// reports ErrChanged if it is not.
+//
+// This is the compare-and-swap the plain Commit path does not need: a client
+// PUT is the newest truth by definition and may overwrite freely, but a
+// background pass acting on what it read minutes ago may not.
+func (s *Store) CommitIfUnchanged(ctx context.Context, key string, m object.Manifest, revision int64) error {
+	data, err := json.Marshal(m)
+	if err != nil {
+		return fmt.Errorf("meta: marshal manifest for %s: %w", key, err)
+	}
+	k := s.key(key)
+	resp, err := s.client.Txn(ctx).
+		If(clientv3.Compare(clientv3.ModRevision(k), "=", revision)).
+		Then(clientv3.OpPut(k, string(data))).
+		Commit()
+	if err != nil {
+		return fmt.Errorf("meta: commit manifest for %s at revision %d: %w", key, revision, err)
+	}
+	if !resp.Succeeded {
+		return fmt.Errorf("%w: %s", ErrChanged, key)
+	}
+	return nil
 }
 
 // ScanObjects returns up to limit objects whose keys sort after the given key, in
@@ -128,7 +163,7 @@ func (s *Store) ScanObjects(ctx context.Context, after string, limit int64) ([]O
 		if err := json.Unmarshal(kv.Value, &m); err != nil {
 			return nil, fmt.Errorf("meta: corrupt manifest for %s: %w", key, err)
 		}
-		objects = append(objects, Object{Key: key, Manifest: m})
+		objects = append(objects, Object{Key: key, Manifest: m, Revision: kv.ModRevision})
 	}
 	return objects, nil
 }

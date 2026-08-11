@@ -169,7 +169,7 @@ func (c *Coordinator) scrubShards(ctx context.Context, o meta.Object, st *ScrubS
 		if len(rotted) == 0 {
 			continue
 		}
-		if err := c.restoreShards(ctx, ref, o.Manifest.Nodes, rotted, o.Manifest.Coding, live, pace); err != nil {
+		if err := c.restoreShards(ctx, ref, o.Manifest.Nodes, o.Manifest.Nodes, rotted, o.Manifest.Coding, live, pace); err != nil {
 			st.Unrecovered += len(rotted)
 			errs = append(errs, fmt.Errorf("scrub: shards of chunk %s rotted on %s: %w", ref.ID, c.self, err))
 			continue

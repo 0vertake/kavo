@@ -211,6 +211,48 @@ Passes are paced by the same byte rate as repair and default to once a day, beca
 every byte the node stores. Rot is rare and disks are large, so scrubbing is a slow sweep rather
 than a reaction.
 
+### Rebalancing
+
+Repair restores the copies a manifest promises and refuses to put them anywhere else, which
+leaves one hole on purpose: a node that leaves for good takes its copy's *place* with it. The
+manifest still names it, repair still declines to substitute another node, and the object sits at
+N-1 copies forever. Rebalancing is the part that changes where copies belong — and the same
+mechanism handles a join, where the ring hands a partition to a new node that holds none of its
+data.
+
+A pass compares each manifest's owners against the ring and moves the objects that disagree, at
+the same byte rate as repair and behind the same first-owner rule. The interval is longer
+(5 minutes against 1) because misplaced redundancy is a weaker problem than missing redundancy.
+
+**Copy, commit, delete — in that order.** Every reader in between resolves the old manifest and
+finds the old copies exactly where it expects them, so at no point is the object readable only
+from nodes that no manifest names. Dropping first would delete the only copies a live manifest
+points at; committing first would promise copies that do not exist yet. A move that cannot place
+every copy is abandoned before the commit and retried next pass, which is why the pass counts
+failures instead of returning them: one unreachable node must not stop the sweep, and the object
+is still readable where it was.
+
+**The commit is a compare-and-swap** against the revision the manifest was read at. A client may
+overwrite an object while the pass is copying its chunks; that manifest is the newer truth and was
+written to the current owners anyway. Committing the moved placement on top of it would resurrect
+the old object and lose an acknowledged write, so the pass abandons the move and leaves the copies
+it made for the next pass to collect.
+
+Two rules keep a move from making redundancy worse:
+
+- **A shrinking cluster is left alone.** If the ring cannot name as many owners as the manifest
+  has copies, moving now would commit a manifest promising fewer copies than the object was
+  acknowledged with. Waiting costs nothing — the copies that exist are still where the manifest
+  says.
+- **Coded shards move by position.** Shard *i* belongs to owner *i* and nowhere else, so both the
+  copy and the delete are decided per position rather than per node. A position-blind move leaves
+  every shard present and the chunk undecodable.
+
+Deletions on the old owners are logged rather than returned: the object is correctly placed and
+committed by then, so a copy that could not be deleted is wasted disk, not a durability problem.
+A node that has already left is never asked — its disk is gone or will be reclaimed when it
+rejoins and finds no manifest pointing at what it holds.
+
 ## Crash safety
 
 fsync errors are data loss: fail the write or quarantine the disk, never retry-and-trust
@@ -248,11 +290,10 @@ External validation: Ceph `s3-tests` via config file + tox; report the pass coun
   mismatch is found. The transfer then aborts short of the promised `Content-Length`, so the
   client always sees a failed transfer — but it may have received corrupt bytes. Verifying
   before sending would mean buffering a whole chunk per request. Same trade-off MinIO makes.
-- **Repair restores copies, it does not re-place them**: it rebuilds every copy a manifest
-  promises on owners that are still members. A node that is gone for good leaves a copy with
-  nowhere to go, since putting it elsewhere means rewriting the manifest — that is rebalancing
-  (milestone 8), not repair. So redundancy returns to N after a crash or a lost disk, but not
-  after a permanent node loss.
+- **Redundancy returns at two different speeds**: repair rebuilds a missing copy on an owner the
+  manifest already names, so a crash or a lost disk heals on the repair interval. A node that is
+  gone for good needs its copy's place moved, which is a rebalance pass — five times less frequent
+  by default, and it moves data rather than restoring it.
 - **Repair sees presence, not integrity**: a chunk that has rotted still answers repair's survey
   as present. The scrubber is what finds it, on a much slower cycle, so rot can sit undetected for
   up to one scrub interval.
@@ -264,8 +305,10 @@ External validation: Ceph `s3-tests` via config file + tox; report the pass coun
   for availability, which is the deliberate trade for having one place that decides what is true.
 - **Placement follows the live ring, so a flapping node moves where new objects go**: objects
   written while it was out live on a different owner set. Reads are unaffected because manifests
-  record placement, but a node that flaps repeatedly spreads a key's objects over several sets,
-  which makes the eventual rebalance (milestone 8) more work.
+  record placement, but a node that flaps repeatedly spreads a key's objects over several sets, and
+  every rebalance pass then moves them back — real disk and network spent on a node that is not
+  staying. Nothing damps this: the ring follows membership immediately, and a node is a member the
+  moment its lease exists.
 - **Capacity is balanced to ~±8%, and vnodes cannot fix it**: 256 partitions over 6 nodes
   leaves a worst-case per-node deviation around 8% (measured above). The lever is more
   partitions, not more vnodes — but partition count is fixed for the life of a cluster, so
@@ -273,10 +316,10 @@ External validation: Ceph `s3-tests` via config file + tox; report the pass coun
 - **Killing a process is not killing a machine**: SIGKILL proves commit ordering and rename
   atomicity, but the page cache survives it, so the harness cannot prove fsync actually
   reached the platter. That needs power-loss or filesystem fault injection (milestone 10).
-- **Interrupted and refused uploads leak chunks**: chunks committed before a crash, or before a
-  write was refused for missing quorum, are unreachable and never reclaimed. Harmless but
-  unbounded until a GC pass exists (manifests are the only roots, so a mark-and-sweep is
-  straightforward).
+- **Interrupted uploads and abandoned moves leak chunks**: chunks committed before a crash, before
+  a write was refused for missing quorum, or copied by a rebalance whose commit lost to a client
+  are unreachable and never reclaimed. Harmless but unbounded until a GC pass exists (manifests are
+  the only roots, so a mark-and-sweep is straightforward).
 - **Metadata ceiling**: per-object manifests in etcd cap object count (etcd practical limit
   ~2–8 GB). Fine for the ~100 GB working set; the at-scale answer is volume/needle packing
   (SeaweedFS/Haystack).

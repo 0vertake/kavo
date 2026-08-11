@@ -210,7 +210,7 @@ func (c *Coordinator) repairShards(ctx context.Context, o meta.Object, st *Stats
 		if len(missing) == 0 {
 			continue
 		}
-		if err := c.restoreShards(ctx, ref, nodes, missing, o.Manifest.Coding, live, pace); err != nil {
+		if err := c.restoreShards(ctx, ref, nodes, nodes, missing, o.Manifest.Coding, live, pace); err != nil {
 			st.Unrepairable += len(missing)
 			errs = append(errs, err)
 			continue
