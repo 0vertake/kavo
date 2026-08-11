@@ -1,6 +1,31 @@
-# Development dependencies. A single etcd node is deliberate: kavo's durability
-# claims are about kavo, and an etcd cluster here would only slow the loop down.
-# Production would run three or five.
+# The dev cluster: one etcd and six kavod nodes.
+#
+# Six because that is the smallest cluster where placement is interesting — with
+# N=3, half the nodes own any given partition, so a failure is a real failure
+# rather than the whole cluster. `make test` starts only etcd from this file.
+#
+# A single etcd node is deliberate: kavo's durability claims are about kavo, and
+# an etcd cluster here would only slow the loop down. Production would run three
+# or five.
+
+# Every node is configured identically except for its identity. They find each
+# other through etcd, so there is no peer list to keep in sync.
+x-kavod: &kavod
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+  restart: unless-stopped
+  environment:
+    KAVO_ETCD: etcd:2379
+  depends_on:
+    etcd:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "wget", "-qO-", "http://localhost:8080/cluster/members"]
+    interval: 2s
+    timeout: 2s
+    retries: 15
+
 services:
   etcd:
     image: quay.io/coreos/etcd:v3.5.17
@@ -18,3 +43,45 @@ services:
       interval: 2s
       timeout: 2s
       retries: 15
+
+  # Each node advertises its service name, which is what its peers dial. All six
+  # are published so a benchmark can drive any of them: any node coordinates any
+  # request, and only measuring through one would hide that.
+  n1:
+    <<: *kavod
+    command: [-id=n1, -advertise=n1:8080, -data=/data]
+    ports: ["8081:8080"]
+    volumes: [n1:/data]
+  n2:
+    <<: *kavod
+    command: [-id=n2, -advertise=n2:8080, -data=/data]
+    ports: ["8082:8080"]
+    volumes: [n2:/data]
+  n3:
+    <<: *kavod
+    command: [-id=n3, -advertise=n3:8080, -data=/data]
+    ports: ["8083:8080"]
+    volumes: [n3:/data]
+  n4:
+    <<: *kavod
+    command: [-id=n4, -advertise=n4:8080, -data=/data]
+    ports: ["8084:8080"]
+    volumes: [n4:/data]
+  n5:
+    <<: *kavod
+    command: [-id=n5, -advertise=n5:8080, -data=/data]
+    ports: ["8085:8080"]
+    volumes: [n5:/data]
+  n6:
+    <<: *kavod
+    command: [-id=n6, -advertise=n6:8080, -data=/data]
+    ports: ["8086:8080"]
+    volumes: [n6:/data]
+
+volumes:
+  n1:
+  n2:
+  n3:
+  n4:
+  n5:
+  n6:
