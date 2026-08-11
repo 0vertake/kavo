@@ -160,6 +160,18 @@ Two consequences that fall out of it:
   reach W. Existing objects are unaffected: their manifests name the nodes their chunks were
   written to, so reads do not depend on the current ring.
 
+**Reads do not depend on the current membership either**, which is a stronger claim and one that
+had to be fixed rather than assumed. A node's address is remembered after it leaves, and a read
+falls back to the last one it was known at. A lease lapses because a node was too busy to renew
+it — which is exactly when reads are arriving — and it does not move a chunk off the disk it is
+sitting on. The failure this prevents is a GET returning nothing while every copy is present and
+every process is answering; under load it is not hypothetical, it is what the `aws` CLI test hit.
+
+Reading from a node the cluster has given up on is safe because chunks are immutable and
+checksum-verified: a stale address either serves the bytes the manifest names or fails. Placement
+deliberately does **not** get the same fallback — acknowledging a write to a node the cluster has
+written off would promise durability nobody is maintaining.
+
 A node is always a member of its own ring, even before its registration lands, and a node that
 loses its lease re-registers itself. Serving starts only after the first membership arrives from
 etcd: a node that placed data while believing it was alone would acknowledge writes with fewer
