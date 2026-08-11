@@ -8,9 +8,10 @@ Everything below runs against a six-node cluster over real HTTP, real etcd and r
 production 32 MB chunk size. Nothing is mocked, because a mocked store would measure the mock.
 
 Every number in this file comes from one session on the machine described below, so they can be
-compared with each other. Two caveats on reading them: 64 MB write numbers vary by ~20% run to
-run, because three replicas fsyncing on one drive is a queue whose length depends on what the OS
-was doing; and the benchmarks are timed with Go's own benchtime rather than a fixed ten passes,
+compared with each other. Two caveats on reading them: anything with 64 MB writes or eight
+concurrent clients varies by ~20% run to run, because three replicas fsyncing on one drive is a
+queue whose length depends on what the OS was doing, so read those as a shape and not a score; and
+the benchmarks are timed with Go's own benchtime rather than a fixed ten passes,
 because ten was not enough to get past a cold connection — a 2 ms GET measured 8 ms that way,
 and chasing that phantom is how this section got written.
 
@@ -176,6 +177,15 @@ and it is capped, and `TestTheSizeHintIsOnlyAHint` covers each way a client can 
 fields they report, and ask etcd for the whole page at once instead of 256 keys at a time when
 there is no delimiter to collapse them: **55 ms → 41 ms** per page of 1 GB objects, with half the
 garbage, and 9.4 ms → 6.5 ms for small ones.
+
+**A node redialled its peers for every chunk.** Go's default transport keeps two idle connections
+per host, and a node talks to the same handful of peers for every chunk it ever writes or reads —
+so past two concurrent requests to one peer, every chunk after that paid for a fresh connection.
+Measured back to back, keeping 64 warm per peer took a 4 KB read across 8 clients from 146 µs to
+131 µs and a 1 MB read from 1.8 GB/s to 2.3 GB/s. The decisive part was not the throughput: on the
+default transport, the parallel read benchmark **ran the machine out of ephemeral ports** and failed
+with `can't assign requested address`. That is a storage node dying under sustained load, not a
+benchmark artifact. `TestConnectionsToAPeerAreReused` fails if the pool is ever left at the default.
 
 **The held-back byte allocated once per 32 KB.** The reader that withholds a chunk's last byte
 until its checksum verifies was building a fresh one-byte slice for each write, which is ~4,000
