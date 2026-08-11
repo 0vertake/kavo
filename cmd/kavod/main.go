@@ -17,13 +17,18 @@ import (
 	"github.com/0vertake/kavo/internal/ec"
 	"github.com/0vertake/kavo/internal/meta"
 	"github.com/0vertake/kavo/internal/object"
+	"github.com/0vertake/kavo/internal/s3"
+	"github.com/0vertake/kavo/internal/sigv4"
 	"github.com/0vertake/kavo/internal/store"
 	"github.com/0vertake/kavo/internal/version"
 )
 
 func main() {
 	id := flag.String("id", "n1", "this node's id in the cluster")
-	addr := flag.String("addr", ":8080", "address to listen on")
+	addr := flag.String("addr", ":8080", "address for the internal API: peer chunk transfer and cluster state")
+	s3Addr := flag.String("s3", ":9000", "address for the S3 API clients use")
+	accessKey := flag.String("access-key", "kavo", "S3 access key id clients sign with")
+	secretKey := flag.String("secret-key", "kavosecret", "S3 secret key clients sign with")
 	advertise := flag.String("advertise", "", "host:port other nodes should dial (default: -addr)")
 	dataDir := flag.String("data", "./data", "directory for chunks")
 	chunkSize := flag.Int64("chunk-size", object.DefaultChunkSize, "chunk size in bytes")
@@ -111,13 +116,23 @@ func main() {
 	if scheme != (ec.Scheme{}) {
 		redundancy = "erasure-coded " + scheme.String()
 	}
-	log.Printf("kavod %s node %s listening on %s (advertising %s, data %s, chunk size %d, %s, etcd %s%s, lease %v)",
-		version.Version, *id, *addr, self, *dataDir, *chunkSize, redundancy, *etcd, *prefix, *leaseTTL)
+	log.Printf("kavod %s node %s serving S3 on %s, internal API on %s (advertising %s, data %s, chunk size %d, %s, etcd %s%s, lease %v)",
+		version.Version, *id, *s3Addr, *addr, self, *dataDir, *chunkSize, redundancy, *etcd, *prefix, *leaseTTL)
 
-	// No read/write timeouts: uploads are multi-gigabyte streams, so any
+	// Two listeners, because the internal API can delete a chunk and read any
+	// object without a signature. One port for clients, one for the cluster, so
+	// that reaching the first does not imply reaching the second.
+	//
+	// No read/write timeouts on either: uploads are multi-gigabyte streams, so any
 	// wall-clock deadline would kill legitimate transfers.
-	if err := http.ListenAndServe(*addr, api.New(c, s)); err != nil {
-		log.Fatalf("serve: %v", err)
+	go func() {
+		if err := http.ListenAndServe(*addr, api.New(c, s)); err != nil {
+			log.Fatalf("serve internal API: %v", err)
+		}
+	}()
+	creds := sigv4.Credentials{AccessKey: *accessKey, SecretKey: *secretKey}
+	if err := http.ListenAndServe(*s3Addr, s3.New(c, creds)); err != nil {
+		log.Fatalf("serve S3: %v", err)
 	}
 }
 

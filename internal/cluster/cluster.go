@@ -5,14 +5,19 @@ package cluster
 
 import (
 	"bytes"
+	"cmp"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"maps"
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/0vertake/kavo/internal/ec"
 	"github.com/0vertake/kavo/internal/meta"
@@ -109,12 +114,22 @@ func (c *Coordinator) Members() map[string]string {
 	return maps.Clone(c.live.Load().peers)
 }
 
+// PutOptions carries what an object remembers beyond its bytes. Everything in it
+// comes from the client and is handed back unchanged.
+type PutOptions struct {
+	ContentType string
+	// ETag overrides the MD5 this write would compute. Only a multipart
+	// completion sets it: that object's ETag is derived from its parts' and there
+	// are no bytes here to hash.
+	ETag string
+}
+
 // Put streams an object into the cluster and returns its committed manifest.
 //
 // Returning nil is the acknowledgement point. By then every chunk is fsynced on
 // at least W owners and the manifest is in etcd; before then the object does not
 // exist, however many chunks are already on disk.
-func (c *Coordinator) Put(ctx context.Context, key string, body io.Reader) (object.Manifest, error) {
+func (c *Coordinator) Put(ctx context.Context, key string, body io.Reader, opts PutOptions) (object.Manifest, error) {
 	// One snapshot for the whole object: membership may change mid-upload, and
 	// spreading an object's chunks over two different rings would leave later
 	// chunks on nodes the manifest does not name.
@@ -133,7 +148,12 @@ func (c *Coordinator) Put(ctx context.Context, key string, body io.Reader) (obje
 			c.scheme, width, len(owners))
 	}
 
-	m, err := object.Write(body, c.chunkSize, func(ref *object.ChunkRef, data []byte) error {
+	// The ETag is the object's MD5 because that is what S3 clients check an
+	// upload against, and hashing here is the only place the whole object passes
+	// through in order. Alongside the write, not after it: reading the object
+	// back to hash it would double the traffic of every PUT.
+	sum := md5.New()
+	m, err := object.Write(io.TeeReader(body, sum), c.chunkSize, func(ref *object.ChunkRef, data []byte) error {
 		if c.scheme != (ec.Scheme{}) {
 			return c.encode(ctx, ref, data, owners, live)
 		}
@@ -144,11 +164,51 @@ func (c *Coordinator) Put(ctx context.Context, key string, body io.Reader) (obje
 	}
 	m.Nodes = owners
 	m.Coding = c.scheme
+	m.ETag = cmp.Or(opts.ETag, hex.EncodeToString(sum.Sum(nil)))
+	m.ContentType = opts.ContentType
+	// Truncated to the millisecond S3 reports, so that what a client is told and
+	// what a later listing says are the same instant.
+	m.Modified = time.Now().UTC().Truncate(time.Millisecond)
 
 	if err := c.meta.Commit(ctx, key, m); err != nil {
 		return object.Manifest{}, err
 	}
 	return m, nil
+}
+
+// Delete removes an object. Its manifest goes first, which is the instant the
+// object stops existing, and only then are its chunks reclaimed: dropping chunks
+// a live manifest still names would be a read served from nothing.
+//
+// Deleting what is not there succeeds, because S3 promises an idempotent delete.
+func (c *Coordinator) Delete(ctx context.Context, key string) error {
+	m, err := c.meta.Get(ctx, key)
+	if errors.Is(err, meta.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := c.meta.Delete(ctx, key); err != nil {
+		return err
+	}
+
+	// Failures here are logged rather than returned: the object is already gone
+	// as far as any reader is concerned, so a copy that could not be deleted is
+	// wasted disk and not a correctness problem.
+	live := c.live.Load()
+	for _, ref := range m.Chunks {
+		for i, node := range m.Nodes {
+			id := ref.ID
+			if m.Coding != (ec.Scheme{}) {
+				id = ref.ShardID(i)
+			}
+			if err := c.drop(ctx, node, id, live); err != nil {
+				log.Printf("delete %s: %v", key, err)
+			}
+		}
+	}
+	return nil
 }
 
 // Resolve returns the committed manifest for an object key, or meta.ErrNotFound.
@@ -161,18 +221,30 @@ func (c *Coordinator) Resolve(ctx context.Context, key string) (object.Manifest,
 // still has it.
 func (c *Coordinator) Stream(ctx context.Context, m object.Manifest, w io.Writer) error {
 	return object.Read(m, w, func(ref object.ChunkRef) (io.ReadCloser, error) {
-		if m.Coding == (ec.Scheme{}) {
-			return c.fetch(ctx, ref, m.Nodes)
-		}
-		// An erasure-coded chunk has to be whole before any of it is valid, so
-		// it is decoded into memory and then streamed. One chunk at a time
-		// either way: the object's size still does not decide the footprint.
-		chunk, err := c.decode(ctx, ref, m.Nodes, m.Coding)
-		if err != nil {
-			return nil, err
-		}
-		return io.NopCloser(bytes.NewReader(chunk)), nil
+		return c.chunk(ctx, m, ref)
 	})
+}
+
+// StreamRange writes length bytes of a resolved object to w, starting at off.
+func (c *Coordinator) StreamRange(ctx context.Context, m object.Manifest, w io.Writer, off, length int64) error {
+	return object.ReadRange(m, w, off, length, func(ref object.ChunkRef) (io.ReadCloser, error) {
+		return c.chunk(ctx, m, ref)
+	})
+}
+
+// chunk returns a reader for one chunk of an object, whichever way it is stored.
+func (c *Coordinator) chunk(ctx context.Context, m object.Manifest, ref object.ChunkRef) (io.ReadCloser, error) {
+	if m.Coding == (ec.Scheme{}) {
+		return c.fetch(ctx, ref, m.Nodes)
+	}
+	// An erasure-coded chunk has to be whole before any of it is valid, so it is
+	// decoded into memory and then streamed. One chunk at a time either way: the
+	// object's size still does not decide the footprint.
+	data, err := c.decode(ctx, ref, m.Nodes, m.Coding)
+	if err != nil {
+		return nil, err
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
 }
 
 // replicate writes one chunk to every owner and insists on W successes.
