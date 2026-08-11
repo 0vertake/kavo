@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"time"
 
 	"github.com/0vertake/kavo/internal/ec"
 )
@@ -50,6 +51,16 @@ func (c ChunkRef) ShardID(i int) string { return fmt.Sprintf("%ss%02d", c.ID, i)
 // object exists only once its manifest is committed.
 type Manifest struct {
 	Size int64
+	// ETag is the object's MD5, hex-encoded, and for a multipart object the MD5
+	// of its parts' MD5s followed by "-<parts>". S3 clients compare it against
+	// what they uploaded, so it is the object's identity to a client rather than
+	// an internal checksum — integrity is the chunks' CRC32C, which is verified
+	// on every read.
+	ETag string
+	// ContentType and Modified exist because S3 promises them back. Neither
+	// affects how the object is stored.
+	ContentType string
+	Modified    time.Time
 	// Nodes are the partition owners the chunks were written to. All chunks of
 	// an object share a partition, so one list covers them all.
 	//
@@ -160,23 +171,60 @@ func readOrEnd(r io.Reader, p []byte) (int, error) {
 // fetch. The readers fetch returns are expected to verify their own checksums,
 // so a corrupt chunk aborts the copy rather than being delivered as complete.
 func Read(m Manifest, w io.Writer, fetch func(ChunkRef) (io.ReadCloser, error)) error {
-	var total int64
+	return ReadRange(m, w, 0, m.Size, fetch)
+}
+
+// ReadRange streams length bytes of the object, starting at off.
+//
+// Every chunk the window touches is read in full and the surplus discarded, even
+// though only part of it is wanted. A chunk's checksum covers the whole chunk, so
+// stopping at the edge of the window would hand back bytes nothing verified: rot
+// outside the range would go unnoticed and the client would have no way to know.
+// The cost is at most two extra chunks of reading per request.
+func ReadRange(m Manifest, w io.Writer, off, length int64, fetch func(ChunkRef) (io.ReadCloser, error)) error {
+	if off < 0 || length < 0 || off+length > m.Size {
+		return fmt.Errorf("object: range %d+%d is outside an object of %d bytes", off, length, m.Size)
+	}
+
+	end, at, total := off+length, int64(0), int64(0)
 	for _, c := range m.Chunks {
+		next := at + c.Size
+		if next <= off || at >= end {
+			at = next
+			continue
+		}
 		rc, err := fetch(c)
 		if err != nil {
 			return err
 		}
-		n, err := io.Copy(w, rc)
+		skip := max(off-at, 0)
+		n, err := readWindow(w, rc, skip, min(next, end)-(at+skip))
 		rc.Close()
 		total += n
 		if err != nil {
 			return fmt.Errorf("object: read chunk %s: %w", c.ID, err)
 		}
+		at = next
 	}
+
 	// Per-chunk checksums cannot catch a manifest that lost a chunk entry; the
 	// byte count can, and a short object must never look complete.
-	if total != m.Size {
-		return fmt.Errorf("object: short read: %d bytes, manifest says %d", total, m.Size)
+	if total != length {
+		return fmt.Errorf("object: short read: %d bytes, manifest promised %d", total, length)
 	}
 	return nil
+}
+
+// readWindow copies take bytes to w after discarding skip, then drains the rest so
+// that the reader checks the chunk it has been verifying all along.
+func readWindow(w io.Writer, rc io.Reader, skip, take int64) (int64, error) {
+	if _, err := io.CopyN(io.Discard, rc, skip); err != nil {
+		return 0, err
+	}
+	n, err := io.CopyN(w, rc, take)
+	if err != nil {
+		return n, err
+	}
+	_, err = io.Copy(io.Discard, rc)
+	return n, err
 }

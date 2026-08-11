@@ -187,7 +187,7 @@ func TestWriteIsRefusedWhenTooFewShardsCanBePlaced(t *testing.T) {
 	for _, n := range owners[:testScheme.Parity] {
 		n.srv.Close()
 	}
-	if _, err := owners[len(owners)-1].c.Put(context.Background(), key, bytes.NewReader(randBytes(1024))); !errors.Is(err, cluster.ErrQuorum) {
+	if _, err := owners[len(owners)-1].c.Put(context.Background(), key, bytes.NewReader(randBytes(1024)), cluster.PutOptions{}); !errors.Is(err, cluster.ErrQuorum) {
 		t.Fatalf("Put with %d owners down = %v, want ErrQuorum", testScheme.Parity, err)
 	}
 	if _, err := owners[len(owners)-1].c.Resolve(context.Background(), key); err == nil {
@@ -204,7 +204,7 @@ func TestCodeWiderThanTheClusterIsRefused(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := tc.nodes["n1"].c.Put(context.Background(), "coded/toowide", bytes.NewReader(randBytes(1024))); err == nil {
+	if _, err := tc.nodes["n1"].c.Put(context.Background(), "coded/toowide", bytes.NewReader(randBytes(1024)), cluster.PutOptions{}); err == nil {
 		t.Fatal("a 4+2 write succeeded on a three-node cluster")
 	}
 }

@@ -188,7 +188,7 @@ func randBytes(n int) []byte {
 
 func mustPut(t testing.TB, n *node, key string, data []byte) object.Manifest {
 	t.Helper()
-	m, err := n.c.Put(context.Background(), key, bytes.NewReader(data))
+	m, err := n.c.Put(context.Background(), key, bytes.NewReader(data), cluster.PutOptions{})
 	if err != nil {
 		t.Fatalf("put %s via %s: %v", key, n.id, err)
 	}
@@ -292,7 +292,7 @@ func TestWriteBelowQuorumIsRefusedAndCommitsNothing(t *testing.T) {
 	owners[1].kill()
 	owners[2].kill()
 
-	_, err := outsider.c.Put(context.Background(), key, bytes.NewReader(randBytes(2*testChunkSize)))
+	_, err := outsider.c.Put(context.Background(), key, bytes.NewReader(randBytes(2*testChunkSize)), cluster.PutOptions{})
 	if !errors.Is(err, cluster.ErrQuorum) {
 		t.Fatalf("Put error = %v, want cluster.ErrQuorum", err)
 	}
@@ -369,7 +369,7 @@ func TestUndersizedClusterRequiresEveryNode(t *testing.T) {
 	}
 
 	tc.nodes[ids[1]].kill()
-	if _, err := first.c.Put(context.Background(), "second/write", bytes.NewReader(data)); !errors.Is(err, cluster.ErrQuorum) {
+	if _, err := first.c.Put(context.Background(), "second/write", bytes.NewReader(data), cluster.PutOptions{}); !errors.Is(err, cluster.ErrQuorum) {
 		t.Fatalf("Put with one of two nodes down = %v, want cluster.ErrQuorum", err)
 	}
 }
@@ -410,7 +410,7 @@ func TestReplicationBuffersOneChunkNotTheObject(t *testing.T) {
 
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
-	if _, err := outsider.c.Put(context.Background(), key, io.LimitReader(zeroReader{}, size)); err != nil {
+	if _, err := outsider.c.Put(context.Background(), key, io.LimitReader(zeroReader{}, size), cluster.PutOptions{}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	runtime.ReadMemStats(&after)
