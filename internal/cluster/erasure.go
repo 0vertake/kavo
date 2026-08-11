@@ -181,25 +181,28 @@ func (c *Coordinator) holdsShard(ctx context.Context, node string, ref object.Ch
 	return peer.HasChunk(ctx, live.peers[node], ref.ShardID(i))
 }
 
-// restoreShards rebuilds every shard of a chunk that its node no longer has.
+// restoreShards rebuilds the named shards of a chunk from the nodes that have it
+// and places each on the node that should. Repair and scrubbing pass the same
+// nodes for both, since they put a shard back where it belongs; a rebalance
+// reads from the old owners and writes to the new ones.
 //
 // Reconstructing gives back the missing shards along with the chunk, so one
-// decode repairs however many shards are gone — which is the whole difference
+// decode restores however many shards are gone — which is the whole difference
 // from replication, where a missing copy is fetched rather than recomputed.
-func (c *Coordinator) restoreShards(ctx context.Context, ref object.ChunkRef, nodes []string, missing []int, scheme ec.Scheme, live *membership, pace *pacer) error {
+func (c *Coordinator) restoreShards(ctx context.Context, ref object.ChunkRef, from, to []string, missing []int, scheme ec.Scheme, live *membership, pace *pacer) error {
 	// Fetching every shard, including the ones being rebuilt: a shard that is
 	// gone leaves its slot nil, and a shard that has rotted fails its checksum
 	// and leaves it nil too, so neither can be mistaken for a source.
 	shards := make([][]byte, scheme.Shards())
-	c.gather(ctx, ref, nodes, shards, scheme, 0, scheme.Shards())
+	c.gather(ctx, ref, from, shards, scheme, 0, scheme.Shards())
 	if _, err := scheme.Reconstruct(shards, ref.Size); err != nil {
 		return fmt.Errorf("cluster: rebuild shards of chunk %s: %w", ref.ID, err)
 	}
 
 	var errs []error
 	for _, i := range missing {
-		if err := c.storeShard(ctx, nodes[i], ref, i, shards[i], live); err != nil {
-			errs = append(errs, fmt.Errorf("cluster: place rebuilt shard %s on %s: %w", ref.ShardID(i), nodes[i], err))
+		if err := c.storeShard(ctx, to[i], ref, i, shards[i], live); err != nil {
+			errs = append(errs, fmt.Errorf("cluster: place rebuilt shard %s on %s: %w", ref.ShardID(i), to[i], err))
 			continue
 		}
 		pace.wait(ctx, int64(len(shards[i])))
