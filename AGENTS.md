@@ -13,7 +13,9 @@ not API surface. Full design and milestones: `docs/design.md`. Research notes wi
 ## Commands
 
 - `make build` — build all binaries
-- `make test` — unit + integration tests (always runs with `-race`); starts etcd first, so
+- `make test` — unit + integration tests (always runs with `-race`)
+- `make bench` — benchmarks against a real six-node cluster; results and the decisions they
+ settle are in `docs/benchmarks.md`; starts etcd first, so
  Docker must be running. Tests that touch metadata use a real etcd, never a fake.
 - `make lint` — `go vet` + `gofmt` check
 - `make etcd` — start just etcd (idempotent)

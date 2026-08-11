@@ -46,6 +46,67 @@ func randBytes(n int) []byte {
 	return b
 }
 
+// The write buffer starts at one small object and grows to a full chunk only
+// when the source turns out to be bigger. That growth is invisible in the
+// manifest, which is exactly why it needs its own test: every other test here
+// uses a chunk size below the small-object size, so none of them ever reach it.
+func TestWriteGrowsItsBufferWithoutChangingTheObject(t *testing.T) {
+	const chunkSize = 4 * smallObject
+	for _, size := range []int64{
+		1,
+		smallObject - 1,
+		smallObject, // exactly one buffer: must not grow, and must not lose the object
+		smallObject + 1,
+		chunkSize,
+		chunkSize + smallObject,
+	} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			s, _ := mustOpen(t)
+			data := randBytes(int(size))
+
+			m, err := Write(bytes.NewReader(data), chunkSize, commitTo(s))
+			if err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			if want := (size + chunkSize - 1) / chunkSize; int64(len(m.Chunks)) != want {
+				t.Errorf("got %d chunks, want %d", len(m.Chunks), want)
+			}
+			if m.Size != size {
+				t.Errorf("manifest size = %d, want %d", m.Size, size)
+			}
+
+			var got bytes.Buffer
+			if err := Read(m, &got, fetchFrom(s)); err != nil {
+				t.Fatalf("Read: %v", err)
+			}
+			if !bytes.Equal(got.Bytes(), data) {
+				t.Error("read data differs from written data")
+			}
+		})
+	}
+}
+
+// The reason the buffer grows at all: an object far smaller than a chunk must
+// not allocate one. Measured before this, a 4 KB object allocated 32 MB.
+func TestSmallObjectDoesNotAllocateAChunk(t *testing.T) {
+	const chunkSize = 32 * smallObject
+	s, _ := mustOpen(t)
+	data := randBytes(4 << 10)
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if _, err := Write(bytes.NewReader(data), chunkSize, commitTo(s)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	runtime.ReadMemStats(&after)
+
+	// One small buffer plus overhead, nowhere near a chunk.
+	if grew := after.TotalAlloc - before.TotalAlloc; grew > 4*smallObject {
+		t.Errorf("writing 4 KB allocated %d bytes, want well under one %d-byte chunk",
+			grew, chunkSize)
+	}
+}
+
 // Chunk-boundary handling is the whole trick in Write: exact multiples must
 // not leave a trailing empty chunk, and an empty object must produce none.
 func TestRoundTripChunkBoundaries(t *testing.T) {

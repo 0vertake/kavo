@@ -18,6 +18,11 @@ import (
 // DefaultChunkSize is the chunk size used by the data path.
 const DefaultChunkSize = 32 << 20
 
+// smallObject is where a write's buffer starts. Objects at or below it never
+// allocate a full chunk; the cutoff is set at the size where the fixed cost of a
+// write — three disk barriers and an etcd commit — stops dominating anyway.
+const smallObject = 1 << 20
+
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
 // ChunkRef locates one chunk of an object and carries the checksum a reader
@@ -59,17 +64,19 @@ func Write(r io.Reader, chunkSize int64, commit func(ChunkRef, []byte) error) (M
 	prefix := rand.Text()
 
 	// One buffer, reused for every chunk, so the footprint of a write is exactly
-	// one chunk however large the object is. A small object still pays for the
-	// full chunk size here; whether that costs enough to be worth a growing
-	// buffer is a question for a benchmark, not a guess.
-	buf := make([]byte, chunkSize)
+	// one chunk however large the object is. It starts at one small object and
+	// grows to a full chunk only once the source proves to be bigger: measured,
+	// a 4 KB object was allocating 32 MB to store 4 KB. The streaming claim is
+	// that the footprint stops growing, not that it starts at the maximum.
+	buf := make([]byte, min(chunkSize, smallObject))
 
 	var m Manifest
 	for i := 0; ; i++ {
-		n, err := io.ReadFull(r, buf)
-		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		n, next, err := readChunk(r, buf, chunkSize)
+		if err != nil {
 			return Manifest{}, fmt.Errorf("object: read source: %w", err)
 		}
+		buf = next
 		if n == 0 {
 			// Nothing left. An object whose size is an exact multiple of
 			// chunkSize must not gain a trailing empty chunk.
@@ -88,6 +95,43 @@ func Write(r io.Reader, chunkSize int64, commit func(ChunkRef, []byte) error) (M
 		m.Chunks = append(m.Chunks, ref)
 		m.Size += ref.Size
 	}
+}
+
+// readChunk reads up to chunkSize bytes into buf and returns how much it read
+// along with the buffer to use for the next chunk — grown to a full chunk if the
+// source had more than buf could hold.
+func readChunk(r io.Reader, buf []byte, chunkSize int64) (int, []byte, error) {
+	n, err := readOrEnd(r, buf)
+	if err != nil || int64(n) < int64(len(buf)) || int64(len(buf)) == chunkSize {
+		return n, buf, err
+	}
+
+	// The buffer is full and might already hold the whole object, so ask for one
+	// more byte before allocating a chunk-sized one. Growing on the guess that
+	// more is coming is how an object exactly one buffer long ends up paying for
+	// a chunk it never uses.
+	var probe [1]byte
+	more, err := readOrEnd(r, probe[:])
+	if err != nil || more == 0 {
+		return n, buf, err
+	}
+
+	grown := make([]byte, chunkSize)
+	copy(grown, buf)
+	grown[n] = probe[0]
+	n++
+	rest, err := readOrEnd(r, grown[n:])
+	return n + rest, grown, err
+}
+
+// readOrEnd fills p unless the source ends first, which is not an error: the
+// last chunk of an object is short unless its size divides evenly.
+func readOrEnd(r io.Reader, p []byte) (int, error) {
+	n, err := io.ReadFull(r, p)
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		err = nil
+	}
+	return n, err
 }
 
 // Read streams the object described by m into w, obtaining each chunk with

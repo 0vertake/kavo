@@ -16,7 +16,7 @@ import (
 // rot flips a bit in this node's copy on disk, without touching its length. This
 // is what a bad sector or a lying drive looks like: the file is there, it is the
 // right size, and one byte is wrong.
-func (n *node) rot(t *testing.T, ref object.ChunkRef) {
+func (n *node) rot(t testing.TB, ref object.ChunkRef) {
 	t.Helper()
 	path := filepath.Join(n.root, "chunks", ref.ID[:2], ref.ID)
 	data, err := os.ReadFile(path)
@@ -29,7 +29,7 @@ func (n *node) rot(t *testing.T, ref object.ChunkRef) {
 	}
 }
 
-func (n *node) chunkBytes(t *testing.T, ref object.ChunkRef) []byte {
+func (n *node) chunkBytes(t testing.TB, ref object.ChunkRef) []byte {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join(n.root, "chunks", ref.ID[:2], ref.ID))
 	if err != nil {
@@ -38,7 +38,7 @@ func (n *node) chunkBytes(t *testing.T, ref object.ChunkRef) []byte {
 	return data
 }
 
-func mustScrub(t *testing.T, n *node, rate int64) cluster.ScrubStats {
+func mustScrub(t testing.TB, n *node, rate int64) cluster.ScrubStats {
 	t.Helper()
 	st, err := n.c.Scrub(context.Background(), rate)
 	if err != nil {
