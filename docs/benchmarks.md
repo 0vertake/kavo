@@ -176,9 +176,12 @@ paying for a fourth replica of everything that moved.
 
 One caveat, from watching it run rather than from theory: in one run of three, three copies of 192
 outlived the move by minutes. Nothing is lost or unreadable when that happens and redundancy is
-above target rather than below it — it is the chunk garbage collection `docs/design.md` defers,
-showing up as storage that is paid for and not counted. The measurement reports the number rather
-than failing on it, because a rare race in a background loop is not something to fail a build on.
+above target rather than below it — a copy on a node the manifest no longer names is storage that
+is paid for and not counted. This is what motivated the collection pass, which reclaims exactly
+that: a chunk is garbage when no manifest names it *for this node*, which is the same rule the move
+itself follows when it deletes what it moved away from. The measurement still reports the residue
+as a number rather than failing on it, because it is now bounded by a collection cycle rather than
+forever, and because a rare race in a background loop is not something to fail a build on.
 
 ## A multi-gigabyte object
 

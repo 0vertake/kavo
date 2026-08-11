@@ -147,8 +147,8 @@ The gaps a client might actually notice are named in
 server-side `aws s3 mv`), no conditional requests, no `Content-MD5` verification, no
 `x-amz-meta-*` passthrough.
 
-Real limitations — leaked chunks with no GC pass yet, an etcd-bound object count, rot that can sit
-until the next scrub — are listed with their consequences in
+Real limitations — an etcd-bound object count, rot that can sit until the next scrub, deleted space
+that comes back within a collection cycle rather than at once — are listed with their consequences in
 [`docs/design.md`](docs/design.md#known-limitations-publish-these). They are published rather than
 fixed because a known limit is cheaper than a surprise.
 
@@ -158,7 +158,7 @@ fixed because a known limit is cheaper than a surprise.
 cmd/kavod        the single binary: S3 gateway + chunk store + repair participant
 internal/s3      the S3 API: objects, ranges, listing, multipart
 internal/sigv4   SigV4 verification, checked against the AWS SDK's own signer
-internal/cluster placement, quorum, erasure coding, repair, scrub, rebalance
+internal/cluster placement, quorum, erasure coding, repair, scrub, rebalance, collection
 internal/ring    the consistent-hash ring: partitions, vnodes, owners
 internal/object  chunking and streaming reassembly
 internal/store   the local chunk store and its commit discipline

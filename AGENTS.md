@@ -53,8 +53,14 @@ Rules that make these structural:
  shards) are fsynced on distinct nodes AND the object manifest is committed to etcd. Readers
  resolve objects only through committed manifests. A plain etcd `Put` is enough for this: it
  is atomic and serialized, so a concurrent overwrite yields one manifest or the other, never a
- mix. Compare-and-swap arrives with chunk garbage collection, which needs to know which
- revision it superseded.
+ mix. It stays a plain `Put`: garbage collection is mark-and-sweep and so does not need the
+ revision it superseded, and a chunk that is live if *any* manifest names it is what lets an
+ object be copied without copying its data. Compare-and-swap exists where a background pass
+ rewrites what it read minutes ago, which is rebalancing.
+- **Deleting a chunk**: only after reading every manifest and finding none that names it, or
+ after a rebalance has committed the manifest that says it lives elsewhere. A pass that could
+ not read all the metadata deletes nothing — a partial answer is indistinguishable from an empty
+ one, and acting on it loses acknowledged writes. See `internal/cluster/collect.go`.
 - **fsync discipline**: chunk commit is write temp → fsync file → rename → fsync directory.
   An fsync error means the data is gone — fail the write or quarantine the disk. Never
   retry-and-trust fsync (fsyncgate: the kernel marks pages clean after a failed fsync).
@@ -74,6 +80,9 @@ Rules that make these structural:
  chunk, acknowledged at k+1 shards. The code is recorded per object, so both modes coexist.
 - Metadata: etcd only (manifests, membership leases, partition layout). Chunks are immutable —
   no vector clocks, no sloppy quorums, no read repair for correctness.
+- Four background passes, all resumable by cursor and all rate-limited or sliced so they never
+  grow with the disk: repair (missing copies), scrub (rot), rebalance (misplaced copies),
+  collect (chunks no manifest references).
 - Inter-node chunk transfer: plain HTTP with streaming bodies. No gRPC.
 
 ## Conventions

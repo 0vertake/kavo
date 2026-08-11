@@ -32,8 +32,9 @@ node is healed automatically — with published numbers behind each claim.
 3. After W=2 acks per chunk, and all chunks done, the gateway commits the object manifest
    (chunk list, locations, checksums, size, version) to etcd in one atomic `Put`. That is
    enough: etcd serializes it, so a concurrent overwrite of the same key resolves to one
-   manifest or the other and never a mix of both. Compare-and-swap is only needed to reclaim
-   the chunks of the manifest being replaced, so it lands with garbage collection.
+   manifest or the other and never a mix of both. It stayed a plain `Put` after garbage
+   collection landed too — reclaiming an overwritten version's chunks turned out not to need
+   the superseded revision, and the reason is under *Collecting unreferenced chunks* below.
 4. Only then is the client acked. **The etcd commit is the commit point** — the same model as
    S3's `CompleteMultipartUpload`: parts are invisible until atomically assembled.
 
@@ -264,6 +265,60 @@ Deletions on the old owners are logged rather than returned: the object is corre
 committed by then, so a copy that could not be deleted is wasted disk, not a durability problem.
 A node that has already left is never asked — its disk is gone or will be reclaimed when it
 rejoins and finds no manifest pointing at what it holds.
+
+### Collecting unreferenced chunks
+
+Every write leaves chunks nothing points at. An overwrite supersedes the chunks of the manifest
+it replaces. A write that fails after storing data leaves what it stored. A rebalance leaves a
+copy behind if the delete after the move does not happen. Deletes and aborted uploads do drop
+their own chunks, but only as a best effort that is logged rather than returned, because by then
+the object is already gone as far as any reader is concerned. None of it is reachable — readers
+resolve objects only through committed manifests — so none of it threatens correctness. It is
+storage that is paid for and not counted, and it only ever grows.
+
+The obvious design is to record what each write superseded: commit the new manifest and a list
+of the old one's chunks in one transaction, then have a worker delete them. That needs the
+revision the commit replaced, which is the compare-and-swap the write path was always going to
+grow. **It is the wrong design, and the reason is `CopyObject`.** Chunk ids are a random prefix
+per write plus an index, so today no two manifests ever name the same chunk — and copying an
+object server-side means copying its manifest and not its data, which makes them share. Under
+sharing, deleting the chunks of the manifest an overwrite replaced would delete chunks a copy
+still references, which is an acknowledged write lost from the collection path. A per-write
+record cannot express sharing without reference counts in the commit path.
+
+So the pass is mark-and-sweep instead. A node reads every manifest in the cluster, builds the
+set of chunk ids some manifest says *this node* should hold, and deletes the local chunks that
+set does not contain. A chunk is live if any manifest names it, so sharing costs nothing, and
+the write path is untouched: the commit point keeps the proof it already had. It also reclaims
+garbage no record would ever have been written for, which is every category above except the
+first.
+
+Three things make it safe:
+
+- **A partial read of the manifests deletes nothing.** A scan that failed halfway is
+  indistinguishable from a cluster where the objects it did not reach do not exist. Any error
+  ends the pass before it touches the disk.
+- **The cutoff is when the scan started, not now.** An object written during the scan, under a
+  key the scan had already passed, is invisible to it. Nothing written after the scan began may
+  be deleted on the strength of it, however long the scan took.
+- **A grace period covers the commit window.** A chunk is durable before the manifest naming it
+  is committed, so for that window good data is referenced by nothing at all. The grace period
+  has to exceed the longest a single write takes; it defaults to an hour, which is far longer
+  than any request this store finishes. In-flight multipart uploads are not covered by age —
+  S3 lets a client take days — so the pass reads part manifests too, and reads them *before*
+  the objects, which is what makes a completion racing the scan safe either way round.
+
+What the manifest says, not what exists: a copy on a node the manifest does not name is
+unreachable, because a reader tries the nodes it names and stops. That is the same rule
+rebalancing relies on when it deletes the copy it moved away from, and it is what lets this pass
+reclaim the residue when that delete does not happen.
+
+Each pass sweeps one thirty-second of the id space, chosen by cursor, because the alternative is
+holding a set of every chunk id on the node — tens of megabytes at a million chunks, and a
+background pass whose memory grows with the disk is one that eventually cannot run. A chunk id
+starts with a random base32 character and a shard id starts with its chunk's id, so one slice
+covers a chunk and all of its shards. At the default 10-minute interval a full cycle is about
+five hours, which is a reasonable time for storage nobody can read to be freed.
 
 ## Crash safety
 
@@ -532,20 +587,19 @@ implementation disagreeing is the only thing that catches a misreading.
 - **Killing a process is not killing a machine**: SIGKILL proves commit ordering and rename
   atomicity, but the page cache survives it, so the harness cannot prove fsync actually
   reached the platter. That needs power-loss or filesystem fault injection (milestone 10).
-- **Interrupted uploads, overwrites and abandoned moves leak chunks**: chunks committed before a
-  crash, before a write was refused for missing quorum, replaced by an overwrite, or copied by a
-  rebalance whose commit lost to a client are unreachable and never reclaimed. A `DELETE` and an
-  aborted multipart upload do reclaim their own chunks; nothing collects the rest. Harmless but
-  unbounded until a GC pass exists (manifests are the only roots, so a mark-and-sweep is
-  straightforward).
+- **Unreferenced chunks are reclaimed within a cycle, not immediately**: an overwrite, an
+  interrupted delete, a write refused for missing quorum and a rebalance whose commit lost to a
+  client all leave chunks nothing points at, and the collection pass above frees them a slice of
+  the id space at a time. At the default interval that is up to about five hours, plus the grace
+  period. Bounded rather than unbounded, but a store that has just deleted a terabyte does not
+  see the space back at once.
 - **A multipart upload nobody finishes is never cleaned up**: an upload whose client walks away
-  without aborting keeps its parts' chunks and its etcd records forever. S3 solves this with a
-  lifecycle rule, which is an anti-goal here; the same GC pass is the fix, and an upload's record
-  carries its creation time so the pass has something to age against. Parts uploaded twice, or
-  uploaded and left out of the completion, leak the same way.
-- **A delete can leave copies behind**: the manifest goes first, so the object is gone the moment
-  it returns, but an owner that is down when the chunks are dropped keeps its copy forever — the
-  delete does not come back for it. Same GC pass fixes it.
+  without aborting keeps its parts' chunks and its etcd records forever, and collection does not
+  help — it is precisely the pass that keeps an in-flight upload's parts alive, and it cannot
+  tell a client that will come back from one that will not. The fix is ageing out the upload
+  record itself, which carries its creation time for that reason; S3 solves it with a lifecycle
+  rule, which is an anti-goal here. Parts uploaded twice, or uploaded and left out of the
+  completion, are reclaimed once the upload is completed or aborted.
 - **Multi-range requests are answered with the whole object**: `bytes=0-9,20-29` returns everything
   rather than a `multipart/byteranges` body. Allowed by HTTP, matches S3, and no S3 client asks.
 - **`ListObjects` v1 is refused**: only v2 is served. Every current client uses v2; a v1 client gets
