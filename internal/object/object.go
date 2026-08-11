@@ -217,14 +217,62 @@ func ReadRange(m Manifest, w io.Writer, off, length int64, fetch func(ChunkRef) 
 
 // readWindow copies take bytes to w after discarding skip, then drains the rest so
 // that the reader checks the chunk it has been verifying all along.
+//
+// The last byte of the window is held back until that check passes. A chunk's
+// checksum is only known once the whole chunk has been read, which is *after* its
+// bytes would otherwise be on the wire — and for the final chunk of a response
+// there is then nothing left to withhold, so a corrupt chunk would arrive as a
+// complete, successful, wrong answer. Keeping one byte back means the client only
+// ever receives the length it was promised for a chunk that verified; anything else
+// is a transfer that stops short, which every client treats as an error. One byte
+// of memory, and invariant 3 stops having a hole in its last chunk.
 func readWindow(w io.Writer, rc io.Reader, skip, take int64) (int64, error) {
 	if _, err := io.CopyN(io.Discard, rc, skip); err != nil {
 		return 0, err
 	}
-	n, err := io.CopyN(w, rc, take)
+	held := &heldBack{w: w}
+	n, err := io.CopyN(held, rc, take)
 	if err != nil {
 		return n, err
 	}
-	_, err = io.Copy(io.Discard, rc)
-	return n, err
+	if _, err := io.Copy(io.Discard, rc); err != nil {
+		return n, err
+	}
+	return n, held.release()
+}
+
+// heldBack passes writes through but keeps the most recent byte, releasing it only
+// when told to.
+type heldBack struct {
+	w    io.Writer
+	last byte
+	held bool
+}
+
+func (h *heldBack) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if h.held {
+		if _, err := h.w.Write([]byte{h.last}); err != nil {
+			return 0, err
+		}
+		h.held = false
+	}
+	if len(p) > 1 {
+		if _, err := h.w.Write(p[:len(p)-1]); err != nil {
+			return 0, err
+		}
+	}
+	h.last, h.held = p[len(p)-1], true
+	return len(p), nil
+}
+
+func (h *heldBack) release() error {
+	if !h.held {
+		return nil
+	}
+	h.held = false
+	_, err := h.w.Write([]byte{h.last})
+	return err
 }

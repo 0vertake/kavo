@@ -167,21 +167,40 @@ func TestSurvivesRestart(t *testing.T) {
 
 // Invariant end to end: a corrupted chunk must reach the client as a failed
 // transfer, never as a complete object with wrong bytes.
+//
+// The single-chunk case is here because it is the one that was broken. Rot in an
+// object's last chunk is only discovered once every byte of it has been read, and
+// for the last chunk there is nothing left to hold back — so the client received
+// the full `Content-Length` it was promised and had no way to know. On a
+// single-chunk object the last chunk is the only chunk, which makes every small
+// object the worst case.
 func TestCorruptChunkFailsDownload(t *testing.T) {
-	root := t.TempDir()
-	srv := newServer(t, root)
-	data := randBytes(3 * chunkSize)
-	put(t, srv, "rotten", data)
-
-	corruptOneChunk(t, filepath.Join(root, "chunks"))
-
-	resp, got, err := get(t, srv, "rotten")
-	if err == nil && bytes.Equal(got, data) {
-		t.Fatal("corrupt chunk was served as a valid object")
+	tests := []struct {
+		name string
+		size int
+	}{
+		{name: "several chunks", size: 3 * chunkSize},
+		{name: "one chunk", size: chunkSize - 100},
+		{name: "one byte", size: 1},
 	}
-	if err == nil {
-		t.Fatalf("GET returned %d and %d bytes with no error, want a failed transfer",
-			resp.StatusCode, len(got))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			srv := newServer(t, root)
+			data := randBytes(tt.size)
+			put(t, srv, "rotten", data)
+
+			corruptOneChunk(t, filepath.Join(root, "chunks"))
+
+			resp, got, err := get(t, srv, "rotten")
+			if err == nil && bytes.Equal(got, data) {
+				t.Fatal("corrupt chunk was served as a valid object")
+			}
+			if err == nil {
+				t.Fatalf("GET returned %d and %d bytes with no error, want a failed transfer",
+					resp.StatusCode, len(got))
+			}
+		})
 	}
 }
 
