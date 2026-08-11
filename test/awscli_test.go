@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -52,6 +53,10 @@ func (n *node) awsTuned(t *testing.T, s3Config string, args ...string) (string, 
 	return string(out), err
 }
 
+// multipartETag matches the "<md5>-<parts>" form in the CLI's JSON output, where
+// the ETag's own quotes arrive escaped.
+var multipartETag = regexp.MustCompile(`"ETag": "\\"[0-9a-f]{32}-\d+\\""`)
+
 func requireAWSCLI(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("aws"); err != nil {
@@ -62,30 +67,29 @@ func requireAWSCLI(t *testing.T) {
 // The claim the whole S3 milestone rests on: `aws s3 cp` up and down, unchanged,
 // through a cluster of real processes.
 //
-// Uploads are kept to a single PUT by raising the CLI's multipart threshold —
-// multipart upload is the next milestone, and pinning the threshold here is what
-// keeps this test about the object path rather than about a missing operation.
-// Downloads are left at the default, so anything over 8 MB comes back as several
-// concurrent ranged GETs. That case is the one worth having: a range served from
-// the middle of a chunk has to land at the right offset in the client's file, and
-// getting it wrong scrambles the object rather than failing, which a unit test of
-// one range in isolation cannot see.
+// Nothing is tuned, so the CLI behaves as it does for a user: anything over 8 MB
+// goes up as a concurrent multipart upload and comes back as concurrent ranged
+// GETs. Both halves of that are worth having. A part boundary that does not line up
+// with a chunk boundary, or a range served from the middle of a chunk landing at the
+// wrong offset in the client's file, scrambles the object rather than failing — and
+// a unit test of one part or one range in isolation cannot see it.
 func TestTheAWSCLIRoundTripsObjects(t *testing.T) {
 	requireAWSCLI(t)
 	bin := buildKavod(t)
 	nodes := startCluster(t, bin, clusterPrefix(), 1<<20, clusterSize)
 
 	tests := []struct {
-		name string
-		key  string
-		size int
+		name      string
+		key       string
+		size      int
+		multipart bool
 	}{
 		{name: "small", key: "small.bin", size: 1024},
 		{name: "empty", key: "empty.bin", size: 0},
 		{name: "spanning chunks", key: "some dir/three chunks.bin", size: 3 << 20},
-		// Above the CLI's download threshold, so it is fetched as parallel
-		// ranged GETs and reassembled.
-		{name: "ranged parallel download", key: "big.bin", size: 12 << 20},
+		// Above the CLI's 8 MB threshold in both directions: uploaded as
+		// concurrent parts, downloaded as concurrent ranged GETs.
+		{name: "multipart up and ranged down", key: "big.bin", size: 12 << 20, multipart: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -101,8 +105,7 @@ func TestTheAWSCLIRoundTripsObjects(t *testing.T) {
 
 			// Uploading through one node and downloading through another, since
 			// any node coordinates any request and a client may hit either.
-			up, err := nodes[0].awsTuned(t, "  multipart_threshold = 1GB",
-				"s3", "cp", src, "s3://bucket/"+tt.key)
+			up, err := nodes[0].aws(t, "s3", "cp", src, "s3://bucket/"+tt.key)
 			if err != nil {
 				t.Fatalf("aws s3 cp up: %v\n%s", err, up)
 			}
@@ -118,6 +121,18 @@ func TestTheAWSCLIRoundTripsObjects(t *testing.T) {
 			}
 			if !bytes.Equal(got, data) {
 				t.Errorf("downloaded %d bytes, want the %d uploaded", len(got), len(data))
+			}
+
+			// A multipart ETag ends in the part count, and the CLI's own
+			// integrity check compares it against what it computed. Asserting
+			// the shape here is what proves the big upload really went up in
+			// parts rather than as one PUT the CLI quietly decided to send.
+			head, err := nodes[2].aws(t, "s3api", "head-object", "--bucket", "bucket", "--key", tt.key)
+			if err != nil {
+				t.Fatalf("head-object: %v\n%s", err, head)
+			}
+			if multipart := multipartETag.MatchString(head); multipart != tt.multipart {
+				t.Errorf("etag looks multipart = %v, want %v:\n%s", multipart, tt.multipart, head)
 			}
 		})
 	}
