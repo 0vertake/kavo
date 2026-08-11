@@ -340,6 +340,42 @@ unescaping queries hands back as a space. Either mistake renames the key. A key 
 itself a valid escape sequence — `100%25.txt` — is the one that proves it: sent unencoded, the
 `aws` CLI asks for `100%.txt` and gets a 404 for a key the listing had just named. That is a test.
 
+### Multipart upload
+
+Not optional either: the `aws` CLI switches to it above 8 MB, so without it the standard client
+cannot upload a large file at all.
+
+**A part is written exactly like a small object, but placed by the final object's key.** That one
+choice is what makes completion cheap: the part's chunks are already on the nodes the object's
+manifest will name, so completing an upload is a single manifest commit rather than a copy of
+everything. Part manifests live under the upload's own prefix in etcd, not among the objects — a
+part must never appear in a listing or resolve as an object, because a part *is* a partially
+written object and invariant 2 forbids reading one.
+
+The commit point is unchanged. Before the completion there is no object; the completion is one
+manifest naming every part's chunks in order, all of them already fsynced on a quorum. The
+consequence worth stating: an upload interrupted at any point leaves no object at all, and the
+object that does appear appears whole.
+
+**The completion is validated before anything is committed.** A part that was never uploaded, an
+ETag that is not the one this server stored, a part named twice, parts listed descending — each is
+refused with nothing changed. Committing a manifest over a client's mistake would produce an
+object that is readable, checksum-valid, and not what anybody uploaded: the worst available
+outcome, since nothing downstream can detect it. A refused completion leaves the upload intact so
+the client can correct its request; only an abort discards parts.
+
+Parts are **not** sorted for the client. The client believes it knows what order its bytes go in,
+and quietly reordering them to whatever we prefer would turn a client bug into a corrupt object.
+
+The one failure a client cannot cause is the ring moving between two parts. A manifest names one
+node set for all its chunks, so parts placed by two different memberships cannot be described by
+any single manifest, and the completion is refused rather than committed against nodes that never
+held the chunks. Tested by changing membership mid-upload.
+
+The ETag is the MD5 of the parts' MD5s with the part count after a dash, because that is the value
+clients recompute to check the upload. `ListParts` and `ListMultipartUploads` are not implemented:
+nothing in the locked subset needs them, and no client kavo is tested against asks.
+
 Error bodies are S3's XML with S3's codes, because the code is the part clients act on: an SDK
 retries `SlowDown`, refuses to retry `SignatureDoesNotMatch`, and turns `NoSuchKey` into a typed
 error applications branch on. A quorum failure is `SlowDown` — it says the write may succeed
@@ -442,9 +478,15 @@ implementation disagreeing is the only thing that catches a misreading.
   reached the platter. That needs power-loss or filesystem fault injection (milestone 10).
 - **Interrupted uploads, overwrites and abandoned moves leak chunks**: chunks committed before a
   crash, before a write was refused for missing quorum, replaced by an overwrite, or copied by a
-  rebalance whose commit lost to a client are unreachable and never reclaimed. A `DELETE` does
-  reclaim its own chunks; nothing collects the rest. Harmless but unbounded until a GC pass exists
-  (manifests are the only roots, so a mark-and-sweep is straightforward).
+  rebalance whose commit lost to a client are unreachable and never reclaimed. A `DELETE` and an
+  aborted multipart upload do reclaim their own chunks; nothing collects the rest. Harmless but
+  unbounded until a GC pass exists (manifests are the only roots, so a mark-and-sweep is
+  straightforward).
+- **A multipart upload nobody finishes is never cleaned up**: an upload whose client walks away
+  without aborting keeps its parts' chunks and its etcd records forever. S3 solves this with a
+  lifecycle rule, which is an anti-goal here; the same GC pass is the fix, and an upload's record
+  carries its creation time so the pass has something to age against. Parts uploaded twice, or
+  uploaded and left out of the completion, leak the same way.
 - **A delete can leave copies behind**: the manifest goes first, so the object is gone the moment
   it returns, but an owner that is down when the chunks are dropped keeps its copy forever — the
   delete does not come back for it. Same GC pass fixes it.

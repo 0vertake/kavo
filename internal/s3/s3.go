@@ -37,6 +37,7 @@ func New(c *cluster.Coordinator, creds sigv4.Credentials) http.Handler {
 	mux.HandleFunc("GET /{bucket}/{key...}", h.authed(h.getObject))
 	mux.HandleFunc("HEAD /{bucket}/{key...}", h.authed(h.getObject))
 	mux.HandleFunc("DELETE /{bucket}/{key...}", h.authed(h.deleteObject))
+	mux.HandleFunc("POST /{bucket}/{key...}", h.authed(h.postObject))
 	// A bucket is a prefix, so it exists as soon as it is named. Clients ask
 	// before uploading, and answering "no such bucket" would be a lie that stops
 	// them. "/{bucket}/" reaches the object routes with an empty key, which
@@ -73,6 +74,13 @@ func (h *handler) putObject(w http.ResponseWriter, r *http.Request) {
 	key, ok := objectKey(r)
 	if !ok {
 		fail(w, r, errNotImplemented, nil)
+		return
+	}
+	// A PUT carrying an upload id is a part, not the object. Checked before
+	// anything else: treating it as an object would commit a manifest under the
+	// object's key holding one part of it.
+	if id := r.URL.Query().Get("uploadId"); id != "" {
+		h.uploadPart(w, r, id)
 		return
 	}
 	// Without a length there is no way to tell a complete upload from a
@@ -151,6 +159,10 @@ func (h *handler) deleteObject(w http.ResponseWriter, r *http.Request) {
 	key, ok := objectKey(r)
 	if !ok {
 		fail(w, r, errNotImplemented, nil)
+		return
+	}
+	if id := r.URL.Query().Get("uploadId"); id != "" {
+		h.abortUpload(w, r, id)
 		return
 	}
 	if err := h.cluster.Delete(r.Context(), key); err != nil {

@@ -110,7 +110,7 @@ func (h *handler) listObjects(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result := listResult{
-		XMLNS:             "http://s3.amazonaws.com/doc/2006-03-01/",
+		XMLNS:             s3XMLNS,
 		Name:              bucket,
 		Prefix:            encode(prefix),
 		Delimiter:         encode(delimiter),

@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"maps"
 	"slices"
 	"sync"
@@ -157,6 +156,28 @@ type PutOptions struct {
 // at least W owners and the manifest is in etcd; before then the object does not
 // exist, however many chunks are already on disk.
 func (c *Coordinator) Put(ctx context.Context, key string, body io.Reader, opts PutOptions) (object.Manifest, error) {
+	m, err := c.write(ctx, key, body)
+	if err != nil {
+		return object.Manifest{}, err
+	}
+	m.ETag = cmp.Or(opts.ETag, m.ETag)
+	m.ContentType = opts.ContentType
+
+	if err := c.meta.Commit(ctx, key, m); err != nil {
+		return object.Manifest{}, err
+	}
+	return m, nil
+}
+
+// write stores a stream's chunks on the owners of key and returns the manifest
+// naming them. Nothing is committed: the chunks are on disk and unreferenced until
+// a caller commits a manifest that names them, which is what makes a torn object
+// impossible rather than unlikely.
+//
+// Multipart upload is why this is separate from Put. A part's chunks are placed by
+// the final object's key so that completing the upload is a single manifest commit
+// — the parts are already where the object's manifest will say they are.
+func (c *Coordinator) write(ctx context.Context, key string, body io.Reader) (object.Manifest, error) {
 	// One snapshot for the whole object: membership may change mid-upload, and
 	// spreading an object's chunks over two different rings would leave later
 	// chunks on nodes the manifest does not name.
@@ -191,17 +212,12 @@ func (c *Coordinator) Put(ctx context.Context, key string, body io.Reader, opts 
 	}
 	m.Nodes = owners
 	m.Coding = c.scheme
-	m.ETag = cmp.Or(opts.ETag, hex.EncodeToString(sum.Sum(nil)))
-	m.ContentType = opts.ContentType
+	m.ETag = hex.EncodeToString(sum.Sum(nil))
 	// Truncated to the second, because that is all the Last-Modified header can
 	// carry. A listing reports the same field to the millisecond, so keeping any
 	// finer resolution would have a HEAD and a listing disagree about when the same
 	// object was written.
 	m.Modified = time.Now().UTC().Truncate(time.Second)
-
-	if err := c.meta.Commit(ctx, key, m); err != nil {
-		return object.Manifest{}, err
-	}
 	return m, nil
 }
 
@@ -222,21 +238,10 @@ func (c *Coordinator) Delete(ctx context.Context, key string) error {
 		return err
 	}
 
-	// Failures here are logged rather than returned: the object is already gone
-	// as far as any reader is concerned, so a copy that could not be deleted is
-	// wasted disk and not a correctness problem.
-	live := c.live.Load()
-	for _, ref := range m.Chunks {
-		for i, node := range m.Nodes {
-			id := ref.ID
-			if m.Coding != (ec.Scheme{}) {
-				id = ref.ShardID(i)
-			}
-			if err := c.drop(ctx, node, id, live); err != nil {
-				log.Printf("delete %s: %v", key, err)
-			}
-		}
-	}
+	// Failures are logged rather than returned: the object is already gone as far
+	// as any reader is concerned, so a copy that could not be deleted is wasted
+	// disk and not a correctness problem.
+	c.dropChunks(ctx, m)
 	return nil
 }
 
