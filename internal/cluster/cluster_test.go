@@ -84,10 +84,8 @@ func newClusterChunked(t *testing.T, n int, chunkSize int64) *testCluster {
 		}
 		t.Cleanup(func() { m.Close() })
 
-		c, err := cluster.New(id, peers, s, m, chunkSize)
-		if err != nil {
-			t.Fatalf("cluster.New: %v", err)
-		}
+		c := cluster.New(id, peers[id], s, m, chunkSize)
+		c.SetMembers(peers)
 		srvs[i].Config.Handler = api.New(c, s)
 		srvs[i].Start()
 		t.Cleanup(srvs[i].Close)
@@ -311,11 +309,18 @@ func TestUndersizedClusterRequiresEveryNode(t *testing.T) {
 	}
 }
 
-// Every node must derive the same ring, so a node that does not know itself is a
-// misconfiguration rather than a cluster of one.
-func TestSelfMustBeInThePeerList(t *testing.T) {
-	if _, err := cluster.New("n9", map[string]string{"n1": "127.0.0.1:1"}, nil, nil, testChunkSize); err == nil {
-		t.Fatal("cluster.New accepted a peer list without the node itself")
+// A node is alive by definition, so it belongs in its own ring whatever etcd
+// currently says — including before its registration has landed.
+func TestSelfIsAlwaysAMember(t *testing.T) {
+	c := cluster.New("n9", "127.0.0.1:1", nil, nil, testChunkSize)
+	if got := c.Members(); got["n9"] != "127.0.0.1:1" {
+		t.Fatalf("members before any update = %v, want to contain n9", got)
+	}
+
+	c.SetMembers(map[string]string{"n1": "127.0.0.1:2"})
+	got := c.Members()
+	if got["n9"] != "127.0.0.1:1" || got["n1"] != "127.0.0.1:2" {
+		t.Fatalf("members = %v, want both n9 and n1", got)
 	}
 }
 

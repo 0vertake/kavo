@@ -12,6 +12,7 @@ import (
 	"maps"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/0vertake/kavo/internal/meta"
 	"github.com/0vertake/kavo/internal/object"
@@ -33,31 +34,51 @@ const (
 // refused. No manifest is committed, so nothing partial becomes readable.
 var ErrQuorum = errors.New("cluster: write quorum not met")
 
+// membership is an immutable snapshot of who is live and where they are, with the
+// ring that follows from it. Replacing it wholesale means a request always sees
+// one coherent view of the cluster rather than a map changing underneath it.
+type membership struct {
+	peers map[string]string // node id -> host:port, including self
+	ring  *ring.Ring
+}
+
 // Coordinator handles client requests on behalf of the whole cluster.
 type Coordinator struct {
 	self      string
-	peers     map[string]string // node id -> host:port, including self
-	ring      *ring.Ring
+	addr      string
+	live      atomic.Pointer[membership]
 	store     *store.Store
 	meta      *meta.Store
 	chunkSize int64
 }
 
-// New builds a coordinator. peers must list every node in the cluster including
-// self, so that every node derives the same ring and therefore the same
-// placement; disagreeing rings would scatter an object's chunks.
-func New(self string, peers map[string]string, s *store.Store, m *meta.Store, chunkSize int64) (*Coordinator, error) {
-	if _, ok := peers[self]; !ok {
-		return nil, fmt.Errorf("cluster: own id %q missing from the peer list %v", self, peers)
+// New builds a coordinator that initially knows only about itself. Callers feed
+// it the cluster's membership as etcd reports it.
+func New(self, addr string, s *store.Store, m *meta.Store, chunkSize int64) *Coordinator {
+	c := &Coordinator{self: self, addr: addr, store: s, meta: m, chunkSize: chunkSize}
+	c.SetMembers(nil)
+	return c
+}
+
+// SetMembers replaces this node's view of the cluster. Self is always included:
+// a node is alive by definition, so it belongs in its own ring even if its
+// registration in etcd has not landed or has briefly lapsed.
+func (c *Coordinator) SetMembers(peers map[string]string) {
+	next := maps.Clone(peers)
+	if next == nil {
+		next = make(map[string]string, 1)
 	}
-	return &Coordinator{
-		self:      self,
-		peers:     peers,
-		ring:      ring.New(slices.Sorted(maps.Keys(peers)), ring.DefaultVNodes),
-		store:     s,
-		meta:      m,
-		chunkSize: chunkSize,
-	}, nil
+	next[c.self] = c.addr
+	c.live.Store(&membership{
+		peers: next,
+		ring:  ring.New(slices.Sorted(maps.Keys(next)), ring.DefaultVNodes),
+	})
+}
+
+// Members reports this node's view of the cluster, which is what makes failure
+// detection observable from outside.
+func (c *Coordinator) Members() map[string]string {
+	return maps.Clone(c.live.Load().peers)
 }
 
 // Put streams an object into the cluster and returns its committed manifest.
@@ -66,13 +87,17 @@ func New(self string, peers map[string]string, s *store.Store, m *meta.Store, ch
 // at least W owners and the manifest is in etcd; before then the object does not
 // exist, however many chunks are already on disk.
 func (c *Coordinator) Put(ctx context.Context, key string, body io.Reader) (object.Manifest, error) {
-	owners := c.ring.Owners(ring.PartitionFor(key), Replicas)
+	// One snapshot for the whole object: membership may change mid-upload, and
+	// spreading an object's chunks over two different rings would leave later
+	// chunks on nodes the manifest does not name.
+	live := c.live.Load()
+	owners := live.ring.Owners(ring.PartitionFor(key), Replicas)
 	if len(owners) == 0 {
 		return object.Manifest{}, fmt.Errorf("cluster: no nodes available to place %q", key)
 	}
 
 	m, err := object.Write(body, c.chunkSize, func(ref object.ChunkRef, data []byte) error {
-		return c.replicate(ctx, ref, data, owners)
+		return c.replicate(ctx, ref, data, owners, live)
 	})
 	if err != nil {
 		return object.Manifest{}, err
@@ -104,14 +129,14 @@ func (c *Coordinator) Stream(ctx context.Context, m object.Manifest, w io.Writer
 // It waits for all N rather than returning at W: the extra copy is the whole
 // point of N > W, and a push abandoned when the request ends would leave the
 // object under-replicated until repair noticed.
-func (c *Coordinator) replicate(ctx context.Context, ref object.ChunkRef, data []byte, owners []string) error {
+func (c *Coordinator) replicate(ctx context.Context, ref object.ChunkRef, data []byte, owners []string, live *membership) error {
 	errs := make([]error, len(owners))
 	var wg sync.WaitGroup
 	for i, owner := range owners {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errs[i] = c.storeChunk(ctx, owner, ref, data)
+			errs[i] = c.storeChunk(ctx, owner, ref, data, live)
 		}()
 	}
 	wg.Wait()
@@ -131,25 +156,31 @@ func (c *Coordinator) replicate(ctx context.Context, ref object.ChunkRef, data [
 	return nil
 }
 
-func (c *Coordinator) storeChunk(ctx context.Context, owner string, ref object.ChunkRef, data []byte) error {
+func (c *Coordinator) storeChunk(ctx context.Context, owner string, ref object.ChunkRef, data []byte, live *membership) error {
 	if owner == c.self {
 		return c.store.WriteChunkVerified(ref.ID, bytes.NewReader(data), ref.CRC, ref.Size)
 	}
-	return peer.PushChunk(ctx, c.peers[owner], ref.ID, ref.CRC, ref.Size, bytes.NewReader(data))
+	return peer.PushChunk(ctx, live.peers[owner], ref.ID, ref.CRC, ref.Size, bytes.NewReader(data))
 }
 
 // fetch returns a reader for one chunk, trying owners until one answers. A chunk
 // that only reached W of N owners is genuinely absent from the others, so a miss
 // is expected rather than a fault.
 func (c *Coordinator) fetch(ctx context.Context, ref object.ChunkRef, nodes []string) (io.ReadCloser, error) {
+	live := c.live.Load()
 	var errs []error
 	for _, node := range c.localFirst(nodes) {
 		var rc io.ReadCloser
 		var err error
-		if node == c.self {
+		switch addr := live.peers[node]; {
+		case node == c.self:
 			rc, err = c.store.ReadChunk(ref.ID, ref.CRC)
-		} else {
-			rc, err = peer.FetchChunk(ctx, c.peers[node], ref.ID, ref.CRC)
+		case addr == "":
+			// The manifest names a node that has since left the cluster, so
+			// there is no address left to try. Its copy may well still exist.
+			err = fmt.Errorf("cluster: node %s holding chunk %s is not a member", node, ref.ID)
+		default:
+			rc, err = peer.FetchChunk(ctx, addr, ref.ID, ref.CRC)
 		}
 		if err == nil {
 			return rc, nil
