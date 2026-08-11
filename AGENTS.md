@@ -79,5 +79,7 @@ Rules that make these structural:
 
 - Never create git commits, push, or open PRs unless explicitly asked.
 - Dependencies: prefer the standard library. Pre-approved: `klauspost/reedsolomon`,
-  `go.etcd.io/etcd/client/v3`. Anything else: propose it first with a one-line reason.
+ `go.etcd.io/etcd/client/v3`, and `aws/aws-sdk-go-v2` **in tests only** — its signer is the
+ independent oracle the SigV4 tests check against. Anything else: propose it first with a
+ one-line reason.
 - Do not "fix" a failing chaos/integration test by loosening its assertions.
