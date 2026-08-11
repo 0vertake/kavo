@@ -148,6 +148,10 @@ type PutOptions struct {
 	// completion sets it: that object's ETag is derived from its parts' and there
 	// are no bytes here to hash.
 	ETag string
+	// Size is the body's length as the client declared it, and is passed on as a
+	// hint for sizing the write buffer. Zero means "not declared", and nothing
+	// here is trusted for anything else.
+	Size int64
 }
 
 // Put streams an object into the cluster and returns its committed manifest.
@@ -156,7 +160,7 @@ type PutOptions struct {
 // at least W owners and the manifest is in etcd; before then the object does not
 // exist, however many chunks are already on disk.
 func (c *Coordinator) Put(ctx context.Context, key string, body io.Reader, opts PutOptions) (object.Manifest, error) {
-	m, err := c.write(ctx, key, body)
+	m, err := c.write(ctx, key, body, opts.Size)
 	if err != nil {
 		return object.Manifest{}, err
 	}
@@ -177,7 +181,7 @@ func (c *Coordinator) Put(ctx context.Context, key string, body io.Reader, opts 
 // Multipart upload is why this is separate from Put. A part's chunks are placed by
 // the final object's key so that completing the upload is a single manifest commit
 // — the parts are already where the object's manifest will say they are.
-func (c *Coordinator) write(ctx context.Context, key string, body io.Reader) (object.Manifest, error) {
+func (c *Coordinator) write(ctx context.Context, key string, body io.Reader, expect int64) (object.Manifest, error) {
 	// One snapshot for the whole object: membership may change mid-upload, and
 	// spreading an object's chunks over two different rings would leave later
 	// chunks on nodes the manifest does not name.
@@ -200,10 +204,31 @@ func (c *Coordinator) write(ctx context.Context, key string, body io.Reader) (ob
 	// upload against, and hashing here is the only place the whole object passes
 	// through in order. Alongside the write, not after it: reading the object
 	// back to hash it would double the traffic of every PUT.
+	//
+	// Concurrently with storing each chunk rather than while reading it. MD5 has
+	// no hardware acceleration on arm64 and runs at ~550 MB/s, which made it 117
+	// ms of a 268 ms 64 MB PUT — nearly half the write, spent in front of the
+	// network instead of beside it. Storing a chunk waits on disks and peers, so
+	// the two overlap almost perfectly: 64 MB went from 268 ms to 154 ms, against
+	// 151 ms for not hashing at all.
+	//
+	// Both only read the chunk, which is what makes this safe, and chunks are
+	// hashed in the order they are cut, which is what keeps the sum the object's.
 	sum := md5.New()
-	m, err := object.Write(io.TeeReader(body, sum), c.chunkSize, func(ref *object.ChunkRef, data []byte) error {
+	m, err := object.Write(body, c.chunkSize, expect, func(ref *object.ChunkRef, data []byte) error {
+		hashed := make(chan struct{})
+		go func() {
+			defer close(hashed)
+			sum.Write(data)
+		}()
+		// Before returning on any path: the next chunk overwrites this buffer.
+		defer func() { <-hashed }()
+
 		if c.scheme != (ec.Scheme{}) {
-			return c.encode(ctx, ref, data, owners, live)
+			// Capacity clamped so that splitting the chunk into shards cannot
+			// pad into the buffer's spare room, which the hash is reading. A
+			// partial last chunk costs one small copy for that.
+			return c.encode(ctx, ref, data[:len(data):len(data)], owners, live)
 		}
 		return c.replicate(ctx, *ref, data, owners, live)
 	})

@@ -64,7 +64,7 @@ func TestWriteGrowsItsBufferWithoutChangingTheObject(t *testing.T) {
 			s, _ := mustOpen(t)
 			data := randBytes(int(size))
 
-			m, err := Write(bytes.NewReader(data), chunkSize, commitTo(s))
+			m, err := Write(bytes.NewReader(data), chunkSize, 0, commitTo(s))
 			if err != nil {
 				t.Fatalf("Write: %v", err)
 			}
@@ -95,7 +95,7 @@ func TestSmallObjectDoesNotAllocateAChunk(t *testing.T) {
 
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
-	if _, err := Write(bytes.NewReader(data), chunkSize, commitTo(s)); err != nil {
+	if _, err := Write(bytes.NewReader(data), chunkSize, 0, commitTo(s)); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 	runtime.ReadMemStats(&after)
@@ -104,6 +104,71 @@ func TestSmallObjectDoesNotAllocateAChunk(t *testing.T) {
 	if grew := after.TotalAlloc - before.TotalAlloc; grew > 4*smallObject {
 		t.Errorf("writing 4 KB allocated %d bytes, want well under one %d-byte chunk",
 			grew, chunkSize)
+	}
+}
+
+// The size hint comes from a client's Content-Length, so the only thing it is
+// allowed to change is how much the write allocates. These are the ways a claim
+// can be wrong — absent, unknown, far short, one byte out, and absurd — and none
+// of them may change the object that comes back.
+func TestTheSizeHintIsOnlyAHint(t *testing.T) {
+	const chunkSize = 4 * smallObject
+	const size = chunkSize + smallObject // more than one chunk, so growth happens too
+	data := randBytes(size)
+
+	for _, expect := range []int64{0, -1, 1, size - 1, size, size + 1, 1 << 40} {
+		t.Run(fmt.Sprint(expect), func(t *testing.T) {
+			s, _ := mustOpen(t)
+			m, err := Write(bytes.NewReader(data), chunkSize, expect, commitTo(s))
+			if err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			if len(m.Chunks) != 2 || m.Size != size {
+				t.Errorf("got %d chunks of %d bytes, want 2 of %d", len(m.Chunks), m.Size, size)
+			}
+
+			var got bytes.Buffer
+			if err := Read(m, &got, fetchFrom(s)); err != nil {
+				t.Fatalf("Read: %v", err)
+			}
+			if !bytes.Equal(got.Bytes(), data) {
+				t.Error("read data differs from written data")
+			}
+		})
+	}
+}
+
+// What the hint is for, and the bound that keeps it from being a weapon. An
+// object between the small-object size and a chunk used to allocate a whole
+// chunk — an 8 MB multipart part cost 33 MB — and a client claiming a terabyte
+// must still allocate exactly one chunk.
+func TestTheSizeHintAllocatesWhatItPromises(t *testing.T) {
+	const chunkSize = 32 * smallObject
+	const size = 8 * smallObject
+	data := randBytes(size)
+
+	for _, tt := range []struct {
+		name     string
+		expect   int64
+		maxAlloc int64
+	}{
+		{"honest", size, 2 * size},
+		{"absurd", 1 << 40, 2 * chunkSize},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, _ := mustOpen(t)
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			if _, err := Write(bytes.NewReader(data), chunkSize, tt.expect, commitTo(s)); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			runtime.ReadMemStats(&after)
+
+			if grew := int64(after.TotalAlloc - before.TotalAlloc); grew > tt.maxAlloc {
+				t.Errorf("writing %d bytes with a hint of %d allocated %d bytes, want at most %d",
+					size, tt.expect, grew, tt.maxAlloc)
+			}
+		})
 	}
 }
 
@@ -126,7 +191,7 @@ func TestRoundTripChunkBoundaries(t *testing.T) {
 			s, _ := mustOpen(t)
 			data := randBytes(tc.size)
 
-			m, err := Write(bytes.NewReader(data), chunkSize, commitTo(s))
+			m, err := Write(bytes.NewReader(data), chunkSize, 0, commitTo(s))
 			if err != nil {
 				t.Fatalf("Write: %v", err)
 			}
@@ -154,7 +219,7 @@ func TestCorruptChunkFailsRead(t *testing.T) {
 	s, root := mustOpen(t)
 	data := randBytes(4096)
 
-	m, err := Write(bytes.NewReader(data), 1024, commitTo(s))
+	m, err := Write(bytes.NewReader(data), 1024, 0, commitTo(s))
 	if err != nil {
 		t.Fatalf("Write: %v", err)
 	}
@@ -197,7 +262,7 @@ func TestCorruptFinalChunkIsNotDeliveredWhole(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s, root := mustOpen(t)
 			data := randBytes(tt.size)
-			m, err := Write(bytes.NewReader(data), tt.chunks, commitTo(s))
+			m, err := Write(bytes.NewReader(data), tt.chunks, 0, commitTo(s))
 			if err != nil {
 				t.Fatalf("Write: %v", err)
 			}
@@ -235,7 +300,7 @@ func TestWriteFailsMidStream(t *testing.T) {
 	boom := errors.New("client disconnected")
 	src := io.MultiReader(bytes.NewReader(randBytes(1500)), failingReader{err: boom})
 
-	m, err := Write(src, 1024, commitTo(s))
+	m, err := Write(src, 1024, 0, commitTo(s))
 	if !errors.Is(err, boom) {
 		t.Fatalf("Write error = %v, want %v", err, boom)
 	}
@@ -248,7 +313,7 @@ func TestWriteFailsMidStream(t *testing.T) {
 // byte count has to.
 func TestShortManifestFailsRead(t *testing.T) {
 	s, _ := mustOpen(t)
-	m, err := Write(bytes.NewReader(randBytes(4096)), 1024, commitTo(s))
+	m, err := Write(bytes.NewReader(randBytes(4096)), 1024, 0, commitTo(s))
 	if err != nil {
 		t.Fatalf("Write: %v", err)
 	}
@@ -287,7 +352,7 @@ func TestStreamingIsConstantMemory(t *testing.T) {
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
 
-	m, err := Write(io.LimitReader(zeroReader{}, objSize), chunkSize, commitTo(s))
+	m, err := Write(io.LimitReader(zeroReader{}, objSize), chunkSize, 0, commitTo(s))
 	if err != nil {
 		t.Fatalf("Write: %v", err)
 	}

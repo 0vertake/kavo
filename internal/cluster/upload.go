@@ -65,12 +65,13 @@ func (c *Coordinator) CreateUpload(ctx context.Context, key, contentType string)
 	return id, nil
 }
 
-// UploadPart stores one part and returns its ETag.
+// UploadPart stores one part and returns its ETag. size is the part's declared
+// length, used only to size the write buffer.
 //
 // The part's chunks are placed by the object's key, not the part's, so that
 // completion is a single manifest commit rather than a copy: the chunks are already
 // on the nodes the object's manifest will name.
-func (c *Coordinator) UploadPart(ctx context.Context, id string, number int, body io.Reader) (string, error) {
+func (c *Coordinator) UploadPart(ctx context.Context, id string, number int, body io.Reader, size int64) (string, error) {
 	// Part 0 does not exist and part 10001 never will, so this is the same answer
 	// as naming a part that was never uploaded.
 	if number < 1 || number > MaxParts {
@@ -81,7 +82,7 @@ func (c *Coordinator) UploadPart(ctx context.Context, id string, number int, bod
 		return "", err
 	}
 
-	m, err := c.write(ctx, u.Key, body)
+	m, err := c.write(ctx, u.Key, body, size)
 	if err != nil {
 		return "", err
 	}

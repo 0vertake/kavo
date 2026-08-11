@@ -94,7 +94,7 @@ func (h *handler) uploadPart(w http.ResponseWriter, r *http.Request, id string) 
 		return
 	}
 
-	etag, err := h.cluster.UploadPart(r.Context(), id, number, r.Body)
+	etag, err := h.cluster.UploadPart(r.Context(), id, number, r.Body, r.ContentLength)
 	if err != nil {
 		fail(w, r, uploadError(err), err)
 		return

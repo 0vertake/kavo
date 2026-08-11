@@ -92,6 +92,7 @@ func (h *handler) putObject(w http.ResponseWriter, r *http.Request) {
 
 	m, err := h.cluster.Put(r.Context(), key, r.Body, cluster.PutOptions{
 		ContentType: r.Header.Get("Content-Type"),
+		Size:        r.ContentLength,
 	})
 	if err != nil {
 		fail(w, r, storeError(err), err)

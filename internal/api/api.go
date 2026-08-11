@@ -58,7 +58,7 @@ func (h *handler) put(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "empty object key", http.StatusBadRequest)
 		return
 	}
-	m, err := h.cluster.Put(r.Context(), key, r.Body, cluster.PutOptions{})
+	m, err := h.cluster.Put(r.Context(), key, r.Body, cluster.PutOptions{Size: r.ContentLength})
 	if err != nil {
 		log.Printf("put %s: %v", key, err)
 		if errors.Is(err, cluster.ErrQuorum) {

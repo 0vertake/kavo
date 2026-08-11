@@ -126,9 +126,9 @@ func (h *handler) listObjects(w http.ResponseWriter, r *http.Request) {
 	for _, o := range page.Objects {
 		result.Contents = append(result.Contents, listEntry{
 			Key:          encode(unscoped(bucket, o.Key)),
-			LastModified: o.Manifest.Modified.UTC().Format("2006-01-02T15:04:05.000Z"),
-			ETag:         `"` + o.Manifest.ETag + `"`,
-			Size:         o.Manifest.Size,
+			LastModified: o.Modified.UTC().Format("2006-01-02T15:04:05.000Z"),
+			ETag:         `"` + o.ETag + `"`,
+			Size:         o.Size,
 			// One class, because tiering is an anti-goal. Clients still expect
 			// the field, and an absent one has been known to crash them.
 			StorageClass: "STANDARD",

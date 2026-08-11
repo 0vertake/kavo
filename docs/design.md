@@ -469,9 +469,11 @@ implementation disagreeing is the only thing that catches a misreading.
   What it does not cover: a partition that isolates nodes from each other while leaving them
   reachable by clients (SIGSTOP freezes a node from everyone at once), erasure-coded mode, and
   anything that needs the page cache to disappear — see the fsync limitation below.
-- **Benchmarks** (milestone 11): MinIO `warp` for throughput/latency (put/get/mixed/
-  multipart, p50–p99.9); custom harness for heal time, rebalance fraction, and peak RSS
-  while streaming. Final numbers on 3–4 separate cloud VMs over a real network.
+- **Benchmarks** (milestone 11): in-repo benchmarks cover both APIs, both redundancy modes, repair,
+  scrub and listing — what they measured, what it changed, and what it deliberately did not, is in
+  `docs/benchmarks.md`. Still outstanding: MinIO `warp` for latency distributions (p50–p99.9) and
+  peak RSS while streaming, on 3–4 separate cloud VMs over a real network. Nothing measured on one
+  laptop with one disk is a headline number.
 
 ## Known limitations (publish these)
 
