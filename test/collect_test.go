@@ -327,7 +327,6 @@ func TestAMoveThatReplacesEveryOwnerKeepsItsData(t *testing.T) {
 	// Waiting on the moves rather than on the clock, because a sleep that turns out
 	// to be shorter than the moves does not fail this test, it empties it.
 	awaitMoved(t, prefix, "measure/", keys, nodes)
-	awaitCopies(t, grown, len(keys)*chunks*cluster.Replicas)
 
 	for _, key := range keys {
 		getSigned(t, nodes[0], key, size)
@@ -335,15 +334,24 @@ func TestAMoveThatReplacesEveryOwnerKeepsItsData(t *testing.T) {
 
 	// Reading is the guarantee, but it is not the whole of it: before the sweep
 	// consulted the ring, these objects still read, because repair replaced what the
-	// sweep took from under the move. Copy, delete, copy again is work the cluster
-	// does twice and a durability argument that rests on repair winning a race, so
-	// the assertion is that nothing was reclaimed at all. There is no garbage in
-	// this test — a move drops what it moved from itself.
+	// sweep had taken from under the move. That is a durability argument resting on
+	// one background pass outrunning another, so the assertion is that repair had
+	// nothing to do. It only logs when it restores or fails to restore a copy, and
+	// with the ring clause in place there is nothing to restore: before the commit
+	// every copy is where the manifest says, and after it every copy is where the
+	// move put it.
 	for _, n := range grown {
-		if line := firstLineContaining(n.logs.String(), "collect: reclaimed"); line != "" {
-			t.Errorf("%s reclaimed chunks while a move was in flight: %s", n.id, line)
+		if line := firstLineContaining(n.logs.String(), "repair: restored"); line != "" {
+			t.Errorf("%s had to rebuild a copy a sweep took from under the move: %s", n.id, line)
 		}
 	}
+
+	// The copies the move superseded are still on the nodes that lost the partition,
+	// because a move no longer drops them — a copied object shares its source's
+	// chunks, so no pass may delete one on the strength of the single manifest in
+	// front of it. Collection is what takes them, and this is the wait for it: back
+	// to one set of copies rather than two.
+	awaitCopies(t, grown, len(keys)*chunks*cluster.Replicas)
 }
 
 // awaitMoved waits until every key's manifest names none of the nodes that held it

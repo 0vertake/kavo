@@ -269,22 +269,20 @@ rejoins and finds no manifest pointing at what it holds.
 ### Collecting unreferenced chunks
 
 Every write leaves chunks nothing points at. An overwrite supersedes the chunks of the manifest
-it replaces. A write that fails after storing data leaves what it stored. A rebalance leaves a
-copy behind if the delete after the move does not happen. Deletes and aborted uploads do drop
-their own chunks, but only as a best effort that is logged rather than returned, because by then
-the object is already gone as far as any reader is concerned. None of it is reachable — readers
-resolve objects only through committed manifests — so none of it threatens correctness. It is
-storage that is paid for and not counted, and it only ever grows.
+it replaces. A write that fails after storing data leaves what it stored. A delete and an aborted
+upload leave everything they named. A rebalance leaves behind the copies it moved away from. None of
+it is reachable — readers resolve objects only through committed manifests — so none of it threatens
+correctness. It is storage that is paid for and not counted, and it only ever grows.
 
 The obvious design is to record what each write superseded: commit the new manifest and a list
 of the old one's chunks in one transaction, then have a worker delete them. That needs the
 revision the commit replaced, which is the compare-and-swap the write path was always going to
 grow. **It is the wrong design, and the reason is `CopyObject`.** Chunk ids are a random prefix
-per write plus an index, so today no two manifests ever name the same chunk — and copying an
-object server-side means copying its manifest and not its data, which makes them share. Under
-sharing, deleting the chunks of the manifest an overwrite replaced would delete chunks a copy
-still references, which is an acknowledged write lost from the collection path. A per-write
-record cannot express sharing without reference counts in the commit path.
+per write plus an index, so no two *writes* ever name the same chunk — but copying an object
+server-side means copying its manifest and not its data, which makes two keys name one set of
+chunks. Under sharing, deleting the chunks of the manifest an overwrite replaced would delete
+chunks a copy still references, which is an acknowledged write lost from the collection path. A
+per-write record cannot express sharing without reference counts in the commit path.
 
 So the pass is mark-and-sweep instead. A node reads every manifest in the cluster, builds the
 set of chunk ids some manifest says *this node* should hold, and deletes the local chunks that
@@ -292,6 +290,19 @@ set does not contain. A chunk is live if any manifest names it, so sharing costs
 the write path is untouched: the commit point keeps the proof it already had. It also reclaims
 garbage no record would ever have been written for, which is every category above except the
 first.
+
+**And it is the only thing that deletes a chunk.** That is the same argument reaching every other
+pass, once sharing exists. A delete used to drop its object's chunks, an abort its parts', a
+rebalance the copies it had just moved away from — each on the strength of the one manifest in front
+of it, which is exactly the judgement sharing invalidates. Deleting a copied object would have taken
+its source's data; and the worse one, because nobody asked for it: a copy keeps its source's
+placement, so the ring makes it misplaced from the moment it exists, and the rebalance that tidied
+it up would drop the source's copies on the way past. `TestMovingACopyLeavesTheSourceReadable`
+covers that. So none of them delete anything now, and there is no longer any code that can delete a
+chunk on another node — the peer API's delete route is gone, which also takes a capability off the
+unauthenticated internal port. The cost is paid at the disk: space returns within a collection cycle
+rather than at once, which is why the interval defaults to a minute and a full cycle to about half
+an hour.
 
 Three things make it safe:
 
@@ -316,9 +327,9 @@ parts through fifteen full cycles of the id space before it completes
 grace period or stops reading part manifests: both mutations turn reads into `unexpected EOF`.
 
 What the manifest says, not what exists: a copy on a node the manifest does not name is
-unreachable, because a reader tries the nodes it names and stops. That is the same rule
-rebalancing relies on when it deletes the copy it moved away from, and it is what lets this pass
-reclaim the residue when that delete does not happen.
+unreachable, because a reader tries the nodes it names and stops. That is what lets this pass
+reclaim the copies a move leaves behind — which is now every move, since nothing but this pass
+deletes a chunk.
 
 **And what the ring says, which is the seam where this pass first lost data.** A rebalance
 copies every chunk to the new owners before committing the manifest that names them — it has to,
@@ -326,8 +337,9 @@ because until that commit a reader must still find the object where the old mani
 — and the copying is rate-limited. So for the length of a move, the object's size over the
 repair rate, the destination holds chunks no manifest mentions. Judged by the manifests alone
 they are garbage, and a sweep deletes them as fast as the move makes them; then the move commits,
-promising copies that are no longer there, and drops the old ones on the strength of that
-promise. Both passes were doing exactly what they were written to do.
+promising copies that are no longer there. At the time the move also dropped the old copies on the
+strength of that promise, which is what turned a missing copy into a missing object. Both passes
+were doing exactly what they were written to do.
 
 Measured, in a three-node cluster grown to six with the sweep set to a short grace: for keys the
 join reassigns to an entirely new set of owners, one chunk ended up on no node at all, the object
@@ -342,16 +354,30 @@ owner of the object it belongs to**. The ring is what says a move here is in fli
 the destination's copies are referenced for the whole move. It spares nothing this pass was
 written for: a copy a move left behind sits on a node that lost the partition, so neither the
 manifest nor the ring names it, and it is still collected. `TestAMoveThatReplacesEveryOwnerKeepsItsData`
-holds the cluster in that state on purpose, and asserts not only that the objects read but that
-the sweep reclaimed nothing — because before the fix the objects sometimes still read, and only
-because repair replaced what the sweep took.
+holds the cluster in that state on purpose: it doubles a three-node cluster and picks keys whose
+owners all change, so no copy of them stays put. It asserts that the objects read *and* that repair
+never restored anything — because before the fix the objects sometimes still read, and only because
+repair replaced what the sweep had taken. A guarantee that depends on one background pass outrunning
+another is not a guarantee. With the ring clause there is nothing to restore: before the commit every
+copy is where the manifest says, and after it every copy is where the move put it.
 
 Each pass sweeps one thirty-second of the id space, chosen by cursor, because the alternative is
 holding a set of every chunk id on the node — tens of megabytes at a million chunks, and a
 background pass whose memory grows with the disk is one that eventually cannot run. A chunk id
 starts with a random base32 character and a shard id starts with its chunk's id, so one slice
-covers a chunk and all of its shards. At the default 10-minute interval a full cycle is about
-five hours, which is a reasonable time for storage nobody can read to be freed.
+covers a chunk and all of its shards. At the default one-minute interval a full cycle is about half
+an hour, and since nothing is reclaimed before the grace period either, a delete shows up as free
+space within a grace period plus a cycle — an hour and a half at the shipped defaults, most of it
+grace.
+
+**The grace period is the expensive default, and it is expensive for a reason.** It has to exceed the
+gap between a chunk becoming durable and the manifest naming it being committed, because for that
+whole window a perfectly good chunk is referenced by nothing. For a single PUT that gap is one
+request — and a request can be slow: S3 allows a single PUT of 5 GB, which over a 10 Mbit link is
+over an hour. An hour of grace is not generosity, it is roughly the size of the hazard, and a PUT
+slower than it is a real edge (see the limitations). Multipart uploads are not exposed to it at all:
+a part's chunks are named by the part's own manifest from the moment it is uploaded, so they are
+protected by reference rather than by age, however long the upload takes.
 
 ## Crash safety
 
@@ -413,10 +439,20 @@ sent cannot be withdrawn. A read that fails **after** the body started is report
 short of the promised `Content-Length` — a truncated transfer every client treats as an error,
 which is the only remaining way to say "do not trust these bytes".
 
-**Delete removes the manifest first**, which is the instant the object stops existing, and only
-then reclaims chunks. The reverse order would drop chunks a live manifest still names. Deleting a
-key that is not there succeeds, because S3 promises an idempotent delete and clients build
-cleanup loops on it.
+**Delete removes the manifest and nothing else**, which is the instant the object stops existing,
+since a reader can only reach chunks through one. The chunks stay until the collection pass has read
+every manifest in the cluster and found no name for them — a copy shares its source's chunks, so this
+manifest alone does not speak for them. Deleting a key that is not there succeeds, because S3
+promises an idempotent delete and clients build cleanup loops on it.
+
+**`CopyObject` copies the manifest, not the data.** A server-side copy of a terabyte is one etcd
+write, which is the only reason to have the operation at all: `aws s3 mv` is a copy and a delete, and
+a copy that made the client download and re-upload would be slower than the client doing it itself.
+The copy keeps the source's placement rather than its own key's, so the ring considers it misplaced
+from the moment it exists and rebalancing moves it in the background; until then it is readable
+exactly where the source is. `UploadPartCopy` is not implemented — a range of a source object would
+have to be re-chunked at the range boundaries, and re-chunking is the one thing this copy never
+does.
 
 ### Listing
 
@@ -538,11 +574,18 @@ implementation disagreeing is the only thing that catches a misreading.
 
 - **Chaos** (milestone 10): `go test ./test -run TestChaos`, tunable with `-chaos.duration` and
   replayable with `-chaos.seed`. Eight workers drive a signed S3 workload — single PUTs and
-  multipart uploads, reads through a different node than the write went to, and deletes — against
-  four real `kavod` processes while faults arrive on a seeded schedule: SIGKILL and restart,
-  SIGSTOP (a frozen process: ports open, nothing answered, no lease renewed), a wiped disk, and a
-  flipped bit under a running node. Then it asserts the four invariants (see `AGENTS.md`) from the
-  recorded history.
+  multipart uploads, reads through a different node than the write went to, server-side copies, and
+  deletes — against four real `kavod` processes while faults arrive on a seeded schedule: SIGKILL and
+  restart, SIGSTOP (a frozen process: ports open, nothing answered, no lease renewed), a wiped disk,
+  and a flipped bit under a running node. Then it asserts the four invariants (see `AGENTS.md`) from
+  the recorded history.
+
+  The copies are there because they are what makes two keys name one set of chunks, and roughly one
+  in five of their sources is then deleted. That combination is the reason nothing but the collection
+  pass may delete a chunk, so the run turns the collector up — a one-second interval and a
+  ten-second grace, still seven times the longest stall a fault here imposes — and counts what it
+  reclaimed. A long run that reclaimed nothing fails: it would mean the copies had been tested
+  against an idle collector, which is the version of this test that proves nothing.
 
   Three things make it more than a smoke test.
 
@@ -620,12 +663,23 @@ implementation disagreeing is the only thing that catches a misreading.
 - **Killing a process is not killing a machine**: SIGKILL proves commit ordering and rename
   atomicity, but the page cache survives it, so the harness cannot prove fsync actually
   reached the platter. That needs power-loss or filesystem fault injection (milestone 10).
-- **Unreferenced chunks are reclaimed within a cycle, not immediately**: an overwrite, an
-  interrupted delete, a write refused for missing quorum and a rebalance whose commit lost to a
-  client all leave chunks nothing points at, and the collection pass above frees them a slice of
-  the id space at a time. At the default interval that is up to about five hours, plus the grace
-  period. Bounded rather than unbounded, but a store that has just deleted a terabyte does not
-  see the space back at once.
+- **Deleted space comes back in about an hour and a half, not at once**: nothing deletes a chunk
+  except the collection pass, so a delete, an overwrite, an aborted upload, a write refused for
+  missing quorum and a rebalance all leave chunks for it, and it frees them a slice of the id space
+  at a time — no sooner than the one-hour grace period, and within a further half-hour cycle after
+  that. Measured on a join: a seventh node's arrival left 32 copies of 192 that no manifest named,
+  and with the collector turned up to a 1-second interval and a 10-second grace they were gone 37
+  seconds after the move. Bounded rather than unbounded, but a store that has just deleted a
+  terabyte does not see the space back immediately. Sharing chunks between keys is what costs this:
+  a delete cannot know whether a copy it never heard of still needs what it is about to free, and
+  the pass that reads every manifest can.
+- **A single PUT slower than the grace period can lose its own early chunks**: the sweep protects a
+  chunk by age, and an upload's first chunk is unreferenced until the manifest commits at the end.
+  An hour of grace against S3's 5 GB single-PUT limit means a client would have to be slower than
+  about 1.2 MB/s to reach it, and the ordinary large-object path is not exposed at all — multipart
+  parts are named by their own manifests as soon as they land, so they are protected by reference
+  rather than by age. The honest fix is for a write in flight to say so, rather than for the sweep to
+  infer it from a timestamp; the timestamp is what exists today.
 - **A multipart upload nobody finishes is never cleaned up**: an upload whose client walks away
   without aborting keeps its parts' chunks and its etcd records forever, and collection does not
   help — it is precisely the pass that keeps an in-flight upload's parts alive, and it cannot

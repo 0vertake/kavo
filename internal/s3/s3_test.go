@@ -319,6 +319,100 @@ func TestDeleteRemovesTheObjectAndIsIdempotent(t *testing.T) {
 	}
 }
 
+// A server-side copy is what `aws s3 mv` and `aws s3 cp` between two keys do, and
+// the SDK sends it as a PUT with a header naming the source. No byte of the object
+// crosses the network in either direction.
+func TestCopyingAnObjectServerSide(t *testing.T) {
+	client := newGateway(t)
+	body := randBytes(2 * testChunkSize)
+	put, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("source.bin"), Body: bytes.NewReader(body),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Across buckets as well as keys, since a bucket here is a prefix and a copy
+	// that only worked within one would be a surprise.
+	copied, err := client.CopyObject(t.Context(), &awss3.CopyObjectInput{
+		Bucket: aws.String("archive"), Key: aws.String("kept.bin"),
+		CopySource: aws.String("bucket/source.bin"),
+	})
+	if err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	if copied.CopyObjectResult == nil || aws.ToString(copied.CopyObjectResult.ETag) != aws.ToString(put.ETag) {
+		t.Errorf("the copy result carries etag %v, want the source's %v", copied.CopyObjectResult, aws.ToString(put.ETag))
+	}
+
+	out, err := client.GetObject(t.Context(), &awss3.GetObjectInput{
+		Bucket: aws.String("archive"), Key: aws.String("kept.bin"),
+	})
+	if err != nil {
+		t.Fatalf("get the copy: %v", err)
+	}
+	defer out.Body.Close()
+	got, err := io.ReadAll(out.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Errorf("the copy is %d bytes of something else, want the %d written", len(got), len(body))
+	}
+
+	// And the source is still there, which is the difference between a copy and a
+	// move: the client issues the delete itself, or not at all.
+	if _, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("source.bin"),
+	}); err != nil {
+		t.Errorf("the source is gone after being copied: %v", err)
+	}
+}
+
+// What a copy has to refuse. A source that does not exist is NoSuchKey, because a
+// client that mistyped a key must not be told the copy worked; a copy onto itself is
+// InvalidRequest, since the only thing it could mean is a metadata rewrite and there
+// is no metadata here to rewrite.
+func TestCopiesThatMustBeRefused(t *testing.T) {
+	client := newGateway(t)
+	if _, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("real.bin"),
+		Body: bytes.NewReader(randBytes(testChunkSize)),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name   string
+		source string
+		bucket string
+		key    string
+		want   string
+	}{
+		{name: "source does not exist", source: "bucket/imaginary.bin",
+			bucket: "bucket", key: "copy.bin", want: "NoSuchKey"},
+		{name: "onto itself", source: "bucket/real.bin",
+			bucket: "bucket", key: "real.bin", want: "InvalidRequest"},
+		{name: "source names no key", source: "bucket",
+			bucket: "bucket", key: "copy.bin", want: "InvalidArgument"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := client.CopyObject(t.Context(), &awss3.CopyObjectInput{
+				Bucket: aws.String(tt.bucket), Key: aws.String(tt.key),
+				CopySource: aws.String(tt.source),
+			})
+			var api smithy.APIError
+			if !errors.As(err, &api) {
+				t.Fatalf("copy = %v, want an S3 error code", err)
+			}
+			if api.ErrorCode() != tt.want {
+				t.Errorf("copy = %s, want %s", api.ErrorCode(), tt.want)
+			}
+		})
+	}
+}
+
 // A missing object must come back as NoSuchKey, not as a generic failure: the SDK
 // turns that code into a typed error applications branch on, and anything else
 // looks like an outage.

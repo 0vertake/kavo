@@ -16,7 +16,7 @@ claim without a failure injected is a wish.
 
 | | proven by |
 | --- | --- |
-| **No acknowledged write is ever lost.** | The chaos suite (`TestChaos`) records every ack and re-reads all of them after killing, freezing and wiping nodes mid-flight. `TestCrashDuringConcurrentUploads` SIGKILLs a node under concurrent uploads and re-reads every ack after it restarts. |
+| **No acknowledged write is ever lost.** | The chaos suite (`TestChaos`) records every ack and re-reads all of them after killing, freezing and wiping nodes mid-flight — including objects made by a server-side copy whose source was then deleted, with the garbage collector turned up so that it is deleting chunks throughout. `TestCrashDuringConcurrentUploads` SIGKILLs a node under concurrent uploads and re-reads every ack after it restarts. |
 | **No partially written object is ever readable.** | A write is acknowledged only once W chunk replicas are fsynced on distinct nodes *and* the manifest is committed to etcd. Readers resolve objects only through committed manifests, so a torn object has nothing to be read through. |
 | **Every read returns checksum-valid data or an explicit error.** | Every chunk is verified against the manifest's CRC32C on the way out, and the last byte of each chunk is withheld until that check passes — so a corrupt chunk becomes a transfer that stops short, never a successful wrong answer. The chaos suite flips bits on disk to check it. |
 | **After healing, redundancy is back to the configured level.** | Repair rebuilds missing copies against the ring; the chaos suite wipes a node's disk and then asserts every chunk is back on every owner it should be on. |
@@ -113,18 +113,27 @@ acknowledge one it cannot make durable.
 ## How compatible is compatible
 
 Ceph's `s3-tests` is the suite S3 implementations are measured against, and nobody here chose what it
-asserts. It has 886 tests and kavo does not implement most of what they cover, on purpose. Of the 641
-that fail: **429 are explicit anti-goals** — ACLs, versioning, server-side encryption, object lock,
+asserts. It has 886 tests and kavo does not implement most of what they cover, on purpose. Of the 622
+that fail: **462 are explicit anti-goals** — ACLs, versioning, server-side encryption, object lock,
 bucket policy, lifecycle, logging, CORS, tagging, SigV2, browser form uploads — **48 are v1
 `ListObjects`**, which kavo answers only at v2, and **28 follow from buckets being prefixes** rather
-than records. **135 are named gaps**, half of them `CopyObject` and conditional requests. One is the
-suite asserting Ceph's own configured region name.
+than records. **83 are named gaps**, a third of them conditional requests. One is the suite asserting
+Ceph's own configured region name.
 
-With that framing: **151 pass, 641 fail, 94 the suite skips, and nothing errors** — every test
+With that framing: **170 pass, 622 fail, 94 the suite skips, and nothing errors** — every test
 reaches a verdict rather than dying in setup, and every failure is accounted for in
 [`docs/s3-compatibility.md`](docs/s3-compatibility.md), which generates its breakdown from the
-suite's own output so it can be checked rather than believed. Of the tests covering `ListObjectsV2`,
-the operation kavo does claim, 37 of 40 pass.
+suite's own output so it can be checked rather than believed. Of the tests covering the operations
+kavo does claim, 37 of 40 `ListObjectsV2` tests pass, and 10 of 22 single-object copy tests — two of
+those ten only because kavo ignores `x-amz-copy-source-if-match` rather than honouring it, which is
+the kind of pass worth subtracting out loud.
+
+Two of those numbers moved for reasons worth separating. Nineteen passes came from adding
+`CopyObject`, which is a real operation clients use. Thirty-seven failures moved from the gap column
+to the anti-goal column because they were misfiled: the encryption tests whose names read as copies
+(`test_copy_enc[...]`) can never pass without SSE, and the classifier's rule for them matched `enc_`
+but not `enc[`. Nothing improved; a number that was wrong got fixed, which is the risk of any
+self-generated breakdown and the reason the script and its input are both in the repo.
 
 Running it was worth more than the number, twice over. It found four real defects, three of which
 kavo's own tests could not see — including a listing that reported itself truncated when it had ended
@@ -137,18 +146,18 @@ that exist nowhere in the code. Refusing them cost eighteen tests and is the rig
 
 Deliberate anti-goals, not a roadmap: no IAM, no ACLs, no versioning, no lifecycle rules, no
 bucket policies, no `ListObjects` v1. The S3 subset is PUT, GET (including ranges), HEAD, DELETE,
-`ListObjectsV2` and multipart upload, with SigV4 verification — plus the handful of calls clients
-make without being asked, which answer for records that do not exist: `CreateBucket` succeeds
+`ListObjectsV2`, multipart upload and `CopyObject`, with SigV4 verification — plus the handful of
+calls clients make without being asked, which answer for records that do not exist: `CreateBucket` succeeds
 because a bucket is a prefix, `ListBuckets` is a root listing, `DeleteBucket` refuses while objects
 remain, and `ListObjectVersions` reports every object once as version `null`.
 
 The gaps a client might actually notice are named in
-[`docs/s3-compatibility.md`](docs/s3-compatibility.md) rather than buried: no `CopyObject` (so no
-server-side `aws s3 mv`), no conditional requests, no `Content-MD5` verification, no
-`x-amz-meta-*` passthrough.
+[`docs/s3-compatibility.md`](docs/s3-compatibility.md) rather than buried: no conditional requests,
+no `Content-MD5` verification, no `x-amz-meta-*` passthrough.
 
 Real limitations — an etcd-bound object count, rot that can sit until the next scrub, deleted space
-that comes back within a collection cycle rather than at once — are listed with their consequences in
+that takes about an hour and a half to come back because collection is the only thing that deletes a
+chunk — are listed with their consequences in
 [`docs/design.md`](docs/design.md#known-limitations-publish-these). They are published rather than
 fixed because a known limit is cheaper than a surprise.
 

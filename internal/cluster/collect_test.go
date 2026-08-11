@@ -111,29 +111,6 @@ func TestOverwrittenChunksAreReclaimed(t *testing.T) {
 	}
 }
 
-// A delete drops its own chunks, but only as a best effort: the object is gone the
-// moment its manifest is, so a copy that could not be deleted is logged and left.
-// Removing the manifest alone is the state that leaves — a node that was down when
-// the drop was attempted, or a process that died between the two.
-func TestChunksAnInterruptedDeleteLeftBehindAreReclaimed(t *testing.T) {
-	tc := newCluster(t, 5)
-	const key = "gone.bin"
-	_, outsider := tc.owners(t, key)
-
-	m := mustPut(t, outsider, key, randBytes(2*testChunkSize))
-	if err := outsider.m.Delete(context.Background(), key); err != nil {
-		t.Fatalf("delete the manifest of %s: %v", key, err)
-	}
-	if where := held(t, tc, m.Chunks); len(where) != len(m.Chunks)*cluster.Replicas {
-		t.Fatalf("%d copies on disk before collecting, want %d", len(where), len(m.Chunks)*cluster.Replicas)
-	}
-
-	collectEverywhere(t, tc, 0)
-	if where := held(t, tc, m.Chunks); len(where) != 0 {
-		t.Errorf("chunks of an object with no manifest survived on %v", where)
-	}
-}
-
 // The grace period is what stands between this pass and a write that is in flight:
 // a chunk is durable before the manifest naming it is committed, so for that window
 // perfectly good data is referenced by nothing at all.
@@ -143,8 +120,8 @@ func TestAnUnreferencedChunkInsideTheGracePeriodIsKept(t *testing.T) {
 	_, outsider := tc.owners(t, key)
 
 	m := mustPut(t, outsider, key, randBytes(2*testChunkSize))
-	if err := outsider.m.Delete(context.Background(), key); err != nil {
-		t.Fatalf("delete the manifest of %s: %v", key, err)
+	if err := outsider.c.Delete(context.Background(), key); err != nil {
+		t.Fatalf("delete %s: %v", key, err)
 	}
 
 	st := collectEverywhere(t, tc, time.Hour)
@@ -347,6 +324,30 @@ func TestCollectingACleanClusterReclaimsNothing(t *testing.T) {
 	}
 	if st.Examined != st.Referenced {
 		t.Errorf("examined %d chunks but only %d were referenced, so something unreferenced is on disk", st.Examined, st.Referenced)
+	}
+}
+
+// The sweep reads the manifests in pages, and every other test in this file fits in
+// one. A pass that stopped at the first page would find a live chunk unreferenced and
+// delete it, which is the worst bug this system can have and the only one paging can
+// cause — so there is a test with more objects than a page holds.
+func TestManifestsBeyondTheFirstPageStillProtectTheirChunks(t *testing.T) {
+	tc := newCluster(t, 5)
+
+	// One chunk each, to keep the cost of 300 objects in the low seconds: it is the
+	// number of manifests that matters here, not their size.
+	const objects = 300 // more than the 256 a single etcd scan returns
+	var refs []object.ChunkRef
+	for i := range objects {
+		refs = append(refs, mustPut(t, tc.nodes["n1"], keyFor(i), randBytes(16)).Chunks...)
+	}
+
+	st := collectEverywhere(t, tc, 0)
+	if st.Collected != 0 {
+		t.Errorf("collected %d chunks of %d live objects, so some manifest was never read", st.Collected, objects)
+	}
+	if where := held(t, tc, refs); len(where) != len(refs)*cluster.Replicas {
+		t.Errorf("%d copies on disk after collecting, want %d", len(where), len(refs)*cluster.Replicas)
 	}
 }
 

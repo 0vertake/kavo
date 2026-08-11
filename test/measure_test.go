@@ -290,6 +290,13 @@ func TestMeasureHealTime(t *testing.T) {
 func TestMeasureRebalanceOnJoin(t *testing.T) {
 	skipUnlessMeasuring(t)
 
+	// A move leaves the copies it superseded for collection, so how long the cluster
+	// pays for two placements of the data that moved is part of what a join costs.
+	// Measuring that inside a run means turning the collector up; the shipped grace is
+	// an hour, which is longer than this measurement. Nothing is written after the
+	// join, so a ten-second grace cannot reach a write in flight.
+	defer withCollect("1s", "10s")()
+
 	bin := buildKavod(t)
 	prefix := clusterPrefix()
 	nodes := startCluster(t, bin, prefix, measureChunkSize, measureCluster)
@@ -321,12 +328,11 @@ func TestMeasureRebalanceOnJoin(t *testing.T) {
 	// has stood still for three seconds.
 	//
 	// Deliberately not part of that definition: the total copy count returning to
-	// what it was. It usually does, and once in three runs it did not — three
-	// copies of 192 outlived the move by minutes. Nothing is lost or unreadable
-	// when that happens, and redundancy is above target rather than below it, so
-	// it is a garbage collection gap and not a durability one — the same chunk
-	// garbage collection `docs/design.md` defers. It is reported below as a
-	// number instead of failing a measurement on a rare race.
+	// what it was. It cannot have, at this point. A move copies to the new owners and
+	// commits, and stops there — nothing but the collection pass deletes a chunk, since
+	// a copied object shares its source's chunks. So the cluster holds two placements
+	// of everything that moved until a sweep comes past, and how long that takes is
+	// measured separately below.
 	var converged time.Duration
 	var moved int
 	stableSince := time.Time{}
@@ -382,12 +388,40 @@ func TestMeasureRebalanceOnJoin(t *testing.T) {
 	}
 	_, after := copiesHeld(grown)
 
+	// Now wait for the residue to go, which is the other half of what a join costs:
+	// the space is committed to the old placement until a sweep reaches the slices
+	// those chunks are in.
+	reclaimStart := time.Now()
+	var reclaimed time.Duration
+	var left int
+	for {
+		extra, err := misplaced(t.Context(), grown, store)
+		if err != nil {
+			t.Fatal(err)
+		}
+		left = 0
+		for _, ids := range extra {
+			left += len(ids)
+		}
+		if left == 0 {
+			reclaimed = time.Since(reclaimStart)
+			break
+		}
+		if time.Since(reclaimStart) > 5*time.Minute {
+			t.Fatalf("%d copies no manifest names were still on disk five minutes after the move", left)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
 	t.Logf("%d objects, %d chunk copies over %d nodes before the join", objects, before, len(nodes))
 	t.Logf("%s joined: seen by every node in %v, converged in %v",
 		joiner.id, detected.Round(10*time.Millisecond), converged.Round(10*time.Millisecond))
 	t.Logf("%d of %d copies moved onto it (%.1f%%), and the seven-node ring owes it %d",
 		moved, before, 100*float64(moved)/float64(before), owed)
-	t.Logf("%d copies after against %d before; %d held that no manifest names", after, before, residue)
+	t.Logf("%d copies once the move committed against %d before, %d of them named by no manifest",
+		after, before, residue)
+	t.Logf("collection reclaimed all %d in %v after the move, at a 1s interval and a 10s grace",
+		residue, reclaimed.Round(100*time.Millisecond))
 }
 
 // Milestone 1's claim at a size that cannot be explained away: an object far

@@ -57,14 +57,18 @@ Rules that make these structural:
  revision it superseded, and a chunk that is live if *any* manifest names it is what lets an
  object be copied without copying its data. Compare-and-swap exists where a background pass
  rewrites what it read minutes ago, which is rebalancing.
-- **Deleting a chunk**: only after reading every manifest and finding none that names it *and*
- the ring does not make this node an owner of the object it belongs to, or after a rebalance has
- committed the manifest that says it lives elsewhere. The ring clause is not belt and braces: a
- move copies to the new owners before committing the manifest that names them, so mid-move the
- destination holds chunks only the ring accounts for, and a sweep that went by the manifests
- alone deleted them and lost an object. A pass that could not read all the metadata deletes
- nothing — a partial answer is indistinguishable from an empty one, and acting on it loses
- acknowledged writes. See `internal/cluster/collect.go`.
+- **Deleting a chunk**: the collection pass is the only thing that deletes one, and there is no
+ code left that can delete a chunk on another node. Deletes, aborted uploads and rebalances all
+ leave their garbage for it. That is because `CopyObject` copies a manifest rather than data, so
+ the chunks under one key are the chunks under another, and any pass that deleted on the strength
+ of the single manifest in front of it would take a second object's data with it. A chunk goes
+ only when every manifest has been read and none names it *and* the ring does not make this node
+ an owner of the object it belongs to. The ring clause is not belt and braces: a move copies to
+ the new owners before committing the manifest that names them, so mid-move the destination holds
+ chunks only the ring accounts for, and a sweep that went by the manifests alone deleted them and
+ lost an object. A pass that could not read all the metadata deletes nothing — a partial answer is
+ indistinguishable from an empty one, and acting on it loses acknowledged writes. See
+ `internal/cluster/collect.go`.
 - **fsync discipline**: chunk commit is write temp → fsync file → rename → fsync directory.
   An fsync error means the data is gone — fail the write or quarantine the disk. Never
   retry-and-trust fsync (fsyncgate: the kernel marks pages clean after a failed fsync).
@@ -97,10 +101,12 @@ Rules that make these structural:
 - Scope: build only what the current milestone needs (see `docs/design.md`). Do not add
   S3 API surface beyond the locked subset (no IAM, ACLs, versioning, lifecycle) — that is
   an explicit anti-goal. The subset is object PUT/GET/HEAD/DELETE, ListObjectsV2, multipart
-  upload, SigV4, and the six calls clients make unprompted: `CreateBucket`, `ListBuckets`,
-  `DeleteBucket`, `DeleteObjects`, `ListObjectVersions`, `GetBucketLocation`. Buckets are
-  still prefixes and nothing is versioned — those last two answer for records that do not
-  exist, because a client that cannot list or empty a bucket cannot use the store.
+  upload, SigV4, `CopyObject`, and the six calls clients make unprompted: `CreateBucket`,
+  `ListBuckets`, `DeleteBucket`, `DeleteObjects`, `ListObjectVersions`, `GetBucketLocation`.
+  Buckets are still prefixes and nothing is versioned — those last two answer for records that
+  do not exist, because a client that cannot list or empty a bucket cannot use the store.
+  `CopyObject` is in because `aws s3 mv` is a copy and a delete, and because a copy that made the
+  client download and re-upload the object would be a copy in name only.
 
 ## Git conventions
 

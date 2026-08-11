@@ -163,25 +163,34 @@ joining a six-node cluster holding 2 GB in 64 objects:
 | | |
 | --- | --- |
 | seen by every node | 40 ms |
-| converged | 4.6 s |
+| converged | 4.4 s |
 | copies moved onto it | 34 of 192 (17.7%) |
 | copies the seven-node ring owes it | 34 |
-| copies held that no manifest names | 0 |
+| copies once the move had committed | 224 |
+| of those, copies no manifest names | 32 |
+| until collection had reclaimed every one | 37 s |
 
-The last two rows are the measurement. 34 moved and 34 owed is not a statistical agreement with a
+Rows three and four are the measurement. 34 moved and 34 owed is not a statistical agreement with a
 prediction — it is the exact count the ring assigns to that node for the keys that exist, so
-placement after the join is the placement the ring specifies, key for key. And the copy count is
-192 before and after: the nodes that gave data up let go of it, so the cluster is not quietly
-paying for a fourth replica of everything that moved.
+placement after the join is the placement the ring specifies, key for key.
 
-One caveat, from watching it run rather than from theory: in one run of three, three copies of 192
-outlived the move by minutes. Nothing is lost or unreadable when that happens and redundancy is
-above target rather than below it — a copy on a node the manifest no longer names is storage that
-is paid for and not counted. This is what motivated the collection pass, which reclaims exactly
-that: a chunk is garbage when no manifest names it *for this node*, which is the same rule the move
-itself follows when it deletes what it moved away from. The measurement still reports the residue
-as a number rather than failing on it, because it is now bounded by a collection cycle rather than
-forever, and because a rare race in a background loop is not something to fail a build on.
+The rows below them are what a move costs while it is settling, and they used to read differently.
+A move used to copy, commit, and then delete what it had copied away from, so the count came back to
+192 on its own. It cannot any more: a server-side copy shares its source's chunks, so no pass may
+delete a chunk on the strength of the one manifest in front of it, and the move now stops at the
+commit. For a while the cluster holds two placements of everything that moved — 224 copies of what
+needs 192 — and the collection pass is what brings it back down, after reading every manifest in the
+cluster and finding no name for them.
+
+So the residue is a measured duration rather than a caveat now. With the collector turned up to a
+1-second interval and a 10-second grace it reclaimed all 32 in 37 seconds, which is one full cycle of
+the id space plus the grace. At the shipped defaults — a minute and an hour — the same residue lives
+about an hour and a half. That is the price of the copy operation, paid in disk rather than in
+durability, and it is why the interval is a minute rather than the ten it was.
+
+Thirty-two, not the thirty-four that moved: a sweep had already taken two by the time the count was
+made. The measurement waits for the number to reach zero rather than asserting what it starts at,
+because a background pass that has already done some of its work is not a failure.
 
 ## A multi-gigabyte object
 

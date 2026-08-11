@@ -246,28 +246,47 @@ func (c *Coordinator) write(ctx context.Context, key string, body io.Reader, exp
 	return m, nil
 }
 
-// Delete removes an object. Its manifest goes first, which is the instant the
-// object stops existing, and only then are its chunks reclaimed: dropping chunks
-// a live manifest still names would be a read served from nothing.
+// Delete removes an object, which is to say it removes the manifest: that is the
+// instant the object stops existing, since a reader can only reach chunks through
+// one.
 //
-// Deleting what is not there succeeds, because S3 promises an idempotent delete.
+// It does not touch the chunks, and no longer may. Copying an object server-side
+// copies its manifest, so the chunks under one key can be the chunks under another,
+// and dropping them here on the strength of this manifest alone would take the other
+// object's data with it. Collection reclaims them, having first read every manifest
+// in the cluster and found no name for them. The cost of that is the only cost:
+// deleted space comes back within a collection cycle rather than at once.
+//
+// Deleting what is not there succeeds, because S3 promises an idempotent delete, and
+// an etcd delete of a key that does not exist is already that.
 func (c *Coordinator) Delete(ctx context.Context, key string) error {
-	m, err := c.meta.Get(ctx, key)
-	if errors.Is(err, meta.ErrNotFound) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if err := c.meta.Delete(ctx, key); err != nil {
-		return err
-	}
+	return c.meta.Delete(ctx, key)
+}
 
-	// Failures are logged rather than returned: the object is already gone as far
-	// as any reader is concerned, so a copy that could not be deleted is wasted
-	// disk and not a correctness problem.
-	c.dropChunks(ctx, m)
-	return nil
+// Copy makes to another name for the object at from, without moving a byte of it:
+// the source's manifest is committed under the destination's key, so both keys name
+// the same chunks. A server-side copy of a terabyte is one etcd write.
+//
+// Which makes a chunk something more than one object's property, and that is the
+// whole cost of this operation. Nothing may delete a chunk on the strength of a
+// single manifest any more — see the collection pass, which is the only thing that
+// deletes one, and which reads every manifest before it does.
+//
+// The copy keeps the source's placement rather than its own key's. Rebalancing will
+// notice, since the ring puts the destination key's partition somewhere else, and
+// move it in the background; until it does, the copy is readable exactly where the
+// source is. What it must not do is drop the source's copies once it has moved the
+// destination's — the reason the move no longer drops anything at all.
+func (c *Coordinator) Copy(ctx context.Context, from, to string) (object.Manifest, error) {
+	m, err := c.meta.Get(ctx, from)
+	if err != nil {
+		return object.Manifest{}, err
+	}
+	m.Modified = time.Now().UTC().Truncate(time.Second)
+	if err := c.meta.Commit(ctx, to, m); err != nil {
+		return object.Manifest{}, err
+	}
+	return m, nil
 }
 
 // Resolve returns the committed manifest for an object key, or meta.ErrNotFound.

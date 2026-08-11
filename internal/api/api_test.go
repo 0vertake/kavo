@@ -312,59 +312,6 @@ func TestPeerChunkPushTruncatedTransfer(t *testing.T) {
 	}
 }
 
-// The delete route takes an id straight off the wire and unlinks a file with it,
-// which makes it the one peer endpoint where a bad id costs data rather than a
-// failed request. A rebalance is the only caller, but the check belongs here
-// rather than in the caller's good intentions.
-func TestPeerChunkDelete(t *testing.T) {
-	tests := []struct {
-		name string
-		id   string
-		want int
-	}{
-		{name: "stored chunk", id: "chunk1", want: http.StatusNoContent},
-		{name: "already gone", id: "chunk2", want: http.StatusNoContent},
-		{name: "escaped path traversal in id", id: "%2e%2e%2fescape", want: http.StatusBadRequest},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			root := t.TempDir()
-			srv := newServer(t, root)
-			data := []byte("a chunk to drop")
-			crc := crc32.Checksum(data, crc32.MakeTable(crc32.Castagnoli))
-			push, err := http.NewRequest(http.MethodPut, srv.URL+"/peer/chunks/chunk1", bytes.NewReader(data))
-			if err != nil {
-				t.Fatal(err)
-			}
-			push.Header.Set(peer.CRCHeader, fmt.Sprintf("%08x", crc))
-			resp, err := srv.Client().Do(push)
-			if err != nil {
-				t.Fatal(err)
-			}
-			resp.Body.Close()
-
-			req, err := http.NewRequest(http.MethodDelete, srv.URL+"/peer/chunks/"+tt.id, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			got, err := srv.Client().Do(req)
-			if err != nil {
-				t.Fatal(err)
-			}
-			got.Body.Close()
-			if got.StatusCode != tt.want {
-				t.Errorf("DELETE %s = %d, want %d", tt.id, got.StatusCode, tt.want)
-			}
-			// Only the chunk the request named may be gone.
-			_, err = os.Stat(filepath.Join(root, "chunks", "ch", "chunk1"))
-			present, wantPresent := err == nil, tt.id != "chunk1"
-			if present != wantPresent {
-				t.Errorf("after DELETE %s, chunk1 present = %v, want %v", tt.id, present, wantPresent)
-			}
-		})
-	}
-}
-
 func corruptOneChunk(t *testing.T, chunksDir string) {
 	t.Helper()
 	found := false

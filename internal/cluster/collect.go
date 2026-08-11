@@ -37,9 +37,19 @@ import (
 
 const (
 	// DefaultCollectInterval is how long a node waits between collection passes.
-	// Garbage costs space and nothing else, so this trades promptness for staying
-	// out of the way of the work that has a client waiting on it.
-	DefaultCollectInterval = 10 * time.Minute
+	//
+	// A pass sweeps one of 32 slices of the id space, so a full cycle is 32 intervals.
+	// That is half of the answer to the question an operator actually asks — how long
+	// after a delete does the disk shrink? — and the grace period below is the other
+	// half and the larger one: nothing is reclaimed before it, so the wait is a grace
+	// period plus up to a cycle. A minute here makes the cycle half an hour, which is
+	// small next to the grace and cheap enough to pay for: the price of a pass is a
+	// scan of every manifest, so raising this trades space back for etcd reads.
+	//
+	// It is not longer because this pass is the only thing that deletes a chunk. A
+	// copied object shares its source's chunks, so no single manifest can be trusted
+	// to speak for one, which leaves every delete, abort and rebalance waiting here.
+	DefaultCollectInterval = time.Minute
 
 	// DefaultCollectGrace is how long an unreferenced chunk is left alone before
 	// it is treated as garbage.

@@ -225,6 +225,51 @@ func TestTheAWSCLIListsAndSyncs(t *testing.T) {
 	}
 }
 
+// `aws s3 mv` is a copy and then a delete, and both halves are server-side: the
+// object never travels to the client and back. Which makes it the operation where
+// two keys name the same chunks, and the delete of the source arrives while they do.
+func TestTheAWSCLIMovesAndCopiesServerSide(t *testing.T) {
+	requireAWSCLI(t)
+	bin := buildKavod(t)
+	nodes := startCluster(t, bin, clusterPrefix(), 1<<20, clusterSize)
+
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	body := bytes.Repeat([]byte("kavo"), 3<<18) // 3 MB, so it spans chunks
+	if err := os.WriteFile(src, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := nodes[0].aws(t, "s3", "cp", src, "s3://bucket/original.bin"); err != nil {
+		t.Fatalf("cp up: %v\n%s", err, out)
+	}
+
+	// A copy first, so that three keys share one object's chunks.
+	if out, err := nodes[1].aws(t, "s3", "cp", "s3://bucket/original.bin", "s3://bucket/copy.bin"); err != nil {
+		t.Fatalf("cp server-side: %v\n%s", err, out)
+	}
+	if out, err := nodes[2].aws(t, "s3", "mv", "s3://bucket/original.bin", "s3://archive/moved.bin"); err != nil {
+		t.Fatalf("mv: %v\n%s", err, out)
+	}
+
+	// The move deleted the source, and the copy must not have gone with it.
+	if out, err := nodes[0].aws(t, "s3", "ls", "s3://bucket/original.bin"); err == nil {
+		t.Errorf("the moved object is still listed under its old key:\n%s", out)
+	}
+	for _, key := range []string{"s3://bucket/copy.bin", "s3://archive/moved.bin"} {
+		back := filepath.Join(dir, filepath.Base(key))
+		if out, err := nodes[1].aws(t, "s3", "cp", key, back); err != nil {
+			t.Fatalf("cp %s down: %v\n%s", key, err, out)
+		}
+		got, err := os.ReadFile(back)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, body) {
+			t.Errorf("%s came back as %d bytes, want the %d written", key, len(got), len(body))
+		}
+	}
+}
+
 // The other operations a client leans on: describing an object without reading it,
 // and deleting it. `s3api` rather than `s3` so that the failure names the request
 // rather than a copy that gave up.
