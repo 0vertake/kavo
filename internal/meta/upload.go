@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"path"
 	"strconv"
+	"strings"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -93,6 +94,59 @@ func (s *Store) Parts(ctx context.Context, id string) (map[int]object.Manifest, 
 			return nil, fmt.Errorf("meta: corrupt part %d of upload %s: %w", number, id, err)
 		}
 		parts[number] = m
+	}
+	return parts, nil
+}
+
+// PartRef is one part manifest and the etcd key it lives under, so that a scan of
+// every upload's parts can resume past it.
+type PartRef struct {
+	Key      string
+	Manifest object.Manifest
+}
+
+// ScanParts returns up to limit part manifests belonging to any in-flight upload,
+// in key order, starting after from. An upload's own record is returned too, with a
+// zero manifest, so that a caller paging by key does not have to know which of an
+// upload's keys are parts.
+//
+// Garbage collection is what needs this. A part's chunks are durable long before
+// the upload they belong to becomes an object — for as long as the client takes,
+// which S3 allows to be days — so a sweep that only consulted object manifests
+// would find those chunks referenced by nothing and delete the upload out from
+// under a client that is still uploading to it.
+func (s *Store) ScanParts(ctx context.Context, from string, limit int64) ([]PartRef, error) {
+	start := path.Join(s.prefix, "uploads") + "/"
+	if from != "" {
+		start = After(from)
+	}
+	end := clientv3.GetPrefixRangeEnd(path.Join(s.prefix, "uploads") + "/")
+	if start >= end {
+		return nil, nil
+	}
+	resp, err := s.client.Get(ctx, start,
+		clientv3.WithRange(end),
+		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend),
+		clientv3.WithLimit(limit),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("meta: scan upload parts from %q: %w", from, err)
+	}
+
+	parts := make([]PartRef, 0, len(resp.Kvs))
+	for _, kv := range resp.Kvs {
+		key := string(kv.Key)
+		// Every upload has one record that is not a part, and it does not
+		// decode as a manifest.
+		if !strings.Contains(key, "/parts/") {
+			parts = append(parts, PartRef{Key: key})
+			continue
+		}
+		var m object.Manifest
+		if err := json.Unmarshal(kv.Value, &m); err != nil {
+			return nil, fmt.Errorf("meta: corrupt part %s: %w", key, err)
+		}
+		parts = append(parts, PartRef{Key: key, Manifest: m})
 	}
 	return parts, nil
 }
