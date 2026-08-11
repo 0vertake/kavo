@@ -17,8 +17,9 @@ not API surface. Full design and milestones: `docs/design.md`. Research notes wi
  Docker must be running. Tests that touch metadata use a real etcd, never a fake.
 - `make lint` — `go vet` + `gofmt` check
 - `make etcd` — start just etcd (idempotent)
-- `make up` / `make down` — dev dependencies via Docker Compose (`deploy/compose.yaml`).
- Currently etcd only; kavod nodes join it once replication lands.
+- `make up` / `make down` — 6-node dev cluster plus etcd via Docker Compose
+ (`deploy/compose.yaml`), published on `localhost:8081`–`8086`. One image serves every node:
+ nodes are symmetric, so only the flags differ.
 
 Run `make test` before declaring any task done.
 
