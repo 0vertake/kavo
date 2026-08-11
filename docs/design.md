@@ -313,6 +313,32 @@ unreachable, because a reader tries the nodes it names and stops. That is the sa
 rebalancing relies on when it deletes the copy it moved away from, and it is what lets this pass
 reclaim the residue when that delete does not happen.
 
+**And what the ring says, which is the seam where this pass first lost data.** A rebalance
+copies every chunk to the new owners before committing the manifest that names them — it has to,
+because until that commit a reader must still find the object where the old manifest says it is
+— and the copying is rate-limited. So for the length of a move, the object's size over the
+repair rate, the destination holds chunks no manifest mentions. Judged by the manifests alone
+they are garbage, and a sweep deletes them as fast as the move makes them; then the move commits,
+promising copies that are no longer there, and drops the old ones on the strength of that
+promise. Both passes were doing exactly what they were written to do.
+
+Measured, in a three-node cluster grown to six with the sweep set to a short grace: for keys the
+join reassigns to an entirely new set of owners, one chunk ended up on no node at all, the object
+returned `unexpected EOF`, and the cluster sat at 21 of the 24 copies its manifests promised.
+Smaller membership changes hid it — a move that replaces one owner of three leaves two good
+copies, so repair restores the third and nothing is lost. That is the failure mode worth naming:
+not a wrong line of code, but two correct passes whose windows overlap, showing up as a race
+repair usually wins.
+
+The fix is to make a chunk live if the manifest names this node **or the ring makes this node an
+owner of the object it belongs to**. The ring is what says a move here is in flight or coming, so
+the destination's copies are referenced for the whole move. It spares nothing this pass was
+written for: a copy a move left behind sits on a node that lost the partition, so neither the
+manifest nor the ring names it, and it is still collected. `TestAMoveThatReplacesEveryOwnerKeepsItsData`
+holds the cluster in that state on purpose, and asserts not only that the objects read but that
+the sweep reclaimed nothing — because before the fix the objects sometimes still read, and only
+because repair replaced what the sweep took.
+
 Each pass sweeps one thirty-second of the id space, chosen by cursor, because the alternative is
 holding a set of every chunk id on the node — tens of megabytes at a million chunks, and a
 background pass whose memory grows with the disk is one that eventually cannot run. A chunk id

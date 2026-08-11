@@ -57,10 +57,14 @@ Rules that make these structural:
  revision it superseded, and a chunk that is live if *any* manifest names it is what lets an
  object be copied without copying its data. Compare-and-swap exists where a background pass
  rewrites what it read minutes ago, which is rebalancing.
-- **Deleting a chunk**: only after reading every manifest and finding none that names it, or
- after a rebalance has committed the manifest that says it lives elsewhere. A pass that could
- not read all the metadata deletes nothing — a partial answer is indistinguishable from an empty
- one, and acting on it loses acknowledged writes. See `internal/cluster/collect.go`.
+- **Deleting a chunk**: only after reading every manifest and finding none that names it *and*
+ the ring does not make this node an owner of the object it belongs to, or after a rebalance has
+ committed the manifest that says it lives elsewhere. The ring clause is not belt and braces: a
+ move copies to the new owners before committing the manifest that names them, so mid-move the
+ destination holds chunks only the ring accounts for, and a sweep that went by the manifests
+ alone deleted them and lost an object. A pass that could not read all the metadata deletes
+ nothing — a partial answer is indistinguishable from an empty one, and acting on it loses
+ acknowledged writes. See `internal/cluster/collect.go`.
 - **fsync discipline**: chunk commit is write temp → fsync file → rename → fsync directory.
   An fsync error means the data is gone — fail the write or quarantine the disk. Never
   retry-and-trust fsync (fsyncgate: the kernel marks pages clean after a failed fsync).
