@@ -32,6 +32,7 @@ func main() {
 	leaseTTL := flag.Duration("lease-ttl", meta.DefaultLeaseTTL, "how long this node may go unheard before the cluster declares it dead")
 	repairRate := flag.Int64("repair-rate", cluster.DefaultRepairRate, "bytes per second this node may use to restore missing copies (0 for unlimited)")
 	repairInterval := flag.Duration("repair-interval", cluster.DefaultRepairInterval, "pause between repair passes")
+	rebalanceInterval := flag.Duration("rebalance-interval", cluster.DefaultRebalanceInterval, "pause between rebalance passes, which move objects onto the nodes that now own them")
 	scrubInterval := flag.Duration("scrub-interval", cluster.DefaultScrubInterval, "pause between scrub passes, which re-read this node's chunks to find rot")
 	erasure := flag.String("ec", "", `erasure-code new objects as "data+parity" (for example 6+3) instead of replicating them`)
 	flag.Parse()
@@ -100,6 +101,11 @@ func main() {
 	// Rot answers every survey correctly and only fails when a client reads it,
 	// which is far too late for that to be the first time anyone looked.
 	go c.ScrubLoop(ctx, *repairRate, *scrubInterval)
+
+	// Repair restores the copies a manifest promises and refuses to put them
+	// anywhere else, so a node that leaves for good takes its copy's place with
+	// it. This is what moves the place.
+	go c.RebalanceLoop(ctx, *repairRate, *rebalanceInterval)
 
 	redundancy := "replicated"
 	if scheme != (ec.Scheme{}) {
