@@ -53,7 +53,7 @@ func (n *node) kill() {
 
 // revive brings a killed node back on the same address, which is what a restarted
 // process is: same id, same disk, same place in the ring.
-func (n *node) revive(t *testing.T) {
+func (n *node) revive(t testing.TB) {
 	t.Helper()
 	l, err := net.Listen("tcp", n.addr)
 	if err != nil {
@@ -73,7 +73,7 @@ func (n *node) has(ref object.ChunkRef) bool {
 
 // loseChunks deletes this node's copies, which is what a replaced disk looks
 // like: the node is healthy and answers, it simply has nothing.
-func (n *node) loseChunks(t *testing.T, refs []object.ChunkRef) {
+func (n *node) loseChunks(t testing.TB, refs []object.ChunkRef) {
 	t.Helper()
 	for _, ref := range refs {
 		if err := os.Remove(filepath.Join(n.root, "chunks", ref.ID[:2], ref.ID)); err != nil {
@@ -86,7 +86,7 @@ type testCluster struct {
 	nodes map[string]*node
 }
 
-func newCluster(t *testing.T, n int) *testCluster {
+func newCluster(t testing.TB, n int) *testCluster {
 	t.Helper()
 	return newClusterChunked(t, n, testChunkSize)
 }
@@ -94,7 +94,7 @@ func newCluster(t *testing.T, n int) *testCluster {
 // newClusterChunked starts n real nodes over real HTTP sharing one etcd prefix.
 // Nothing here is faked: the point of these tests is what happens between
 // processes.
-func newClusterChunked(t *testing.T, n int, chunkSize int64) *testCluster {
+func newClusterChunked(t testing.TB, n int, chunkSize int64) *testCluster {
 	t.Helper()
 	prefix := "/kavo-test/" + rand.Text()
 
@@ -145,7 +145,7 @@ func newClusterChunked(t *testing.T, n int, chunkSize int64) *testCluster {
 // owners returns the nodes that should hold key, and one node that should not.
 // Reads and writes are driven from the outsider where possible, since any node
 // coordinates any request and going through a non-owner exercises the network.
-func (tc *testCluster) owners(t *testing.T, key string) (owners []*node, outsider *node) {
+func (tc *testCluster) owners(t testing.TB, key string) (owners []*node, outsider *node) {
 	t.Helper()
 	ids := slices.Sorted(maps.Keys(tc.nodes))
 	want := ring.New(ids, ring.DefaultVNodes).Owners(ring.PartitionFor(key), cluster.Replicas)
@@ -168,7 +168,7 @@ func randBytes(n int) []byte {
 	return b
 }
 
-func mustPut(t *testing.T, n *node, key string, data []byte) object.Manifest {
+func mustPut(t testing.TB, n *node, key string, data []byte) object.Manifest {
 	t.Helper()
 	m, err := n.c.Put(context.Background(), key, bytes.NewReader(data))
 	if err != nil {
@@ -177,7 +177,7 @@ func mustPut(t *testing.T, n *node, key string, data []byte) object.Manifest {
 	return m
 }
 
-func mustGet(t *testing.T, n *node, key string) []byte {
+func mustGet(t testing.TB, n *node, key string) []byte {
 	t.Helper()
 	m, err := n.c.Resolve(context.Background(), key)
 	if err != nil {
