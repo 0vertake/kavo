@@ -28,19 +28,37 @@ write number as a floor, not a ceiling.
 
 | what | cost |
 | --- | --- |
-| one durable 4 KB chunk (`WriteChunk`) | 9.5 ms |
+| one durable 4 KB chunk (`WriteChunk`) | 8.2 ms |
 | ...of which fsync of the file | ~3.7 ms |
 | ...of which fsync of the parent directory | ~3.6 ms |
 | manifest commit to etcd (`meta.Commit`) | 0.54 ms |
-| a 4 KB PUT end to end, 3 replicas | 26 ms |
+| a 4 KB PUT end to end, 3 replicas | 25 ms |
 
 A small write is **disk barriers, not code**. Two barriers per chunk, three chunk copies, one etcd
-commit: on this machine that is ~22 ms of the 26 ms, and it is spent waiting for a drive to
+commit: on this machine that is ~22 ms of the 25 ms, and it is spent waiting for a drive to
 confirm. `F_FULLFSYNC` on APFS forces a full cache flush; Linux `fdatasync` on server NVMe is an
 order of magnitude cheaper, so the fixed cost of a small object on real hardware is closer to
-2–3 ms than 26.
+2–3 ms than 25.
 
 Measured by removing each barrier in turn and re-running — both are load-bearing and both stay.
+
+## Where a read's time goes
+
+| what | cost |
+| --- | --- |
+| resolve the manifest in etcd (`meta.Get`) | 0.29 ms |
+| read a 4 KB chunk from local disk (`ReadChunk`) | 0.015 ms |
+| a 4 KB GET end to end | 0.74 ms |
+
+A small read is **one etcd round trip and a rounding error**. The disk is 2% of it; resolving the
+object through its committed manifest is ~40%, and that round trip is the price of the commit point
+being somewhere other than the node answering.
+
+etcd can answer a read from the local member without a quorum round, which would cut most of this.
+kavo does not ask it to: a serialisable read can return a manifest that is already superseded, so a
+client could write, get an ack, read, and be told the old object — and every guarantee in this
+project is written on the assumption that a committed manifest is what a reader sees. A 4 KB object
+is the one shape where this dominates, and it is the shape a cache would fix if it ever mattered.
 
 ## Throughput
 
@@ -48,19 +66,19 @@ The internal API, which is the data path with no S3 compatibility on top of it.
 
 | operation | one client | 8 clients |
 | --- | --- | --- |
-| PUT 4 KB | 26 ms | 20 ms |
-| PUT 1 MB | 29 ms / 37 MB/s | 20 ms / 53 MB/s |
-| PUT 64 MB | 142 ms / 472 MB/s | 86 ms / 778 MB/s |
-| GET 4 KB | 0.62 ms | 0.14 ms |
-| GET 1 MB | 1.6 ms / 672 MB/s | 0.53 ms / 2.0 GB/s |
-| GET 64 MB | 47 ms / 1.4 GB/s | 22 ms / 3.1 GB/s |
+| PUT 4 KB | 25 ms | 17 ms |
+| PUT 1 MB | 28 ms / 37 MB/s | 20 ms / 54 MB/s |
+| PUT 64 MB | 143 ms / 469 MB/s | 92 ms / 727 MB/s |
+| GET 4 KB | 0.74 ms | 0.15 ms |
+| GET 1 MB | 1.6 ms / 642 MB/s | 0.53 ms / 2.0 GB/s |
+| GET 64 MB | 46 ms / 1.5 GB/s | 23 ms / 2.9 GB/s |
 
-Every PUT byte is written three times, so 778 MB/s of client throughput is 2.3 GB/s of durable
-writes on one disk. Reads scale to 3.1 GB/s and the local store alone reads at 4.2 GB/s, so reads
+Every PUT byte is written three times, so 727 MB/s of client throughput is 2.2 GB/s of durable
+writes on one disk. Reads scale to 2.9 GB/s and the local store alone reads at 4.0 GB/s, so reads
 are bound by the disk and the loopback, not by the code.
 
-Concurrency helps a large write (142 ms → 86 ms across 8 clients) and barely helps a small one
-(26 ms → 20 ms), because a small write is almost entirely disk barriers and they serialise on the
+Concurrency helps a large write (143 ms → 92 ms across 8 clients) and barely helps a small one
+(25 ms → 17 ms), because a small write is almost entirely disk barriers and they serialise on the
 shared drive. On separate disks this is where the cluster should scale.
 
 ## What the S3 gateway costs
@@ -70,17 +88,17 @@ real client signs them. Against the table above, the difference is the price of 
 
 | operation | one client | 8 clients |
 | --- | --- | --- |
-| PUT 4 KB | 26 ms | 18 ms |
-| PUT 1 MB | 30 ms / 35 MB/s | 21 ms / 50 MB/s |
-| PUT 64 MB | 196 ms / 342 MB/s | 90 ms / 742 MB/s |
-| GET 4 KB | 0.69 ms | 0.16 ms |
-| GET 1 MB | 1.9 ms / 562 MB/s | 0.56 ms / 1.9 GB/s |
-| GET 64 MB | 45 ms / 1.5 GB/s | 21 ms / 3.2 GB/s |
-| GET an 8 MB range of a 64 MB object | 24 ms / 356 MB/s | |
-| HEAD | 0.56 ms | |
-| PUT 64 MB as 8 multipart parts | 344 ms / 195 MB/s | |
+| PUT 4 KB | 25 ms | 18 ms |
+| PUT 1 MB | 29 ms / 36 MB/s | 19 ms / 55 MB/s |
+| PUT 64 MB | 191 ms / 352 MB/s | 100 ms / 668 MB/s |
+| GET 4 KB | 0.64 ms | 0.14 ms |
+| GET 1 MB | 1.8 ms / 595 MB/s | 0.59 ms / 1.8 GB/s |
+| GET 64 MB | 48 ms / 1.4 GB/s | 21 ms / 3.1 GB/s |
+| GET an 8 MB range of a 64 MB object | 22 ms / 379 MB/s | |
+| HEAD | 0.66 ms | |
+| PUT 64 MB as 8 multipart parts | 342 ms / 196 MB/s | |
 | `ListObjectsV2`, a page of 1000 keys | 13 ms | |
-| `ListObjectsV2`, the same keyspace under a delimiter | 4.6 ms | |
+| `ListObjectsV2`, the same keyspace under a delimiter | 4.8 ms | |
 
 **The gateway is free.** Every row matches the internal API within the noise, which is the answer
 to the question this table exists to ask: parsing S3, verifying a signature, and producing XML are
@@ -101,9 +119,9 @@ range still verifies every chunk it touches in full, so an 8 MB window into 32 M
 
 | operation | rate |
 | --- | --- |
-| heal a lost disk, unrated (`RepairHeal`) | 326 MB/s |
-| scrub, unrated (`Scrub`) | 2.1 GB/s |
-| survey a healthy partition (`RepairSurvey`) | 157 µs per copy |
+| heal a lost disk, unrated (`RepairHeal`) | 349 MB/s |
+| scrub, unrated (`Scrub`) | 2.2 GB/s |
+| survey a healthy partition (`RepairSurvey`) | 163 µs per copy |
 
 The default repair cap of 32 MB/s is ~10× below what a heal can actually do, which is the intended
 relationship: the cap, not the hardware, decides how much a heal disturbs clients. Scrubbing is
@@ -117,19 +135,19 @@ six. Same tolerance as three copies in both cases: two nodes may be lost.
 | | replicated (3 copies) | coded (4+2) |
 | --- | --- | --- |
 | stored per byte of object | 3.00x | 1.50x |
-| PUT 4 KB | 25 ms | 44 ms |
-| PUT 1 MB | 28 ms / 38 MB/s | 46 ms / 23 MB/s |
-| PUT 64 MB | 143 ms / 469 MB/s | 189 ms / 355 MB/s |
-| GET 64 MB | 47 ms / 1.4 GB/s | 68 ms / 981 MB/s |
-| GET 64 MB, two shards gone | — | 71 ms / 951 MB/s |
-| allocated per 64 MB GET | 126 KB | 168 MB |
+| PUT 4 KB | 25 ms | 41 ms |
+| PUT 1 MB | 27 ms / 39 MB/s | 44 ms / 24 MB/s |
+| PUT 64 MB | 142 ms / 472 MB/s | 184 ms / 365 MB/s |
+| GET 64 MB | 48 ms / 1.4 GB/s | 70 ms / 966 MB/s |
+| GET 64 MB, two shards gone | — | 65 ms / 1.0 GB/s |
+| allocated per 64 MB GET | 125 KB | 168 MB |
 
-A large coded write costs ~32% more wall time and stores half the bytes, which is the trade the mode
-exists to make. Reads are ~44% slower, and **a degraded read is no slower than a healthy one** —
+A large coded write costs ~30% more wall time and stores half the bytes, which is the trade the mode
+exists to make. Reads are ~45% slower, and **a degraded read is no slower than a healthy one** —
 reconstruction arithmetic is not the expensive part, moving the shards is, and a degraded read moves
 the same number of shards.
 
-Small writes are where coding hurts: 44 ms against 25 ms, because a 4 KB object still becomes six
+Small writes are where coding hurts: 41 ms against 25 ms, because a 4 KB object still becomes six
 shards on six nodes, so it pays six disk barriers instead of three to store 4 KB.
 
 The memory column is the honest cost. A replicated read streams a chunk through; a coded read has to
@@ -147,10 +165,10 @@ listing does: a 1 GB object has 32 chunk references, and a page of a thousand of
 
 | a page of 1000 keys | server side | allocated |
 | --- | --- | --- |
-| one-chunk manifests (small objects) | 7.2 ms | 1.9 MB |
-| 32-chunk manifests (1 GB objects) | 41 ms | 6.2 MB |
+| one-chunk manifests (small objects) | 6.6 ms | 1.7 MB |
+| 32-chunk manifests (1 GB objects) | 47 ms | 5.9 MB |
 
-Still 6x, after the fixes below took it down from 55 ms and 12.5 MB. What is left is
+Still ~7x, after the fixes below took it down from 55 ms and 12.5 MB. What is left is
 `encoding/json` walking past chunk references at ~180 MB/s to reach fields it has already found.
 Two ways to make that go away, both rejected — see the last section.
 
@@ -203,6 +221,11 @@ write, whose path does not change, was watched alongside as a control.
 which on a node with many uploads in flight is memory that buys nothing. A chunk already in memory
 is offered as a `*bytes.Reader`, which writes itself in one syscall and gets no buffer at all.
 
+**Every key of a listing rebuilt the same prefix.** The etcd prefix manifests live under was
+composed with `path.Join` on every read and trimmed off every key a listing returned, so a page of a
+thousand built two thousand copies of one constant: 16,200 allocations per page to 13,200, and 1.9 MB
+to 1.7 MB. It buys no time — it is one line and one fewer thing happening per key.
+
 **The held-back byte allocated once per 32 KB.** The reader that withholds a chunk's last byte
 until its checksum verifies was building a fresh one-byte slice for each write, which is ~4,000
 allocations for a 64 MB read. It keeps the byte in an array now: 5,000 allocations per read to
@@ -223,20 +246,20 @@ on purpose:
 - **Acknowledging at W instead of waiting for all N.** Worth the slowest of three barriers, but
   only with a background copy that outlives the request — a new failure mode for one barrier's
   latency. Not while three replicas share one disk and that barrier is a measurement artifact.
-- **Batching the repair survey** into one "which of these do you have?" per node. At 157 µs per
+- **Batching the repair survey** into one "which of these do you have?" per node. At 163 µs per
   copy, a pass over 10 M chunks is ~1.3 hours of pure survey. That is a real problem at that
   scale and no problem at all at this one; the fix is a protocol change and can wait for the
   scale that needs it.
 - **Coalescing directory fsyncs across concurrent commits** (group commit). The dir barrier is
-  ~3.6 ms of a 9.5 ms chunk write, and concurrent writers on one node could share it. But it puts
+  ~3.6 ms of an 8.2 ms chunk write, and concurrent writers on one node could share it. But it puts
   shared mutable state in the one function the durability invariants depend on, to win back a cost
   that is 10× smaller on the hardware this will actually run on.
 - **Getting chunk references out of the way of listings**, either by splitting a manifest across
   two etcd keys (a header a listing reads, a chunk list a read reads) or by deriving chunk ids from
-  the object instead of storing all 32 of them. Both would make a listing of large objects ~6x
+  the object instead of storing all 32 of them. Both would make a listing of large objects ~7x
   faster. Both also put churn in the commit path — the transaction that makes a write exist, and
   the compare-and-swap that rebalancing depends on — to speed up an operation no user is blocked
-  on. 41 ms for a page of a thousand 1 GB objects is not a problem; a subtle bug in the commit
+  on. 47 ms for a page of a thousand 1 GB objects is not a problem; a subtle bug in the commit
   point is.
 - **Bigger copy buffers on the read path**, the mirror of the write-side fix above. It measured
   nothing at all on a read and cost five times the allocation: a 1 MB GET went from 58 KB to 298 KB
@@ -249,11 +272,15 @@ on purpose:
   and it is not one — the profile puts 80% of that read in socket syscalls, 0.8% in `memmove` and
   nothing measurable in GC. Reusing the buffers across chunks would cut the garbage and win no time,
   in exchange for reasoning about a buffer's lifetime across the goroutines that fill it.
+- **Deferring the resume position of a listing.** A page computes where the next page starts once per
+  key and throws away all but the last, which is a thousand small allocations per page. Fixing it
+  means restructuring the loop that does both paging and delimiter grouping — the one place a subtle
+  bug loses or repeats keys — and the allocations do not show up in the time. Left alone.
 - **The payload hash of a signed request.** SigV4 with a hex payload hash requires hashing the body
   to verify the signature, and that is not an optimisation to find but a promise to keep. Clients
   that would rather not pay it already have two ways out that kavo implements: `UNSIGNED-PAYLOAD`
   and `aws-chunked` streaming.
 
 Pipelining chunks — reading chunk N+1 while N replicates — was also considered and rejected on
-measurement: chunking runs at 6.1 GB/s against replication's ~470 MB/s, so the read is 8% of a large
+measurement: chunking runs at 6.2 GB/s against replication's ~470 MB/s, so the read is 8% of a large
 write and overlapping it buys nearly nothing for a second chunk buffer.
