@@ -50,6 +50,12 @@ const (
 	testSecretKey = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 )
 
+// testRepairRate is what nodes are given for -repair-rate. Unlimited, so that a
+// test asserting redundancy came back is waiting on the code rather than on a
+// throttle. Only the heal measurement changes it, to report what the production
+// cap costs.
+var testRepairRate = "0"
+
 // clusterPrefix isolates a test's manifests in etcd. It has to be unique per
 // run: etcd outlives the test, so a reused prefix would resolve objects whose
 // chunks were left behind in a previous run's data directory.
@@ -129,7 +135,7 @@ func (n *node) start() {
 		// in these tests, and the interval is what decides whether "redundancy
 		// comes back" is observable in seconds or in minutes.
 		"-rebalance-interval", testRepairInterval.String(),
-		"-repair-rate", "0",
+		"-repair-rate", testRepairRate,
 	)
 	if n.erasure != "" {
 		n.cmd.Args = append(n.cmd.Args, "-ec", n.erasure)

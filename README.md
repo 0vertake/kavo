@@ -61,6 +61,21 @@ costs ~30% on a large write and ~45% on a large read, measured at 4+2 so that re
 are compared at the same two-node tolerance on a six-node cluster. A degraded read is no slower than
 a healthy one: moving the shards is the expensive part, not the arithmetic.
 
+Three more that are about the cluster rather than a call (`make measure`):
+
+- **A node loses its entire disk: full redundancy is back in 9.2 s** at the default 32 MB/s repair
+  cap, 1.1 s uncapped, rebuilding 1.09 GB of copies. Nobody asks for the repair. The cap is per
+  node, so heal bandwidth grows with the cluster while the disturbance to any one node's clients
+  does not.
+- **A seventh node joins and converges in 4.6 s**, and the 34 copies of 192 that move onto it are
+  exactly the 34 the seven-node ring owes it — placement after a join is the ring's placement, key
+  for key, with 192 copies before and after.
+- **A 4 GB object streams through a node whose RSS peaks at 89 MB** — 68 MB above idle, against
+  33 MB for a 64 MB object. Sixty-four times the object for twice the memory, because what memory
+  scales with is the 32 MB chunk, not the object. This is measured on the node process with `ps`,
+  through the signed API, with an unsigned payload — because hashing the body to sign it would mean
+  reading a 4 GB object twice.
+
 ## Run it
 
 ```sh
@@ -98,10 +113,18 @@ acknowledge one it cannot make durable.
 ## How compatible is compatible
 
 Ceph's `s3-tests` is the suite S3 implementations are measured against, and nobody here chose what it
-asserts. **151 of its 886 tests pass and none error** — every failure is classified in
-[`docs/s3-compatibility.md`](docs/s3-compatibility.md), most of them features that are deliberately
-absent: ACLs, versioning, encryption, lifecycle, policy, v1 `ListObjects`, SigV2. Of the tests that
-cover `ListObjectsV2`, the operation kavo does claim, 37 of 40 pass.
+asserts. It has 886 tests and kavo does not implement most of what they cover, on purpose. Of the 641
+that fail: **429 are explicit anti-goals** — ACLs, versioning, server-side encryption, object lock,
+bucket policy, lifecycle, logging, CORS, tagging, SigV2, browser form uploads — **48 are v1
+`ListObjects`**, which kavo answers only at v2, and **28 follow from buckets being prefixes** rather
+than records. **135 are named gaps**, half of them `CopyObject` and conditional requests. One is the
+suite asserting Ceph's own configured region name.
+
+With that framing: **151 pass, 641 fail, 94 the suite skips, and nothing errors** — every test
+reaches a verdict rather than dying in setup, and every failure is accounted for in
+[`docs/s3-compatibility.md`](docs/s3-compatibility.md), which generates its breakdown from the
+suite's own output so it can be checked rather than believed. Of the tests covering `ListObjectsV2`,
+the operation kavo does claim, 37 of 40 pass.
 
 Running it was worth more than the number, twice over. It found four real defects, three of which
 kavo's own tests could not see — including a listing that reported itself truncated when it had ended
