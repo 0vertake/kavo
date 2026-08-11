@@ -1,4 +1,4 @@
-.PHONY: build test bench lint up down etcd clean
+.PHONY: build test bench measure lint up down etcd clean
 
 build:
 	go build ./...
@@ -14,6 +14,13 @@ test: etcd
 # and what they mean: docs/benchmarks.md.
 bench: etcd
 	go test ./internal/... -run XXX -bench . -timeout 1800s
+
+# The cluster-level numbers a benchmark harness cannot express: how long a heal
+# takes, how much a join moves, and what a node's memory does under a
+# multi-gigabyte object. They print rather than assert, so `make test` skips them
+# and this runs them. Writes several GB and takes a few minutes.
+measure: etcd
+	go test ./test -run TestMeasure -measure -v -timeout 3600s
 
 etcd:
 	@docker compose -f deploy/compose.yaml up -d --wait etcd

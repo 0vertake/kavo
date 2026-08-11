@@ -5,6 +5,11 @@ goes and which optimisations are worth their complexity — not to produce a hea
 number nothing in this repo chose, see [what an outside client measures](#what-an-outside-client-measures)
 at the end: MinIO's `warp` against the S3 API.
 
+Three numbers cannot be expressed as a per-operation benchmark, because they are about a cluster
+rather than a call: how long a heal takes, what a join moves, and what a node's memory does under a
+multi-gigabyte object. `make measure` produces those against six real processes; they print rather
+than assert, so the normal suite skips them.
+
 Everything below runs against a six-node cluster over real HTTP, real etcd and real disks, at the
 production 32 MB chunk size. Nothing is mocked, because a mocked store would measure the mock.
 
@@ -127,6 +132,74 @@ range still verifies every chunk it touches in full, so an 8 MB window into 32 M
 The default repair cap of 32 MB/s is ~10× below what a heal can actually do, which is the intended
 relationship: the cap, not the hardware, decides how much a heal disturbs clients. Scrubbing is
 checksum-bound and effectively free at any sane interval.
+
+### How long a heal takes
+
+Rates are not an answer to the question an operator asks, which is: a node died, when is redundancy
+back? `make measure` answers it against six real processes — 64 objects of 32 MB, 192 chunk copies,
+one node losing its entire disk while the cluster keeps serving, and nobody asking for a repair.
+
+| repair cap | redundancy restored | effective rate |
+| --- | --- | --- |
+| 32 MB/s (the default) | 9.2 s | 122 MB/s |
+| unlimited | 1.1 s | 994 MB/s |
+
+The node came back with nothing and 1.09 GB of copies had to be rebuilt. **122 MB/s under a 32 MB/s
+cap is not a broken limiter** — the cap is per node, and each node repairs the objects it is
+responsible for, so four nodes rebuilding at once move four times one node's allowance while each
+one disturbs its own clients by no more than the cap. That is the property worth having: heal
+bandwidth grows with the cluster, and the blast radius per node does not.
+
+The gap between the two rows is the whole argument for the cap. Unthrottled, this cluster heals a
+dead disk almost as fast as it can read one — and every byte of that is competing with client
+requests on the same disks and the same network.
+
+### What a join moves
+
+The claim consistent hashing exists to make is that adding a node moves that node's share and
+nothing else, where hashing keys modulo the node count would move most of the data. A seventh node
+joining a six-node cluster holding 2 GB in 64 objects:
+
+| | |
+| --- | --- |
+| seen by every node | 40 ms |
+| converged | 4.6 s |
+| copies moved onto it | 34 of 192 (17.7%) |
+| copies the seven-node ring owes it | 34 |
+| copies held that no manifest names | 0 |
+
+The last two rows are the measurement. 34 moved and 34 owed is not a statistical agreement with a
+prediction — it is the exact count the ring assigns to that node for the keys that exist, so
+placement after the join is the placement the ring specifies, key for key. And the copy count is
+192 before and after: the nodes that gave data up let go of it, so the cluster is not quietly
+paying for a fourth replica of everything that moved.
+
+One caveat, from watching it run rather than from theory: in one run of three, three copies of 192
+outlived the move by minutes. Nothing is lost or unreadable when that happens and redundancy is
+above target rather than below it — it is the chunk garbage collection `docs/design.md` defers,
+showing up as storage that is paid for and not counted. The measurement reports the number rather
+than failing on it, because a rare race in a background loop is not something to fail a build on.
+
+## A multi-gigabyte object
+
+Memory staying flat regardless of object size is the invariant that separates an object store from a
+key-value store with S3 headers on it, so it is worth measuring at a size where no buffer could
+hide. `TestStreamingIsConstantMemory` pins the data path at 64 MB with Go's own allocation counters;
+this pins the *process* with `ps`, through the signed S3 API, at 64 times that.
+
+| object | PUT | GET | peak RSS | over idle | of the object |
+| --- | --- | --- | --- | --- | --- |
+| 64 MB | 210 ms / 305 MB/s | 48 ms / 1.3 GB/s | 55 MB | 33 MB | 86% |
+| 4 GB | 13.1 s / 312 MB/s | 16.8 s / 243 MB/s | 89 MB | 68 MB | 2.2% |
+
+Idle RSS is 22 MB. The object grew 64x and the memory above idle grew 2x — from 33 MB to 68 MB,
+which is chunk-shaped rather than object-shaped: a 32 MB chunk buffer, its replication in flight,
+and the hash running beside it. Throughput is flat across the two sizes in both directions, so
+nothing is being paid for in the large case that the small case avoids.
+
+The upload is signed with `UNSIGNED-PAYLOAD`, which is the only honest way to stream something larger
+than memory to a signed API: a hex payload hash would require reading the object twice, and holding
+it in order to hash it is the exact thing this measures the absence of.
 
 ## Replication against erasure coding
 

@@ -102,6 +102,10 @@ died on: many of these never reach their assertion because a `ListObjects` v1 ca
 | 1 | website, torrent, select, notification, inventory, analytics, replication | anti-goal |
 | 1 | `GetBucketLocation` | suite artifact, see below |
 
+By verdict: **429 anti-goals, 48 v1 `ListObjects`, 28 consequences of buckets being prefixes, 135
+named gaps, and 1 artifact of the suite's own config.** The gap column is the one to read — it is the
+list of things a client might reasonably expect and not get, and two entries are most of it.
+
 Anti-goals are listed in `docs/design.md` and are not defects: kavo is an object store with a locked
 S3 subset, not an S3 clone. The rows marked **gap** are things a client might reasonably expect that
 kavo does not do yet, and they are worth naming honestly:

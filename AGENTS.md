@@ -17,6 +17,10 @@ not API surface. Full design and milestones: `docs/design.md`. Research notes wi
 - `make bench` — benchmarks against a real six-node cluster; results and the decisions they
  settle are in `docs/benchmarks.md`; starts etcd first, so
  Docker must be running. Tests that touch metadata use a real etcd, never a fake.
+- `make measure` — the numbers a per-operation benchmark cannot express: heal time after a node
+ loses its disk, what a join moves, and a node's peak RSS under a multi-gigabyte object. They print
+ rather than assert, so `make test` skips them; writes several GB and takes a few minutes. Results
+ in `docs/benchmarks.md`.
 - `make lint` — `go vet` + `gofmt` check
 - `go test ./test -run TestChaos` — the chaos suite: a concurrent S3 workload against four real
  processes while faults arrive at random, then the four invariants checked against the recorded
