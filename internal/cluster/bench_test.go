@@ -3,13 +3,17 @@ package cluster_test
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"fmt"
-	"github.com/0vertake/kavo/internal/object"
 	"io"
 	"net/http"
 	"strconv"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/0vertake/kavo/internal/cluster"
+	"github.com/0vertake/kavo/internal/object"
 )
 
 // The benchmarks run against a six-node cluster over real HTTP, real etcd and
@@ -337,6 +341,67 @@ func BenchmarkRedundancyModes(b *testing.B) {
 	}
 }
 
+// Listing is the one operation whose cost is per key rather than per byte, and
+// what it costs depends on the *shape* of the manifests rather than on the
+// objects: a page reports three scalars per key and has to get past everything
+// else the manifest holds. So the two cases are the same thousand keys with
+// one-chunk manifests and with the thirty-two chunks a 1 GB object has.
+//
+// Manifests are committed straight to etcd with no chunks behind them, because a
+// listing never reads a chunk and writing 32 GB to measure a listing would only
+// measure the disk.
+func BenchmarkList(b *testing.B) {
+	for _, chunks := range []int{1, 32} {
+		b.Run(fmt.Sprintf("1000 keys/%d chunks", chunks), func(b *testing.B) {
+			tc := newClusterChunked(b, 1, object.DefaultChunkSize)
+			n := tc.nodes["n1"]
+			const keys = 1000
+			for i := range keys {
+				key := fmt.Sprintf("bench-list/key%04d", i)
+				if err := n.m.Commit(context.Background(), key, fatManifest(chunks)); err != nil {
+					b.Fatal(err)
+				}
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				page, err := n.c.List(context.Background(), cluster.ListRequest{
+					Prefix: "bench-list/", Limit: keys,
+				})
+				if err != nil {
+					b.Fatal(err)
+				}
+				if len(page.Objects) != keys {
+					b.Fatalf("listed %d keys, want %d", len(page.Objects), keys)
+				}
+			}
+		})
+	}
+}
+
+// fatManifest is a manifest with the given number of chunk refs and nothing
+// behind them. The ids are the length the real ones are, since their bytes are
+// most of what a listing has to read past.
+func fatManifest(chunks int) object.Manifest {
+	m := object.Manifest{
+		Size:        int64(chunks) * object.DefaultChunkSize,
+		ETag:        "9f2fb1a5f2b4c6d8e0a1b2c3d4e5f607",
+		ContentType: "application/octet-stream",
+		Modified:    time.Now().UTC().Truncate(time.Second),
+		Nodes:       []string{"n1", "n2", "n3"},
+	}
+	prefix := rand.Text()
+	for i := range chunks {
+		m.Chunks = append(m.Chunks, object.ChunkRef{
+			ID:   fmt.Sprintf("%s%06d", prefix, i),
+			Size: object.DefaultChunkSize,
+			CRC:  0xdeadbeef,
+		})
+	}
+	return m
+}
+
 // Chunking on its own, with no network and no disk, to separate the cost of
 // splitting a stream from the cost of storing it. If this is slow, nothing
 // downstream can be fast.
@@ -348,7 +413,7 @@ func BenchmarkChunking(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for b.Loop() {
-				_, err := object.Write(bytes.NewReader(data), object.DefaultChunkSize,
+				_, err := object.Write(bytes.NewReader(data), object.DefaultChunkSize, 0,
 					func(*object.ChunkRef, []byte) error { return nil })
 				if err != nil {
 					b.Fatal(err)

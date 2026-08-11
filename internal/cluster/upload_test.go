@@ -39,14 +39,14 @@ func TestACompletionIsRefusedWhenPlacementMovedMidUpload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := driver.c.UploadPart(ctx, id, 1, bytes.NewReader(randBytes(testChunkSize)))
+	first, err := driver.c.UploadPart(ctx, id, 1, bytes.NewReader(randBytes(testChunkSize)), testChunkSize)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	tc.tellEveryone(fewer)
 
-	second, err := driver.c.UploadPart(ctx, id, 2, bytes.NewReader(randBytes(1024)))
+	second, err := driver.c.UploadPart(ctx, id, 2, bytes.NewReader(randBytes(1024)), 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func TestAbortReclaimsThePartsChunks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := driver.c.UploadPart(ctx, id, 1, bytes.NewReader(randBytes(2*testChunkSize))); err != nil {
+	if _, err := driver.c.UploadPart(ctx, id, 1, bytes.NewReader(randBytes(2*testChunkSize)), 2*testChunkSize); err != nil {
 		t.Fatal(err)
 	}
 

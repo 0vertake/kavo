@@ -8,11 +8,12 @@ build:
 test: etcd
 	go test -race ./...
 
-# Fixed iteration counts, not a duration: a 64 MB write takes 160 ms, so letting
-# Go pick would spend minutes proving what ten passes already show. Results and
-# what they mean: docs/benchmarks.md.
+# Go's own benchtime, not a fixed ten passes. Ten was cheap and wrong: the first
+# request through the AWS SDK pays for credential resolution and a connection, and
+# at ten iterations that fixed cost made a 2 ms GET look like an 8 ms one. Results
+# and what they mean: docs/benchmarks.md.
 bench: etcd
-	go test ./internal/... -run XXX -bench . -benchtime 10x -timeout 1800s
+	go test ./internal/... -run XXX -bench . -timeout 1800s
 
 etcd:
 	@docker compose -f deploy/compose.yaml up -d --wait etcd
