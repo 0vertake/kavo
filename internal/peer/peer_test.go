@@ -9,12 +9,16 @@ import (
 	"errors"
 	"hash/crc32"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/0vertake/kavo/internal/api"
 	"github.com/0vertake/kavo/internal/cluster"
@@ -164,6 +168,73 @@ func TestPushToUnreachablePeer(t *testing.T) {
 
 	if err := push(t, dead, "chunk1", []byte("data"), 0, 4); err == nil {
 		t.Fatal("PushChunk to a dead peer reported success")
+	}
+}
+
+// Connections to a peer are reused across chunks. Not a micro-optimisation: the
+// default transport keeps two idle connections per host, so a node doing more
+// than two things at once with one peer closes and redials for every chunk after
+// that — which under sustained load exhausts the machine's ephemeral ports, and
+// did exactly that in the parallel read benchmark.
+//
+// The count is deliberately loose. What must not happen is one connection per
+// chunk; how many the pool settles on is the transport's business.
+func TestConnectionsToAPeerAreReused(t *testing.T) {
+	root := t.TempDir()
+	s, err := store.Open(root)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+
+	// The handler is slow so that every fetch of a round is in flight at the same
+	// moment and they all return their connections together. That is when the
+	// pool's size decides anything: requests that complete instantly barely
+	// overlap, and then every transport looks alike.
+	inner := api.New(nil, s)
+	var conns atomic.Int64
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(20 * time.Millisecond)
+		inner.ServeHTTP(w, r)
+	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			conns.Add(1)
+		}
+	}
+	srv.Start()
+	t.Cleanup(srv.Close)
+	addr := strings.TrimPrefix(srv.URL, "http://")
+
+	data := []byte("a chunk worth fetching")
+	crc := crc32.Checksum(data, castagnoli)
+	if err := push(t, addr, "reused", data, crc, int64(len(data))); err != nil {
+		t.Fatalf("PushChunk: %v", err)
+	}
+
+	const workers = 8
+	round := func() {
+		var wg sync.WaitGroup
+		for range workers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if _, err := fetch(t, addr, "reused", crc); err != nil {
+					t.Errorf("FetchChunk: %v", err)
+				}
+			}()
+		}
+		wg.Wait()
+	}
+	round()
+	opened := conns.Load()
+	round()
+
+	// The second round is the test: its connections already exist. One more is
+	// allowed for a connection the pool happens to replace; six more is the
+	// default transport throwing away everything past the two it keeps.
+	if again := conns.Load() - opened; again > 1 {
+		t.Errorf("a second round of %d fetches opened %d more connections, want at most 1 (first round opened %d)",
+			workers, again, opened)
 	}
 }
 
