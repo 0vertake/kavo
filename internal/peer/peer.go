@@ -30,7 +30,24 @@ const CRCHeader = "X-Kavo-Crc32c"
 // client has no timeout on purpose: a chunk transfer is bounded by chunk size
 // and link speed, not by a deadline we could pick here. Callers cancel with the
 // request context instead.
-var client = &http.Client{}
+//
+// It does not use the default transport, for one reason: that keeps two idle
+// connections per host, and a node talks to the same handful of peers for every
+// chunk it ever writes or reads. Past two concurrent requests to one peer the
+// default closes connections as soon as they are done and dials again for the
+// next chunk, which showed up as ~8% of CPU in a parallel read.
+var client = &http.Client{Transport: peerTransport()}
+
+// peerTransport clones the default rather than building one, so proxy, dial and
+// TLS behaviour stay whatever the standard library thinks is right.
+func peerTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	// A cluster this talks to is small and its members are long-lived, so an idle
+	// connection per concurrent request is cheap; redialling one per chunk is not.
+	t.MaxIdleConnsPerHost = 64
+	t.MaxIdleConns = 0 // no cluster-wide cap: the per-peer one is the real bound
+	return t
+}
 
 // DropChunk asks the node at addr to delete its copy of a chunk, and treats a
 // copy that is already gone as success.
