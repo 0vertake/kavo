@@ -3,6 +3,7 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -27,12 +28,23 @@ func New(c *cluster.Coordinator, s *store.Store) http.Handler {
 	mux.HandleFunc("GET /objects/{key...}", h.get)
 	mux.HandleFunc("PUT /peer/chunks/{id}", h.putChunk)
 	mux.HandleFunc("GET /peer/chunks/{id}", h.getChunk)
+	mux.HandleFunc("GET /cluster/members", h.members)
 	return mux
 }
 
 type handler struct {
 	cluster *cluster.Coordinator
 	store   *store.Store
+}
+
+// members exposes this node's view of the cluster. Failure detection is only a
+// claim if it can be observed, and this is what makes the detection time
+// measurable from outside the process.
+func (h *handler) members(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(h.cluster.Members()); err != nil {
+		log.Printf("members: %v", err)
+	}
 }
 
 // put replicates the body across the partition's owners and commits the

@@ -4,13 +4,13 @@ package test
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -28,6 +28,10 @@ type node struct {
 	logs    *bytes.Buffer
 }
 
+// testLeaseTTL is etcd's floor. Detection is then as fast as the design allows,
+// which keeps these tests short; production defaults are longer.
+const testLeaseTTL = time.Second
+
 // clusterPrefix isolates a test's manifests in etcd. It has to be unique per
 // run: etcd outlives the test, so a reused prefix would resolve objects whose
 // chunks were left behind in a previous run's data directory.
@@ -37,32 +41,27 @@ func clusterPrefix() string { return "/kavo-test/" + rand.Text() }
 // and prefix to a later startNode call simulates a restart.
 func startNode(t *testing.T, bin, dataDir, prefix string, chunkSize int) *node {
 	t.Helper()
-	return launch(t, bin, "n1", freePort(t), "", dataDir, prefix, chunkSize)
+	return launch(t, bin, "n1", freePort(t), dataDir, prefix, chunkSize)
 }
 
-// startCluster launches n kavod processes that know about each other, returned in
-// id order (n1, n2, ...). Every node is given the same peer list so that they all
-// derive the same ring; disagreeing rings would scatter an object's chunks.
+// startCluster launches n kavod processes into the same cluster, returned in id
+// order (n1, n2, ...). They find each other through etcd, so all that makes them
+// one cluster is the shared prefix.
 func startCluster(t *testing.T, bin, prefix string, chunkSize, n int) []*node {
 	t.Helper()
-	ids := make([]string, n)
-	addrs := make([]string, n)
-	entries := make([]string, n)
-	for i := range n {
-		ids[i] = fmt.Sprintf("n%d", i+1)
-		addrs[i] = freePort(t)
-		entries[i] = ids[i] + "=" + addrs[i]
-	}
-	peers := strings.Join(entries, ",")
-
 	nodes := make([]*node, n)
-	for i := range n {
-		nodes[i] = launch(t, bin, ids[i], addrs[i], peers, t.TempDir(), prefix, chunkSize)
+	for i := range nodes {
+		nodes[i] = launch(t, bin, fmt.Sprintf("n%d", i+1), freePort(t), t.TempDir(), prefix, chunkSize)
+	}
+	// Every node has to see every other before placement is stable, and until
+	// then a write would be spread over a smaller ring than the cluster has.
+	for _, n := range nodes {
+		n.waitForMembers(len(nodes))
 	}
 	return nodes
 }
 
-func launch(t *testing.T, bin, id, addr, peers, dataDir, prefix string, chunkSize int) *node {
+func launch(t *testing.T, bin, id, addr, dataDir, prefix string, chunkSize int) *node {
 	t.Helper()
 	n := &node{
 		t:       t,
@@ -72,18 +71,15 @@ func launch(t *testing.T, bin, id, addr, peers, dataDir, prefix string, chunkSiz
 		addr:    addr,
 		logs:    &bytes.Buffer{},
 	}
-	args := []string{
+	n.cmd = exec.Command(bin,
 		"-id", id,
 		"-addr", n.addr,
 		"-data", dataDir,
 		"-chunk-size", fmt.Sprint(chunkSize),
 		"-etcd", meta.EndpointFromEnv(),
 		"-cluster", prefix,
-	}
-	if peers != "" {
-		args = append(args, "-peers", peers)
-	}
-	n.cmd = exec.Command(bin, args...)
+		"-lease-ttl", testLeaseTTL.String(),
+	)
 	n.cmd.Stdout = n.logs
 	n.cmd.Stderr = n.logs
 	if err := n.cmd.Start(); err != nil {
@@ -127,6 +123,43 @@ func (n *node) stop() {
 
 func (n *node) url(key string) string {
 	return "http://" + n.addr + "/objects/" + key
+}
+
+// members reports this node's view of the cluster.
+func (n *node) members() (map[string]string, error) {
+	resp, err := http.Get("http://" + n.addr + "/cluster/members")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var members map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&members); err != nil {
+		return nil, err
+	}
+	return members, nil
+}
+
+// waitForMembers blocks until this node sees want members, or fails the test.
+func (n *node) waitForMembers(want int) {
+	n.t.Helper()
+	if !n.awaitMembers(func(m map[string]string) bool { return len(m) == want }, 15*time.Second) {
+		got, _ := n.members()
+		n.t.Fatalf("%s sees members %v, want %d of them", n.id, got, want)
+	}
+}
+
+// awaitMembers polls until this node's view satisfies ok, reporting whether it
+// did so within the timeout.
+func (n *node) awaitMembers(ok func(map[string]string) bool, timeout time.Duration) bool {
+	n.t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if members, err := n.members(); err == nil && ok(members) {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return false
 }
 
 // put uploads body and reports the status code. A 200 means the write was

@@ -41,10 +41,7 @@ func newPeer(t *testing.T) (addr, root string) {
 	}
 	t.Cleanup(func() { m.Close() })
 
-	c, err := cluster.New("n1", map[string]string{"n1": "127.0.0.1:0"}, s, m, 1024)
-	if err != nil {
-		t.Fatalf("cluster.New: %v", err)
-	}
+	c := cluster.New("n1", "127.0.0.1:0", s, m, 1024)
 	srv := httptest.NewServer(api.New(c, s))
 	t.Cleanup(srv.Close)
 	return strings.TrimPrefix(srv.URL, "http://"), root
