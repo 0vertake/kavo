@@ -175,6 +175,59 @@ func TestCorruptChunkFailsRead(t *testing.T) {
 	}
 }
 
+// The corruption that used to get through: rot in the object's **last** chunk.
+// A chunk's checksum is only known once the whole chunk has been read, and for the
+// last chunk there is then nothing left to withhold — so every byte had already
+// been handed over and the caller received a complete, wrong object with an error
+// nobody downstream could see. Found by the chaos suite on a single-chunk object,
+// which is the worst version of it: the last chunk is the only chunk.
+//
+// The reader now has to be short by at least one byte whenever it errors, because
+// short is the only remaining way to say "do not trust this".
+func TestCorruptFinalChunkIsNotDeliveredWhole(t *testing.T) {
+	sizes := []struct {
+		name   string
+		size   int
+		chunks int64
+	}{
+		{name: "one chunk, which is also the last", size: 900, chunks: 1024},
+		{name: "several chunks, rot in the last", size: 4096, chunks: 1024},
+	}
+	for _, tt := range sizes {
+		t.Run(tt.name, func(t *testing.T) {
+			s, root := mustOpen(t)
+			data := randBytes(tt.size)
+			m, err := Write(bytes.NewReader(data), tt.chunks, commitTo(s))
+			if err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+
+			last := m.Chunks[len(m.Chunks)-1].ID
+			path := filepath.Join(root, "chunks", last[:2], last)
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The final byte, so that everything before it has been read and
+			// delivered before the mismatch is known.
+			raw[len(raw)-1] ^= 0xff
+			if err := os.WriteFile(path, raw, 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			var got bytes.Buffer
+			err = Read(m, &got, fetchFrom(s))
+			if !errors.Is(err, store.ErrChecksumMismatch) {
+				t.Fatalf("Read error = %v, want store.ErrChecksumMismatch", err)
+			}
+			if got.Len() >= tt.size {
+				t.Errorf("delivered %d of %d bytes before failing: a caller that trusts "+
+					"Content-Length cannot tell this from success", got.Len(), tt.size)
+			}
+		})
+	}
+}
+
 // Invariant: a failed upload never yields a usable manifest. Returning a
 // partial one would make a truncated object committable.
 func TestWriteFailsMidStream(t *testing.T) {

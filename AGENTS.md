@@ -18,6 +18,10 @@ not API surface. Full design and milestones: `docs/design.md`. Research notes wi
  settle are in `docs/benchmarks.md`; starts etcd first, so
  Docker must be running. Tests that touch metadata use a real etcd, never a fake.
 - `make lint` — `go vet` + `gofmt` check
+- `go test ./test -run TestChaos` — the chaos suite: a concurrent S3 workload against four real
+ processes while faults arrive at random, then the four invariants checked against the recorded
+ history. `-chaos.duration` to run it longer, `-chaos.seed` to replay one. It runs at a short
+ default as part of `make test`; run it long before believing a durability change.
 - `make etcd` — start just etcd (idempotent)
 - `make up` / `make down` — 6-node dev cluster plus etcd via Docker Compose
  (`deploy/compose.yaml`). Each node publishes two ports: the S3 API on `localhost:9001`–`9006`

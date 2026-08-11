@@ -433,10 +433,42 @@ implementation disagreeing is the only thing that catches a misreading.
 
 ## Testing and benchmarks
 
-- **Chaos** (milestone 10): Go-native runner (etcd's Jepsen-in-Go precedent) drives
-  concurrent workloads, records every acknowledged PUT, injects faults — Docker SIGKILL,
-  toxiproxy partitions/latency/bandwidth, direct byte-flips — and asserts the four
-  invariants (see `AGENTS.md`) from recorded history.
+- **Chaos** (milestone 10): `go test ./test -run TestChaos`, tunable with `-chaos.duration` and
+  replayable with `-chaos.seed`. Eight workers drive a signed S3 workload — single PUTs and
+  multipart uploads, reads through a different node than the write went to, and deletes — against
+  four real `kavod` processes while faults arrive on a seeded schedule: SIGKILL and restart,
+  SIGSTOP (a frozen process: ports open, nothing answered, no lease renewed), a wiped disk, and a
+  flipped bit under a running node. Then it asserts the four invariants (see `AGENTS.md`) from the
+  recorded history.
+
+  Three things make it more than a smoke test.
+
+  **The history distinguishes three outcomes, not two.** Acknowledged, refused, and *unknown* — a
+  request whose response was lost. An acknowledged write must be readable byte for byte; an
+  acknowledged delete must be gone; an operation nobody got an answer to may have happened or not,
+  and both are correct. Conflating the last two is how a chaos suite invents a lost write: a crash
+  between "manifest removed" and "204 sent" is two correct steps and a dropped reply, and the first
+  version of this suite reported it as data loss.
+
+  **Faults stay inside the redundancy they were configured with.** N=3 tolerates two copies of a
+  chunk being lost, not three. The first version wiped three disks in five seconds, lost an
+  object, and was right to: nothing promises to survive that. So faults are strictly one at a time,
+  and the next one waits at a barrier — every node a member again, and every chunk of every
+  manifest present on every owner that manifest names. That barrier *is* invariant 4, asserted
+  after every single fault rather than once at the end, and it is what turns "healing works" from
+  a claim into a measurement.
+
+  **Redundancy is checked against the manifests, not the ring.** An object is where its manifest
+  says it is, so the checker reads manifests out of etcd and stats files on each node's disk —
+  the same question repair and rebalance answer, asked from outside the code that answers it.
+
+  A read that fails during a fault window is allowed: invariant 3 promises checksum-valid data
+  **or an explicit error**. The one unacceptable outcome is a complete response whose bytes are not
+  what was written, which the suite separates from every other failure and reports on its own.
+
+  What it does not cover: a partition that isolates nodes from each other while leaving them
+  reachable by clients (SIGSTOP freezes a node from everyone at once), erasure-coded mode, and
+  anything that needs the page cache to disappear — see the fsync limitation below.
 - **Benchmarks** (milestone 11): MinIO `warp` for throughput/latency (put/get/mixed/
   multipart, p50–p99.9); custom harness for heal time, rebalance fraction, and peak RSS
   while streaming. Final numbers on 3–4 separate cloud VMs over a real network.
@@ -450,6 +482,13 @@ implementation disagreeing is the only thing that catches a misreading.
   mismatch is found. The transfer then aborts short of the promised `Content-Length`, so the
   client always sees a failed transfer — but it may have received corrupt bytes. Verifying
   before sending would mean buffering a whole chunk per request. Same trade-off MinIO makes.
+
+  "Aborts short" had a hole, and the chaos suite found it: for the **last** chunk there is
+  nothing left to withhold once the mismatch is known, so a corrupt final chunk was delivered as
+  a complete, successful, wrong response — worst of all on a single-chunk object, where the last
+  chunk is the only one. Fixed by holding back the final byte of every chunk until that chunk's
+  checksum verifies. One byte of memory, and the client either gets the length it was promised
+  from chunks that verified, or a transfer that stops short.
 - **Redundancy returns at two different speeds**: repair rebuilds a missing copy on an owner the
   manifest already names, so a crash or a lost disk heals on the repair interval. A node that is
   gone for good needs its copy's place moved, which is a rebalance pass — five times less frequent

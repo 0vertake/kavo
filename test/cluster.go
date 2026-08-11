@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -20,14 +21,17 @@ import (
 
 // node is a kavod process under test.
 type node struct {
-	t       *testing.T
-	id      string
-	bin     string
-	dataDir string
-	addr    string
-	s3Addr  string
-	cmd     *exec.Cmd
-	logs    *bytes.Buffer
+	t         *testing.T
+	id        string
+	bin       string
+	dataDir   string
+	prefix    string
+	chunkSize int
+	erasure   string
+	addr      string
+	s3Addr    string
+	cmd       *exec.Cmd
+	logs      *bytes.Buffer
 }
 
 const (
@@ -85,42 +89,84 @@ func startClusterCoded(t *testing.T, bin, prefix string, chunkSize, n int, erasu
 func launch(t *testing.T, bin, id, addr, dataDir, prefix string, chunkSize int, erasure string) *node {
 	t.Helper()
 	n := &node{
-		t:       t,
-		id:      id,
-		bin:     bin,
-		dataDir: dataDir,
-		addr:    addr,
+		t:         t,
+		id:        id,
+		bin:       bin,
+		dataDir:   dataDir,
+		prefix:    prefix,
+		chunkSize: chunkSize,
+		erasure:   erasure,
+		addr:      addr,
 		// Every node serves S3 too, on its own port: a restart has to be able to
 		// bind both, and the CLI test needs a real one to talk to.
 		s3Addr: freePort(t),
 		logs:   &bytes.Buffer{},
 	}
-	n.cmd = exec.Command(bin,
-		"-id", id,
+	n.start()
+	t.Cleanup(n.stop)
+	n.waitReady()
+	return n
+}
+
+// start runs the process. Everything it needs is on the node, so starting it
+// again after a kill is the same call — which is what a restart is.
+func (n *node) start() {
+	n.t.Helper()
+	n.cmd = exec.Command(n.bin,
+		"-id", n.id,
 		"-addr", n.addr,
 		"-s3", n.s3Addr,
 		"-access-key", testAccessKey,
 		"-secret-key", testSecretKey,
-		"-data", dataDir,
-		"-chunk-size", fmt.Sprint(chunkSize),
+		"-data", n.dataDir,
+		"-chunk-size", fmt.Sprint(n.chunkSize),
 		"-etcd", meta.EndpointFromEnv(),
-		"-cluster", prefix,
+		"-cluster", n.prefix,
 		"-lease-ttl", testLeaseTTL.String(),
 		"-repair-interval", testRepairInterval.String(),
 		"-scrub-interval", testRepairInterval.String(),
+		// Rebalancing runs as often as repair here. Membership changes constantly
+		// in these tests, and the interval is what decides whether "redundancy
+		// comes back" is observable in seconds or in minutes.
+		"-rebalance-interval", testRepairInterval.String(),
 		"-repair-rate", "0",
 	)
-	if erasure != "" {
-		n.cmd.Args = append(n.cmd.Args, "-ec", erasure)
+	if n.erasure != "" {
+		n.cmd.Args = append(n.cmd.Args, "-ec", n.erasure)
 	}
 	n.cmd.Stdout = n.logs
 	n.cmd.Stderr = n.logs
 	if err := n.cmd.Start(); err != nil {
-		t.Fatalf("start kavod: %v", err)
+		n.t.Fatalf("start kavod %s: %v", n.id, err)
 	}
-	t.Cleanup(n.stop)
+}
+
+// restart is a process coming back from the dead: same id, same addresses, same
+// disk, and whatever the crash left on it.
+func (n *node) restart() {
+	n.t.Helper()
+	n.stop()
+	n.start()
 	n.waitReady()
-	return n
+}
+
+// pause stops the process without killing it: it holds its ports open, answers
+// nothing, and renews no lease. That is what a node behind a network partition or
+// stuck in a long GC pause looks like to the rest of the cluster, and it is the
+// harder case — a killed node's connections are refused immediately, where a
+// paused one's hang.
+func (n *node) pause() {
+	n.t.Helper()
+	if err := n.cmd.Process.Signal(syscall.SIGSTOP); err != nil {
+		n.t.Fatalf("pause %s: %v", n.id, err)
+	}
+}
+
+func (n *node) resume() {
+	n.t.Helper()
+	if err := n.cmd.Process.Signal(syscall.SIGCONT); err != nil {
+		n.t.Fatalf("resume %s: %v", n.id, err)
+	}
 }
 
 // waitReady blocks until both listeners are up. Both, because a node whose S3
@@ -179,10 +225,40 @@ func (n *node) chunkFiles() []string {
 func (n *node) loseChunks() {
 	n.t.Helper()
 	for _, f := range n.chunkFiles() {
-		if err := os.Remove(f); err != nil {
+		// Already gone is fine: repair may be rewriting this node's chunks while
+		// the disk is being wiped, which is exactly what happens in the chaos run.
+		if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
 			n.t.Fatalf("remove %s: %v", f, err)
 		}
 	}
+}
+
+// hasChunk reports whether this node's disk holds the chunk with this id.
+func (n *node) hasChunk(id string) bool {
+	_, err := os.Stat(filepath.Join(n.dataDir, "chunks", id[:2], id))
+	return err == nil
+}
+
+// rotAChunk flips a bit in one chunk this node holds, which is bit rot: the file
+// is the right size, in the right place, with the wrong contents. Reports whether
+// there was anything to rot.
+func (n *node) rotAChunk(pick func(int) int) bool {
+	n.t.Helper()
+	files := n.chunkFiles()
+	if len(files) == 0 {
+		return false
+	}
+	target := files[pick(len(files))]
+	data, err := os.ReadFile(target)
+	if err != nil || len(data) == 0 {
+		// The scrubber or a repair may have replaced the file underneath us.
+		return false
+	}
+	data[pick(len(data))] ^= 1 << pick(8)
+	if err := os.WriteFile(target, data, 0o644); err != nil {
+		return false
+	}
+	return true
 }
 
 // waitForChunks blocks until this node holds want chunks, reporting whether it
