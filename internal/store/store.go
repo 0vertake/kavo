@@ -181,6 +181,25 @@ func (s *Store) ReadChunk(id string, wantCRC uint32) (io.ReadCloser, error) {
 	return Verify(f, wantCRC), nil
 }
 
+// HasChunk reports whether this node holds chunk id.
+//
+// Presence only: the checksum is not read, so a chunk that has rotted still
+// counts as present. Repair uses this to find missing copies, which is a
+// different question from whether the copies that exist are still good.
+func (s *Store) HasChunk(id string) (bool, error) {
+	if err := validateID(id); err != nil {
+		return false, err
+	}
+	_, err := os.Stat(s.chunkPath(id))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("store: stat chunk %s: %w", id, err)
+	}
+	return true, nil
+}
+
 // Verify wraps r so that reads fail with ErrChecksumMismatch instead of
 // returning a final EOF unless the bytes read match want.
 //
