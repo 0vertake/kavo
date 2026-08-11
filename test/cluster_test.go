@@ -3,6 +3,7 @@ package test
 import (
 	"bytes"
 	"net/http"
+	"os"
 	"slices"
 	"testing"
 	"time"
@@ -199,6 +200,58 @@ func TestALostDiskIsHealedWithoutBeingAskedTo(t *testing.T) {
 	}
 	if status, got, err := outsider.get(client, key); err != nil || status != http.StatusOK || !bytes.Equal(got, data) {
 		t.Fatalf("GET after healing = (%d, %d bytes, %v), want (200, %d, nil)",
+			status, len(got), err, len(data))
+	}
+}
+
+// Rot has to be found by looking. Nobody asks for a scrub here: a byte is flipped
+// under a running node, and the cluster replaces the copy on its own.
+func TestBitRotIsFoundAndReplacedWithoutBeingAskedTo(t *testing.T) {
+	bin := buildKavod(t)
+	nodes := startCluster(t, bin, clusterPrefix(), testChunkSize, clusterSize)
+
+	const key = "rotted/object"
+	data := payloadFor(3)
+	client := &http.Client{}
+	if status, err := nodes[0].put(client, key, data); err != nil || status != http.StatusOK {
+		t.Fatalf("PUT = (%d, %v), want (200, nil)", status, err)
+	}
+
+	owners, _ := ownersOf(nodes, key)
+	victim := owners[1]
+	files := victim.chunkFiles()
+	if len(files) == 0 {
+		t.Fatalf("%s holds no chunks of an object it owns", victim.id)
+	}
+	target := files[0]
+	want, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotted := bytes.Clone(want)
+	rotted[len(rotted)/2] ^= 0x01
+	if err := os.WriteFile(target, rotted, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		got, err := os.ReadFile(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Equal(got, want) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the rotted chunk was never replaced")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	status, got, err := victim.get(client, key)
+	if err != nil || status != http.StatusOK || !bytes.Equal(got, data) {
+		t.Fatalf("GET from the scrubbed node = (%d, %d bytes, %v), want (200, %d, nil)",
 			status, len(got), err, len(data))
 	}
 }

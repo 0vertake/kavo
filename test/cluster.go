@@ -88,6 +88,7 @@ func launch(t *testing.T, bin, id, addr, dataDir, prefix string, chunkSize int) 
 		"-cluster", prefix,
 		"-lease-ttl", testLeaseTTL.String(),
 		"-repair-interval", testRepairInterval.String(),
+		"-scrub-interval", testRepairInterval.String(),
 		"-repair-rate", "0",
 	)
 	n.cmd.Stdout = n.logs
