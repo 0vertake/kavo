@@ -133,22 +133,23 @@ func (s *Store) ScanObjects(ctx context.Context, after string, limit int64) ([]O
 	return objects, nil
 }
 
-// SaveRepairCursor records how far a node's repair pass got, so that a restart
-// resumes instead of starting over. A heal that begins again from the first
-// object every time a process restarts never reaches the last one.
-func (s *Store) SaveRepairCursor(ctx context.Context, node, key string) error {
-	if _, err := s.client.Put(ctx, s.cursorKey(node), key); err != nil {
-		return fmt.Errorf("meta: save repair cursor for %s: %w", node, err)
+// SaveCursor records how far a node got in a background walk over the cluster's
+// objects, so that a restart resumes instead of starting over. A pass that begins
+// again from the first object every time a process restarts never reaches the
+// last one.
+func (s *Store) SaveCursor(ctx context.Context, task, node, key string) error {
+	if _, err := s.client.Put(ctx, s.cursorKey(task, node), key); err != nil {
+		return fmt.Errorf("meta: save %s cursor for %s: %w", task, node, err)
 	}
 	return nil
 }
 
-// RepairCursor returns where this node's repair pass should resume, or "" to
-// start from the beginning.
-func (s *Store) RepairCursor(ctx context.Context, node string) (string, error) {
-	resp, err := s.client.Get(ctx, s.cursorKey(node))
+// Cursor returns where a node's walk should resume, or "" to start from the
+// beginning.
+func (s *Store) Cursor(ctx context.Context, task, node string) (string, error) {
+	resp, err := s.client.Get(ctx, s.cursorKey(task, node))
 	if err != nil {
-		return "", fmt.Errorf("meta: read repair cursor for %s: %w", node, err)
+		return "", fmt.Errorf("meta: read %s cursor for %s: %w", task, node, err)
 	}
 	if len(resp.Kvs) == 0 {
 		return "", nil
@@ -163,6 +164,6 @@ func (s *Store) key(objectKey string) string { return s.objectPrefix() + objectK
 
 func (s *Store) objectPrefix() string { return path.Join(s.prefix, "objects") + "/" }
 
-func (s *Store) cursorKey(node string) string {
-	return path.Join(s.prefix, "repair", node, "cursor")
+func (s *Store) cursorKey(task, node string) string {
+	return path.Join(s.prefix, "cursors", task, node)
 }

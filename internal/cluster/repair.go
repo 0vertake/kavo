@@ -77,39 +77,12 @@ func (c *Coordinator) Repair(ctx context.Context, rate int64) (Stats, error) {
 	var st Stats
 	pace := &pacer{rate: rate, since: time.Now()}
 
-	cursor, err := c.meta.RepairCursor(ctx, c.self)
+	err := c.walk(ctx, "repair", func(o meta.Object) error {
+		return c.repairObject(ctx, o, &st, pace)
+	})
 	if err != nil {
 		return st, err
 	}
-	for {
-		objects, err := c.meta.ScanObjects(ctx, cursor, scanPage)
-		if err != nil {
-			return st, err
-		}
-		if len(objects) == 0 {
-			// The end of the cluster's objects: the next pass starts over.
-			if err := c.meta.SaveRepairCursor(ctx, c.self, ""); err != nil {
-				return st, err
-			}
-			break
-		}
-
-		for _, o := range objects {
-			if err := c.repairObject(ctx, o, &st, pace); err != nil {
-				if ctx.Err() != nil {
-					return st, ctx.Err()
-				}
-				// One object nobody can rebuild must not stop the pass; the
-				// rest of the cluster still needs repairing.
-				log.Printf("repair: %s: %v", o.Key, err)
-			}
-			cursor = o.Key
-		}
-		if err := c.meta.SaveRepairCursor(ctx, c.self, cursor); err != nil {
-			return st, err
-		}
-	}
-
 	// The pass finishes either way — the rest of the cluster still needs
 	// repairing — but a pass that found data with no copies left has not
 	// succeeded, whatever else it fixed.
@@ -117,6 +90,41 @@ func (c *Coordinator) Repair(ctx context.Context, rate int64) (Stats, error) {
 		return st, fmt.Errorf("%w: %d copies with no source left to rebuild from", ErrUnrepairable, st.Unrepairable)
 	}
 	return st, nil
+}
+
+// walk visits every object in the cluster in key order, resuming where this
+// node's last walk of the same task stopped and starting over once it reaches the
+// end. Objects are read a page at a time: a background pass must not depend on
+// holding every manifest in memory.
+//
+// A failure on one object is logged and the walk continues. The alternative is a
+// single unrebuildable object stopping every other object from being repaired.
+func (c *Coordinator) walk(ctx context.Context, task string, visit func(meta.Object) error) error {
+	cursor, err := c.meta.Cursor(ctx, task, c.self)
+	if err != nil {
+		return err
+	}
+	for {
+		objects, err := c.meta.ScanObjects(ctx, cursor, scanPage)
+		if err != nil {
+			return err
+		}
+		if len(objects) == 0 {
+			return c.meta.SaveCursor(ctx, task, c.self, "")
+		}
+		for _, o := range objects {
+			if err := visit(o); err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				log.Printf("%s: %s: %v", task, o.Key, err)
+			}
+			cursor = o.Key
+		}
+		if err := c.meta.SaveCursor(ctx, task, c.self, cursor); err != nil {
+			return err
+		}
+	}
 }
 
 // repairObject restores any copy of o's chunks that a live owner should have and

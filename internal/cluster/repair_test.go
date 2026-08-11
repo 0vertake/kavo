@@ -160,7 +160,7 @@ func TestRepairResumesFromWhereItStopped(t *testing.T) {
 	lateOwners[1].loseChunks(t, lateManifest.Chunks)
 
 	// Resuming past the early object is exactly what a restart mid-pass looks like.
-	if err := repairer.m.SaveRepairCursor(ctx, repairer.id, "b"); err != nil {
+	if err := repairer.m.SaveCursor(ctx, "repair", repairer.id, "b"); err != nil {
 		t.Fatalf("save cursor: %v", err)
 	}
 	if st := mustRepair(t, repairer, 0); st.Objects != 1 {
@@ -178,7 +178,7 @@ func TestRepairResumesFromWhereItStopped(t *testing.T) {
 	}
 
 	// Reaching the end resets the cursor, so the next pass sees everything again.
-	if cursor, err := repairer.m.RepairCursor(ctx, repairer.id); err != nil || cursor != "" {
+	if cursor, err := repairer.m.Cursor(ctx, "repair", repairer.id); err != nil || cursor != "" {
 		t.Fatalf("cursor after a completed pass = (%q, %v), want empty", cursor, err)
 	}
 	if st := mustRepair(t, repairer, 0); st.Restored != len(earlyManifest.Chunks) {
