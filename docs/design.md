@@ -277,9 +277,21 @@ acknowledged write is byte-identical and that nothing is readable in a partial s
 
 ## S3 subset (milestone 9)
 
-PUT, GET, DELETE, LIST, multipart upload, SigV4 — nothing else (no IAM/ACLs/versioning/
-lifecycle; anti-goal). External validation: Ceph `s3-tests` via config file + tox; report the
-pass count.
+PUT, GET, DELETE, LIST, multipart upload, SigV4 — plus the six operations a client calls without
+being asked to: `CreateBucket`, `ListBuckets`, `DeleteBucket`, `DeleteObjects`,
+`ListObjectVersions` and `GetBucketLocation`. Nothing else (no IAM/ACLs/versioning/lifecycle;
+anti-goal).
+
+Those six are not a widening of the subset so much as the cost of being reachable. An SDK creates
+the bucket before its first upload, `aws s3 ls` with no argument lists buckets, and every client
+empties a bucket by listing versions and bulk-deleting what it finds. None of them store anything
+new: a bucket is still a prefix, and the version listing reports every object once with the id
+`null`, which is S3's own answer for a bucket that was never versioned.
+
+External validation: Ceph `s3-tests`. **169 of 886 pass, nothing errors**, and every failure is
+classified in `docs/s3-compatibility.md` — as an anti-goal, a consequence of buckets being prefixes,
+or a named gap. The suite found four real defects, three of which kavo's own tests could not see;
+they are listed there too.
 
 ### Object API
 
@@ -551,9 +563,11 @@ implementation disagreeing is the only thing that catches a misreading.
 6. Automatic repair (rate-limited, resumable; heal-time vs latency chart)
 7. Erasure coding as second mode (both modes measured side by side)
 8. Rebalance on join/leave (% moved, convergence time)
-9. S3 subset + SigV4 (`aws s3 cp` end to end; s3-tests pass count)
-10. Chaos suite in CI (invariants asserted under randomized faults)
-11. Benchmarks + README + demo video (real machines, real network)
+9. S3 subset + SigV4 (`aws s3 cp` end to end; s3-tests pass count — `docs/s3-compatibility.md`)
+10. Chaos suite in CI (invariants asserted under randomized faults; GitHub Actions runs it long
+    on every push, which is where a fixed heal deadline was caught measuring the keyspace)
+11. Benchmarks + README (`docs/benchmarks.md`, including `warp` as an outside client). Still
+    outstanding: separate machines over a real network, and a demo recording
 
 Milestones 6, 7, 10 are where the project stops being a tutorial — never skip them for API
 surface.
