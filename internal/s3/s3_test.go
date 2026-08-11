@@ -43,9 +43,16 @@ var creds = sigv4.Credentials{AccessKey: "AKIAIOSFODNN7EXAMPLE", SecretKey: "wJa
 // N=3: a smaller cluster cannot accept an object at all.
 func newGateway(t testing.TB) *awss3.Client {
 	t.Helper()
+	return newGatewaySized(t, 3, testChunkSize)
+}
+
+// newGatewaySized is newGateway with the cluster size and chunk size the caller
+// needs. Benchmarks want six nodes at the production chunk size, so that their
+// numbers can be put next to the ones the internal API produces.
+func newGatewaySized(t testing.TB, n int, chunkSize int64) *awss3.Client {
+	t.Helper()
 	prefix := "/kavo-test/" + rand.Text()
 
-	const n = 3
 	srvs := make([]*httptest.Server, n)
 	peers := make(map[string]string, n)
 	ids := make([]string, n)
@@ -67,7 +74,7 @@ func newGateway(t testing.TB) *awss3.Client {
 		}
 		t.Cleanup(func() { m.Close() })
 
-		c := cluster.New(id, peers[id], st, m, testChunkSize)
+		c := cluster.New(id, peers[id], st, m, chunkSize)
 		c.SetMembers(peers)
 		srvs[i].Config.Handler = api.New(c, st)
 		srvs[i].Start()

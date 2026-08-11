@@ -23,7 +23,7 @@ type ListRequest struct {
 
 // ListPage is one page of a listing.
 type ListPage struct {
-	Objects []meta.Object
+	Objects []meta.Entry
 	// Prefixes are the groups the delimiter collapsed, in key order.
 	Prefixes []string
 	// Next is where a following page starts, inclusive, and is empty when the
@@ -33,10 +33,11 @@ type ListPage struct {
 	Next string
 }
 
-// scanPageSize is how many manifests are read from etcd at a time. A listing with
-// a delimiter can discard almost all of them — many keys under one grouped prefix
-// collapse to one entry — so the page a client asked for is not the page etcd is
-// asked for.
+// scanPageSize is how many keys are read from etcd at a time when a delimiter is
+// grouping them. A grouped listing can discard almost all of what it reads — many
+// keys under one prefix collapse to one entry — so the page a client asked for is
+// not the page etcd is asked for. Without a delimiter the two are the same and
+// this does not apply.
 const scanPageSize = 256
 
 // List returns one page of a bucket's keys.
@@ -50,13 +51,23 @@ func (c *Coordinator) List(ctx context.Context, req ListRequest) (ListPage, erro
 	var page ListPage
 	from := req.From
 	for {
-		objects, err := c.meta.ScanObjects(ctx, req.Prefix, from, scanPageSize)
+		// Without a delimiter every key read becomes an entry, so what is left to
+		// fill is exactly what to ask etcd for: a page of 1000 is one round trip
+		// rather than four.
+		want := int64(scanPageSize)
+		if req.Delimiter == "" {
+			want = int64(req.Limit - len(page.Objects))
+		}
+		objects, err := c.meta.ScanEntries(ctx, req.Prefix, from, want)
 		if err != nil {
 			return ListPage{}, err
 		}
 		if len(objects) == 0 {
 			return page, nil // the listing ran out, so it is complete
 		}
+		// A short read means the range is exhausted, which saves asking again to
+		// be told there is nothing left.
+		exhausted := int64(len(objects)) < want
 
 		// group holds the prefix just reported, whose remaining keys are inside it
 		// and must not be reported again. Keys arrive sorted, so once one falls
@@ -84,8 +95,8 @@ func (c *Coordinator) List(ctx context.Context, req ListRequest) (ListPage, erro
 				return page, nil
 			}
 		}
-		if from == "" {
-			return page, nil // nothing sorts past the group just skipped
+		if exhausted || from == "" {
+			return page, nil // nothing left, or nothing sorts past the group just skipped
 		}
 	}
 }
