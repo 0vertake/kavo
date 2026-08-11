@@ -8,6 +8,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/0vertake/kavo/internal/ec"
 	"github.com/0vertake/kavo/internal/meta"
 	"github.com/0vertake/kavo/internal/object"
 	"github.com/0vertake/kavo/internal/peer"
@@ -87,6 +88,9 @@ func (c *Coordinator) Scrub(ctx context.Context, rate int64) (ScrubStats, error)
 
 func (c *Coordinator) scrubObject(ctx context.Context, o meta.Object, st *ScrubStats, pace *pacer) error {
 	live := c.live.Load()
+	if o.Manifest.Coding != (ec.Scheme{}) {
+		return c.scrubShards(ctx, o, st, pace, live)
+	}
 
 	var errs []error
 	for _, ref := range o.Manifest.Chunks {
@@ -123,6 +127,55 @@ func (c *Coordinator) scrubObject(ctx context.Context, o meta.Object, st *ScrubS
 		}
 		st.Rebuilt++
 		log.Printf("scrub: replaced rotted chunk %s from a peer", ref.ID)
+	}
+	return errors.Join(errs...)
+}
+
+// scrubShards checks the erasure-coded shards this node holds and replaces any
+// that have rotted.
+//
+// A rotted shard is rebuilt from the other shards rather than copied from a peer:
+// there is no other copy of shard 4 anywhere, only the arithmetic that produces
+// it. Which means rot in a shard costs a full decode to fix, where rot in a
+// replica costs a fetch — the read-side price of storing 1.5x instead of 3x.
+func (c *Coordinator) scrubShards(ctx context.Context, o meta.Object, st *ScrubStats, pace *pacer, live *membership) error {
+	var errs []error
+	for _, ref := range o.Manifest.Chunks {
+		var rotted []int
+		for i, node := range o.Manifest.Nodes {
+			if node != c.self {
+				continue
+			}
+			held, size, err := c.verifyLocalShard(ref, i)
+			if !held {
+				if err != nil {
+					errs = append(errs, err)
+				}
+				continue
+			}
+			st.CopiesRead++
+			st.BytesRead += size
+			pace.wait(ctx, size)
+
+			if errors.Is(err, store.ErrChecksumMismatch) {
+				st.Rotted++
+				rotted = append(rotted, i)
+				continue
+			}
+			if err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if len(rotted) == 0 {
+			continue
+		}
+		if err := c.restoreShards(ctx, ref, o.Manifest.Nodes, rotted, o.Manifest.Coding, live, pace); err != nil {
+			st.Unrecovered += len(rotted)
+			errs = append(errs, fmt.Errorf("scrub: shards of chunk %s rotted on %s: %w", ref.ID, c.self, err))
+			continue
+		}
+		st.Rebuilt += len(rotted)
+		log.Printf("scrub: rebuilt %d rotted shards of chunk %s", len(rotted), ref.ID)
 	}
 	return errors.Join(errs...)
 }

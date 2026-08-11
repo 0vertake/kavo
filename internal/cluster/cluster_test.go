@@ -37,7 +37,17 @@ type node struct {
 	srv     *httptest.Server
 	revived *http.Server
 	m       *meta.Store
+	s       *store.Store
 	c       *cluster.Coordinator
+}
+
+// loseEverything empties this node's disk, which is what a replaced drive looks
+// like: the node is healthy and answering, it simply has nothing.
+func (n *node) loseEverything(t testing.TB) {
+	t.Helper()
+	if err := os.RemoveAll(filepath.Join(n.root, "chunks")); err != nil {
+		t.Fatalf("empty %s: %v", n.id, err)
+	}
 }
 
 // kill takes the node off the network. Its chunks stay on disk, so this is a
@@ -136,6 +146,7 @@ func newClusterChunked(t testing.TB, n int, chunkSize int64) *testCluster {
 			handler: handler,
 			srv:     srvs[i],
 			m:       m,
+			s:       s,
 			c:       c,
 		}
 	}
@@ -147,8 +158,15 @@ func newClusterChunked(t testing.TB, n int, chunkSize int64) *testCluster {
 // coordinates any request and going through a non-owner exercises the network.
 func (tc *testCluster) owners(t testing.TB, key string) (owners []*node, outsider *node) {
 	t.Helper()
+	return tc.ownersN(t, key, cluster.Replicas)
+}
+
+// ownersN is owners for a placement that is not three wide, which erasure coding
+// needs: a k+m code spreads a chunk over k+m nodes.
+func (tc *testCluster) ownersN(t testing.TB, key string, width int) (owners []*node, outsider *node) {
+	t.Helper()
 	ids := slices.Sorted(maps.Keys(tc.nodes))
-	want := ring.New(ids, ring.DefaultVNodes).Owners(ring.PartitionFor(key), cluster.Replicas)
+	want := ring.New(ids, ring.DefaultVNodes).Owners(ring.PartitionFor(key), width)
 	for _, id := range want {
 		owners = append(owners, tc.nodes[id])
 	}

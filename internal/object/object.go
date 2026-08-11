@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+
+	"github.com/0vertake/kavo/internal/ec"
 )
 
 // DefaultChunkSize is the chunk size used by the data path.
@@ -31,18 +33,36 @@ type ChunkRef struct {
 	ID   string
 	Size int64
 	CRC  uint32
+	// Shards holds one checksum per erasure-coded shard, in shard order, and is
+	// empty for a replicated chunk. Position is not decoration: it is what tells
+	// the decoder which equation a shard belongs to, and Reed–Solomon cannot
+	// notice that two shards were swapped. These checksums are the only thing
+	// that can.
+	Shards []uint32
 }
+
+// ShardID names the i'th shard of a chunk. Shards are derived from the chunk id
+// rather than given their own random names, so a reader that has the manifest can
+// address every shard without the manifest listing them.
+func (c ChunkRef) ShardID(i int) string { return fmt.Sprintf("%ss%02d", c.ID, i) }
 
 // Manifest describes a stored object. It is the unit committed to etcd: an
 // object exists only once its manifest is committed.
 type Manifest struct {
 	Size int64
 	// Nodes are the partition owners the chunks were written to. All chunks of
-	// an object share a partition, so one list covers them all. A reader tries
-	// them in turn, because a chunk that only reached W of N owners is missing
-	// from the rest.
+	// an object share a partition, so one list covers them all.
+	//
+	// Replicated: a reader tries them in turn, because a chunk that only reached
+	// W of N owners is missing from the rest. Erasure-coded: position matters —
+	// shard i lives on Nodes[i], and there are as many owners as shards.
 	Nodes  []string
 	Chunks []ChunkRef
+	// Coding is the erasure code the chunks were written with, or the zero
+	// Scheme for replication. It is recorded per object rather than read from
+	// the node's configuration: an object written as 6+3 must still be readable
+	// after the cluster's default changes.
+	Coding ec.Scheme
 }
 
 // Write splits r into chunks of at most chunkSize, hands each to commit, and
@@ -54,8 +74,10 @@ type Manifest struct {
 //
 // commit receives a buffer that is reused for the next chunk, so it must not
 // retain the slice after returning. Buffering one chunk is what allows a chunk
-// to be written to several nodes at once from a single pass over the body.
-func Write(r io.Reader, chunkSize int64, commit func(ChunkRef, []byte) error) (Manifest, error) {
+// to be written to several nodes at once from a single pass over the body. It
+// takes the ref by pointer because an erasure-coding commit has to record a
+// checksum per shard, and only the code that made the shards knows them.
+func Write(r io.Reader, chunkSize int64, commit func(*ChunkRef, []byte) error) (Manifest, error) {
 	if chunkSize <= 0 {
 		return Manifest{}, fmt.Errorf("object: chunk size must be positive, got %d", chunkSize)
 	}
@@ -89,7 +111,7 @@ func Write(r io.Reader, chunkSize int64, commit func(ChunkRef, []byte) error) (M
 			Size: int64(n),
 			CRC:  crc32.Checksum(data, castagnoli),
 		}
-		if err := commit(ref, data); err != nil {
+		if err := commit(&ref, data); err != nil {
 			return Manifest{}, err
 		}
 		m.Chunks = append(m.Chunks, ref)

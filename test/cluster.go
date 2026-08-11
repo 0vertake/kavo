@@ -49,7 +49,7 @@ func clusterPrefix() string { return "/kavo-test/" + rand.Text() }
 // and prefix to a later startNode call simulates a restart.
 func startNode(t *testing.T, bin, dataDir, prefix string, chunkSize int) *node {
 	t.Helper()
-	return launch(t, bin, "n1", freePort(t), dataDir, prefix, chunkSize)
+	return launch(t, bin, "n1", freePort(t), dataDir, prefix, chunkSize, "")
 }
 
 // startCluster launches n kavod processes into the same cluster, returned in id
@@ -57,9 +57,16 @@ func startNode(t *testing.T, bin, dataDir, prefix string, chunkSize int) *node {
 // one cluster is the shared prefix.
 func startCluster(t *testing.T, bin, prefix string, chunkSize, n int) []*node {
 	t.Helper()
+	return startClusterCoded(t, bin, prefix, chunkSize, n, "")
+}
+
+// startClusterCoded is startCluster with the nodes erasure-coding new writes, so
+// that the flag and everything behind it is exercised as an operator would use it.
+func startClusterCoded(t *testing.T, bin, prefix string, chunkSize, n int, erasure string) []*node {
+	t.Helper()
 	nodes := make([]*node, n)
 	for i := range nodes {
-		nodes[i] = launch(t, bin, fmt.Sprintf("n%d", i+1), freePort(t), t.TempDir(), prefix, chunkSize)
+		nodes[i] = launch(t, bin, fmt.Sprintf("n%d", i+1), freePort(t), t.TempDir(), prefix, chunkSize, erasure)
 	}
 	// Every node has to see every other before placement is stable, and until
 	// then a write would be spread over a smaller ring than the cluster has.
@@ -69,7 +76,7 @@ func startCluster(t *testing.T, bin, prefix string, chunkSize, n int) []*node {
 	return nodes
 }
 
-func launch(t *testing.T, bin, id, addr, dataDir, prefix string, chunkSize int) *node {
+func launch(t *testing.T, bin, id, addr, dataDir, prefix string, chunkSize int, erasure string) *node {
 	t.Helper()
 	n := &node{
 		t:       t,
@@ -91,6 +98,9 @@ func launch(t *testing.T, bin, id, addr, dataDir, prefix string, chunkSize int) 
 		"-scrub-interval", testRepairInterval.String(),
 		"-repair-rate", "0",
 	)
+	if erasure != "" {
+		n.cmd.Args = append(n.cmd.Args, "-ec", erasure)
+	}
 	n.cmd.Stdout = n.logs
 	n.cmd.Stderr = n.logs
 	if err := n.cmd.Start(); err != nil {

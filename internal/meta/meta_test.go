@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/0vertake/kavo/internal/object"
@@ -60,7 +61,7 @@ func TestCommitGetRoundTrip(t *testing.T) {
 			t.Fatalf("Get(%q) = %+v, want %+v", key, got, want)
 		}
 		for j, c := range got.Chunks {
-			if c != want.Chunks[j] {
+			if !reflect.DeepEqual(c, want.Chunks[j]) {
 				t.Errorf("Get(%q) chunk %d = %+v, want %+v", key, j, c, want.Chunks[j])
 			}
 		}

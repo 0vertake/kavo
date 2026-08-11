@@ -74,13 +74,43 @@ Plain HTTP with streaming bodies, no gRPC: a chunk transfer is one request with 
 missing header, an unknown length, or a body that ends early are all the sender's fault and
 answered with 4xx.
 
-### Erasure-coded mode (milestone 7)
+### Erasure-coded mode
 
-Per-chunk encoding: each 32–64 MB chunk is encoded in memory into 6 data + 3 parity shards
-(~5–10 MB each — `klauspost/reedsolomon` recommends the in-memory API below ~10 MB shards).
-The manifest persists shard order, size, and per-shard hash; the library cannot recover from
-swapped or corrupted shards without that. Same fault tolerance as RF=3 at ~1.5× disk instead
-of 3×; the rebuild-cost penalty is measured and reported honestly.
+Per-chunk encoding: each chunk is encoded in memory into `k` data + `m` parity shards, 6+3 by
+default (~5–10 MB each — `klauspost/reedsolomon` recommends the in-memory API below ~10 MB
+shards). Any `k` shards reconstruct the chunk, so 6+3 tolerates three losses at 1.5× the bytes
+where three copies cost 3×. Measured on disk: 3.00× against 1.50× for the same object.
+
+The mode is per object, not per cluster. `-ec=6+3` changes what new writes do; every manifest
+records the code it was written with, so switching modes — or misconfiguring one node — cannot
+strand data that already exists. Both kinds of object are readable from the same cluster at the
+same time.
+
+**Shard position is structural.** Shard *i* lives on `Nodes[i]` and nowhere else, because
+Reed–Solomon identifies a shard by which equation it belongs to. Two consequences the tests pin
+down:
+
+- The manifest carries the chunk length, the shard order, and a checksum per shard. Without them
+  the library cannot tell a swapped or corrupted shard from a valid one — it solves whatever
+  equations it is handed, and returns garbage with no error. `ec.TestSwappedShardsAreNotDetected`
+  exists to demonstrate exactly that.
+- A `k+m` code needs `k+m` nodes. Replication can narrow to a smaller cluster and let repair catch
+  up; erasure coding cannot, so a write that has nowhere to put shard `k+1` is refused instead of
+  storing something unrebuildable.
+
+**Acknowledged at `k+1` shards, not `k`.** Acking at `k` would mean one later loss makes the
+chunk unreadable — an acknowledged write lost to a single failure. One spare, mirroring how W=2 of
+N=3 leaves a spare copy; repair rebuilds the rest.
+
+**Repair and scrub rebuild rather than copy.** There is no second copy of shard 4 anywhere, only
+the arithmetic that produces it, so a missing or rotted shard costs a decode of its chunk. One
+decode produces every missing shard of that chunk, which is why the survey is per chunk. That
+rebuild cost is the read-side price of storing 1.5× instead of 3×, and the numbers are in
+`docs/benchmarks.md`: writes 15% slower for half the bytes, reads ~23% slower, and a degraded read
+— with the code's full tolerance missing — no slower than a healthy one.
+
+Still costlier in memory than replication: a decode holds a chunk's shards plus the chunk. Flat in
+object size, which is the invariant, but ~2.6× a chunk rather than 1×.
 
 ## Placement
 

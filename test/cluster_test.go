@@ -256,6 +256,54 @@ func TestBitRotIsFoundAndReplacedWithoutBeingAskedTo(t *testing.T) {
 	}
 }
 
+// The erasure-coded mode as an operator gets it: six real processes started with
+// -ec, an object written, two of the six wiped, and the object still readable —
+// then healed back without anyone asking.
+func TestErasureCodedObjectSurvivesAndHealsAcrossProcesses(t *testing.T) {
+	bin := buildKavod(t)
+	// Six nodes, not the usual four: a 4+2 code needs six, since a shard is
+	// pinned to a node by its position and there is nowhere else to put it.
+	nodes := startClusterCoded(t, bin, clusterPrefix(), testChunkSize, 6, "4+2")
+
+	const key = "coded/across/processes"
+	data := payloadFor(3)
+	client := &http.Client{}
+	if status, err := nodes[0].put(client, key, data); err != nil || status != http.StatusOK {
+		t.Fatalf("PUT = (%d, %v), want (200, nil)", status, err)
+	}
+
+	// A 4+2 object is spread over all six nodes, so any two of them are the
+	// code's full tolerance.
+	held := make([]int, len(nodes))
+	for i, n := range nodes {
+		held[i] = len(n.chunkFiles())
+		if held[i] == 0 {
+			t.Fatalf("%s holds no shard of a 4+2 object on a six-node cluster", n.id)
+		}
+	}
+	victims := nodes[:2]
+	for _, v := range victims {
+		v.loseChunks()
+	}
+
+	status, got, err := nodes[5].get(client, key)
+	if err != nil || status != http.StatusOK || !bytes.Equal(got, data) {
+		t.Fatalf("GET with two nodes wiped = (%d, %d bytes, %v), want (200, %d, nil)",
+			status, len(got), err, len(data))
+	}
+
+	for i, v := range victims {
+		if !v.waitForChunks(held[i], 20*time.Second) {
+			t.Fatalf("%s has %d of %d shards back, want repair to have rebuilt them all",
+				v.id, len(v.chunkFiles()), held[i])
+		}
+	}
+	if status, got, err := victims[0].get(client, key); err != nil || status != http.StatusOK || !bytes.Equal(got, data) {
+		t.Fatalf("GET from a rebuilt node = (%d, %d bytes, %v), want (200, %d, nil)",
+			status, len(got), err, len(data))
+	}
+}
+
 // A node joining an existing cluster must be picked up without restarting anyone,
 // and must be able to serve objects written before it arrived.
 func TestANewNodeJoinsAndServesExistingObjects(t *testing.T) {
@@ -270,7 +318,7 @@ func TestANewNodeJoinsAndServesExistingObjects(t *testing.T) {
 		t.Fatalf("PUT = (%d, %v), want (200, nil)", status, err)
 	}
 
-	joiner := launch(t, bin, "joiner", freePort(t), t.TempDir(), prefix, testChunkSize)
+	joiner := launch(t, bin, "joiner", freePort(t), t.TempDir(), prefix, testChunkSize, "")
 	for _, n := range append([]*node{joiner}, nodes...) {
 		n.waitForMembers(clusterSize + 1)
 	}
