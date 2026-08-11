@@ -39,6 +39,8 @@ func main() {
 	repairInterval := flag.Duration("repair-interval", cluster.DefaultRepairInterval, "pause between repair passes")
 	rebalanceInterval := flag.Duration("rebalance-interval", cluster.DefaultRebalanceInterval, "pause between rebalance passes, which move objects onto the nodes that now own them")
 	scrubInterval := flag.Duration("scrub-interval", cluster.DefaultScrubInterval, "pause between scrub passes, which re-read this node's chunks to find rot")
+	collectInterval := flag.Duration("collect-interval", cluster.DefaultCollectInterval, "pause between collection passes, which reclaim chunks no manifest references")
+	collectGrace := flag.Duration("collect-grace", cluster.DefaultCollectGrace, "how long an unreferenced chunk is left alone before it is treated as garbage")
 	erasure := flag.String("ec", "", `erasure-code new objects as "data+parity" (for example 6+3) instead of replicating them`)
 	flag.Parse()
 
@@ -111,6 +113,11 @@ func main() {
 	// anywhere else, so a node that leaves for good takes its copy's place with
 	// it. This is what moves the place.
 	go c.RebalanceLoop(ctx, *repairRate, *rebalanceInterval)
+
+	// An overwrite supersedes the chunks it replaces and a failed write leaves the
+	// ones it stored. Neither is reachable and neither frees itself, so without
+	// this a store's disk usage only ever goes up.
+	go c.CollectLoop(ctx, *collectGrace, *collectInterval)
 
 	redundancy := "replicated"
 	if scheme != (ec.Scheme{}) {

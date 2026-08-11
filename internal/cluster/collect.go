@@ -1,0 +1,284 @@
+package cluster
+
+// Reclaiming the chunks no manifest references any more.
+//
+// An overwrite supersedes the chunks of the manifest it replaces and nothing
+// reclaims them. A write that fails after storing chunks leaves chunks no manifest
+// was ever committed for. A rebalance leaves a copy where it moved data from if the
+// delete that should follow the move does not happen. And deletes and aborted
+// uploads drop their own chunks, but only as a best effort that is logged rather
+// than returned — because by then the object is already gone as far as any reader
+// is concerned, so a copy that could not be deleted is wasted disk rather than a
+// correctness problem. Every one of those is unreachable, since readers resolve
+// objects only through committed manifests. It is storage that is paid for and not
+// counted, and without something like this it only ever grows.
+//
+// The pass is mark-and-sweep rather than a record of what each write superseded.
+// That costs a scan where a record would cost a lookup, and buys two things. It
+// reclaims garbage nobody wrote a record for, which is every category above except
+// the first. And a chunk is live if any manifest names it, so two objects may name
+// the same chunk — which is what lets an object be copied without copying its
+// data, and what a per-write record could not express without reference counts in
+// the commit path.
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/0vertake/kavo/internal/ec"
+	"github.com/0vertake/kavo/internal/meta"
+	"github.com/0vertake/kavo/internal/object"
+	"github.com/0vertake/kavo/internal/store"
+)
+
+const (
+	// DefaultCollectInterval is how long a node waits between collection passes.
+	// Garbage costs space and nothing else, so this trades promptness for staying
+	// out of the way of the work that has a client waiting on it.
+	DefaultCollectInterval = 10 * time.Minute
+
+	// DefaultCollectGrace is how long an unreferenced chunk is left alone before
+	// it is treated as garbage.
+	//
+	// It has to exceed the longest gap between a chunk becoming durable and the
+	// manifest that references it being committed, because for that whole window
+	// a perfectly good chunk is referenced by nothing. For a single PUT that gap
+	// is one request. An hour is far longer than any request this store will
+	// finish, and the cost of being generous is only that garbage lives an hour
+	// longer than it had to.
+	//
+	// Zero is legal and means "no write is in flight", which is true of a test and
+	// of nothing else.
+	DefaultCollectGrace = time.Hour
+
+	// collectTask names this pass's cursor, which records the slice of the id
+	// space to sweep next.
+	collectTask = "collect"
+
+	// idAlphabet is what chunk ids are drawn from, and so what the slices of the
+	// id space are: crypto/rand.Text's base32 alphabet.
+	idAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+
+	// CollectSlices is how many passes sweep the whole id space, and so how many
+	// intervals a full cycle takes: at the default interval, garbage is reclaimed
+	// within about five hours of being made.
+	CollectSlices = len(idAlphabet)
+)
+
+// CollectStats reports what one collection pass did.
+type CollectStats struct {
+	Slice          string // the slice of the id space this pass swept
+	Referenced     int    // local chunks a manifest still names on this node
+	Examined       int    // local chunks in the slice, referenced or not
+	Collected      int    // chunks no manifest named, and old enough to prove it
+	BytesCollected int64
+	Young          int // unreferenced, but inside the grace period and so left alone
+}
+
+// CollectLoop reclaims unreferenced chunks until ctx is done, pausing between
+// passes.
+func (c *Coordinator) CollectLoop(ctx context.Context, grace, interval time.Duration) {
+	for {
+		start := time.Now()
+		st, err := c.Collect(ctx, grace)
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			log.Printf("collect: pass over slice %s failed after %v: %v", st.Slice, time.Since(start), err)
+		} else if st.Collected > 0 {
+			log.Printf("collect: reclaimed %d chunks (%d bytes) in slice %s in %v, %d referenced, %d too young",
+				st.Collected, st.BytesCollected, st.Slice, time.Since(start), st.Referenced, st.Young)
+		}
+		if !sleep(ctx, interval) {
+			return
+		}
+	}
+}
+
+// Collect sweeps one slice of the chunk id space: it reads every manifest in the
+// cluster to learn which of this node's chunks are still referenced, then deletes
+// the local chunks in that slice which none of them names and which are older than
+// grace. Successive passes move through the id space, so a full cycle takes as
+// many passes as there are slices.
+//
+// It deletes nothing at all unless it read every manifest successfully. A partial
+// view of the manifests is indistinguishable from a cluster where those objects do
+// not exist, and acting on it would delete data that is referenced.
+func (c *Coordinator) Collect(ctx context.Context, grace time.Duration) (CollectStats, error) {
+	slice, err := c.nextSlice(ctx)
+	if err != nil {
+		return CollectStats{}, err
+	}
+	st := CollectStats{Slice: string(slice)}
+
+	start := time.Now()
+	referenced, err := c.referenced(ctx, slice)
+	if err != nil {
+		return st, err
+	}
+
+	// Measured from when the manifests were read, not from now, and the difference
+	// is a correctness one. An object written during the scan under a key the scan
+	// had already passed is missed by it, so nothing written after the scan began
+	// may be deleted on the strength of it, however long the scan took.
+	//
+	// The grace period covers the other window: a chunk is durable before the
+	// manifest naming it is committed, so a write that began before the scan and
+	// committed during it is missed too, and only its age says it is not garbage.
+	cutoff := start.Add(-grace)
+	var failed int
+	var first error
+	err = c.store.ScanChunks(st.Slice, func(ci store.ChunkInfo) error {
+		st.Examined++
+		if _, live := referenced[ci.ID]; live {
+			st.Referenced++
+			return nil
+		}
+		if ci.Modified.After(cutoff) {
+			st.Young++
+			return nil
+		}
+		if err := c.store.RemoveChunk(ci.ID); err != nil {
+			// A chunk that will not go away is garbage that stays garbage, and the
+			// next pass tries again. It is not a reason to leave the rest, and one
+			// example with a count says as much as a thousand joined errors.
+			failed++
+			if first == nil {
+				first = err
+			}
+			return nil
+		}
+		st.Collected++
+		st.BytesCollected += ci.Size
+		return nil
+	})
+	if err != nil {
+		return st, err
+	}
+	if failed > 0 {
+		return st, fmt.Errorf("collect: %d unreferenced chunks could not be removed, for example: %w", failed, first)
+	}
+	return st, nil
+}
+
+// referenced is the set of chunk ids that some manifest says this node should be
+// holding, restricted to one slice of the id space.
+//
+// Restricted, because the alternative is a set of every chunk id on the node: at a
+// million chunks that is tens of megabytes of live map, and a background pass that
+// grows with the disk is a background pass that eventually cannot run. Each pass
+// pays one read of the manifests to sweep a thirty-second of the disk.
+//
+// Not c.walk, which every other pass uses: that one resumes from a cursor and stops
+// at the end of the keyspace, which is right for work that can be done in pieces.
+// This cannot. A sweep acts on the absence of a reference, so it needs the whole
+// keyspace in one pass or it is reading a partial answer.
+//
+// ponytail: a full cycle therefore reads every manifest thirty-two times. Fine while
+// the metadata fits comfortably in etcd, which is a documented ceiling of its own;
+// if manifest reads ever dominate, the fix is an index from partition to keys so a
+// pass reads only the manifests that could name this node.
+func (c *Coordinator) referenced(ctx context.Context, slice byte) (map[string]struct{}, error) {
+	referenced := make(map[string]struct{})
+
+	// Parts before objects, which is the ordering that makes completing a
+	// multipart upload safe to race with. A part's chunks can be hours old by the
+	// time the upload completes, so they are not protected by their age: they are
+	// protected by being referenced, first by the part and then by the object.
+	// Reading the parts first means the handover cannot fall between the two — a
+	// completion that happens after the parts were read was seen as parts, and one
+	// that happened before them committed its object manifest before the object
+	// scan began, so the object scan sees it.
+	from := ""
+	for {
+		parts, err := c.meta.ScanParts(ctx, from, scanPage)
+		if err != nil {
+			return nil, err
+		}
+		if len(parts) == 0 {
+			break
+		}
+		for _, p := range parts {
+			c.reference(referenced, p.Manifest, slice)
+			from = p.Key
+		}
+	}
+
+	from = ""
+	for {
+		objects, err := c.meta.ScanObjects(ctx, "", from, scanPage)
+		if err != nil {
+			return nil, err
+		}
+		if len(objects) == 0 {
+			break
+		}
+		for _, o := range objects {
+			c.reference(referenced, o.Manifest, slice)
+			from = meta.After(o.Key)
+		}
+	}
+	return referenced, nil
+}
+
+// reference adds the chunks m says this node holds, of those in the slice.
+//
+// What the manifest says, not what exists: a copy on a node the manifest does not
+// name is unreachable, because a reader tries the nodes the manifest names and
+// stops. That is the same rule rebalancing already relies on when it deletes the
+// copy it moved away from, and it is what lets this pass reclaim the copies a
+// rebalance failed to.
+func (c *Coordinator) reference(referenced map[string]struct{}, m object.Manifest, slice byte) {
+	mine := slices.Contains(m.Nodes, c.self)
+	for _, ref := range m.Chunks {
+		// A shard id begins with its chunk's id, so one slice covers a chunk and
+		// all of its shards.
+		if ref.ID == "" || ref.ID[0] != slice {
+			continue
+		}
+		if m.Coding == (ec.Scheme{}) {
+			if mine {
+				referenced[ref.ID] = struct{}{}
+			}
+			continue
+		}
+		// Erasure-coded: position is identity, so this node holds the shard at
+		// its own index and no other.
+		for i, node := range m.Nodes {
+			if node == c.self {
+				referenced[ref.ShardID(i)] = struct{}{}
+			}
+		}
+	}
+}
+
+// nextSlice returns the slice of the id space this pass should sweep, and records
+// the following one before the pass runs rather than after it.
+//
+// Before, so that a slice which fails every time — a directory that cannot be read,
+// a manifest that cannot be decoded — costs one pass rather than blocking the other
+// thirty-one behind it forever. The cost is that a crash mid-pass leaves that
+// slice's garbage until the cycle comes round again, and garbage is exactly the
+// thing that can wait.
+func (c *Coordinator) nextSlice(ctx context.Context) (byte, error) {
+	at, err := c.meta.Cursor(ctx, collectTask, c.self)
+	if err != nil {
+		return 0, err
+	}
+	i := 0
+	if len(at) == 1 {
+		if found := strings.IndexByte(idAlphabet, at[0]); found >= 0 {
+			i = found
+		}
+	}
+	next := idAlphabet[(i+1)%len(idAlphabet)]
+	if err := c.meta.SaveCursor(ctx, collectTask, c.self, string(next)); err != nil {
+		return 0, err
+	}
+	return idAlphabet[i], nil
+}
