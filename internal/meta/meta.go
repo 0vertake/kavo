@@ -42,6 +42,11 @@ func EndpointFromEnv() string {
 type Store struct {
 	client *clientv3.Client
 	prefix string
+	// objects is the key prefix every manifest lives under, kept rather than
+	// rebuilt: it is joined onto every read and written off every listed key, so
+	// composing it per key made a page of a thousand allocate two thousand copies
+	// of the same constant.
+	objects string
 }
 
 // Open connects to etcd. It does not block on reachability: etcd may be
@@ -54,7 +59,11 @@ func Open(endpoints []string, prefix string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("meta: connect to etcd %v: %w", endpoints, err)
 	}
-	return &Store{client: client, prefix: prefix}, nil
+	return &Store{
+		client:  client,
+		prefix:  prefix,
+		objects: path.Join(prefix, "objects") + "/",
+	}, nil
 }
 
 func (s *Store) Close() error { return s.client.Close() }
@@ -183,7 +192,7 @@ func (s *Store) ScanObjects(ctx context.Context, prefix, from string, limit int6
 
 	objects := make([]Object, 0, len(resp.Kvs))
 	for _, kv := range resp.Kvs {
-		key := strings.TrimPrefix(string(kv.Key), s.objectPrefix())
+		key := strings.TrimPrefix(string(kv.Key), s.objects)
 		var m object.Manifest
 		if err := json.Unmarshal(kv.Value, &m); err != nil {
 			return nil, fmt.Errorf("meta: corrupt manifest for %s: %w", key, err)
@@ -217,7 +226,7 @@ func (s *Store) ScanEntries(ctx context.Context, prefix, from string, limit int6
 
 	entries := make([]Entry, 0, len(resp.Kvs))
 	for _, kv := range resp.Kvs {
-		key := strings.TrimPrefix(string(kv.Key), s.objectPrefix())
+		key := strings.TrimPrefix(string(kv.Key), s.objects)
 		// The fields not named here are skipped by the decoder rather than built.
 		var m struct {
 			Size     int64
@@ -280,9 +289,7 @@ func (s *Store) Cursor(ctx context.Context, task, node string) (string, error) {
 // key namespaces an object key. Object keys may contain anything, including
 // slashes, which is fine: etcd keys are opaque byte strings, so the only thing
 // that matters is that the mapping is unambiguous.
-func (s *Store) key(objectKey string) string { return s.objectPrefix() + objectKey }
-
-func (s *Store) objectPrefix() string { return path.Join(s.prefix, "objects") + "/" }
+func (s *Store) key(objectKey string) string { return s.objects + objectKey }
 
 func (s *Store) cursorKey(task, node string) string {
 	return path.Join(s.prefix, "cursors", task, node)
