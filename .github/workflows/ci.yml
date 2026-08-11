@@ -1,0 +1,55 @@
+# Everything here is a Makefile target a developer already runs. CI that drifts
+# from the local commands eventually only proves things about CI.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A push to a branch that already has a run in flight cancels it: the chaos job
+# takes minutes, and the answer for a commit nobody is on any more is not worth
+# waiting for. main is left alone, where every commit's answer is worth having.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: make lint
+
+  # make test starts etcd from the dev Compose file, because tests that touch
+  # metadata use a real etcd and a fake one would test the fake. The runner's
+  # aws CLI makes the client tests run here rather than skip, which is the point
+  # of running them on someone else's machine.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: aws --version
+      - run: make test
+
+  # The chaos suite runs at a short default as part of make test. Here it runs
+  # long, with the seed printed, because a durability guarantee is only worth the
+  # number of faults it has survived.
+  chaos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: make etcd
+      - run: go test ./test -run TestChaos -race -v -timeout 20m -chaos.duration=5m

@@ -155,9 +155,9 @@ func TestChaos(t *testing.T) {
 			// Not the run's context: a barrier that gave up because the clock ran
 			// out would report nothing, which is the one way this assertion could
 			// quietly stop existing. The run ends a little late instead.
-			if holes := waitWhole(context.WithoutCancel(ctx), nodes, store, healTimeout); len(holes) > 0 {
-				t.Errorf("%v after %q the cluster is still short %d copies; first few:",
-					healTimeout, what, len(holes))
+			if holes := waitWhole(context.WithoutCancel(ctx), nodes, store, healStall); len(holes) > 0 {
+				t.Errorf("after %q, repair stopped restoring copies for %v with the cluster still short %d; first few:",
+					what, healStall, len(holes))
 				for _, h := range holes[:min(5, len(holes))] {
 					t.Errorf("  %s", h)
 				}
@@ -263,11 +263,12 @@ func TestChaos(t *testing.T) {
 	// Invariants 1, 2 and 3: every acknowledged object reads back byte for byte,
 	// every deleted one is gone, and an object that was never acknowledged is
 	// either absent or perfect — never a torn or corrupt version of itself.
-	checkHistory(t, clients[0], history, healTimeout)
+	checkHistory(t, clients[0], history, restartSettle)
 
 	// Invariant 4, one last time now that the workload has stopped.
-	if holes := waitWhole(context.WithoutCancel(ctx), nodes, store, healTimeout); len(holes) > 0 {
-		t.Errorf("%d copies are still missing %v after the run ended; first few:", len(holes), healTimeout)
+	if holes := waitWhole(context.WithoutCancel(ctx), nodes, store, healStall); len(holes) > 0 {
+		t.Errorf("the run ended and repair then stopped for %v with %d copies still missing; first few:",
+			healStall, len(holes))
 		for _, h := range holes[:min(10, len(holes))] {
 			t.Errorf("  %s", h)
 		}
@@ -315,54 +316,88 @@ func checkHistory(t *testing.T, client *awss3.Client, history []write, settle ti
 		restored, absent, lost, torn)
 }
 
-// healTimeout is how long the cluster gets to put redundancy back after one
-// fault. Generous, because it competes with the workload for disk and network,
-// but finite: "eventually" is not a durability guarantee.
-const healTimeout = 45 * time.Second
+// restartSettle is how long a read may be retried while a node that was just
+// killed comes back. A restart takes about as long whatever the cluster holds, so
+// this one is a constant.
+const restartSettle = 45 * time.Second
+
+// healStall is how long the cluster may go without restoring a single copy before
+// the barrier calls repair stuck.
+//
+// It replaced a fixed 45s budget for the whole heal, which was measuring the wrong
+// thing: losing a disk destroys however much was on it, so the work grows with the
+// run while a constant deadline does not. At a five-minute run that deadline
+// expired with 53 of 1,433 copies left to go — a heal 96% finished, failed for
+// being big rather than for being broken. Invariant 4 claims redundancy comes
+// back, so this waits for progress and fails on the absence of it.
+//
+// What that gives up is a bound on how long a heal may take: one that is ten times
+// slower but still moving now passes. Heal rate is measured in `make bench`, which
+// is where a speed claim belongs; this barrier is about completeness.
+const healStall = 30 * time.Second
 
 // waitWhole polls until the cluster is whole — every node a member, and every
 // chunk of every manifest present on every owner that manifest names — and returns
-// the copies still missing when it gives up. Empty means whole.
+// the copies still missing if repair stops making progress. Empty means whole.
 //
 // Manifests are the authority, not the ring: an object is where its manifest says
 // it is, so this is the same question repair and rebalance are answering, asked
 // from outside.
-func waitWhole(ctx context.Context, nodes []*node, store *meta.Store, timeout time.Duration) []string {
+func waitWhole(ctx context.Context, nodes []*node, store *meta.Store, stall time.Duration) []string {
 	byID := make(map[string]*node, len(nodes))
 	for _, n := range nodes {
 		byID[n.id] = n
 	}
 
-	deadline := time.Now().Add(timeout)
-	var holes []string
+	fewest, since := -1, time.Now()
+	unsettled := time.Time{}
 	for {
-		holes = missingCopies(ctx, byID, store, len(nodes))
-		if len(holes) == 0 || time.Now().After(deadline) || ctx.Err() != nil {
+		holes, settled := missingCopies(ctx, byID, store, len(nodes))
+		switch {
+		case len(holes) == 0:
 			return holes
+		case !settled:
+			// Placement is in flux, so the count is not a measurement of anything
+			// yet. Start the clock over rather than read a restarting node as a
+			// heal that stalled — but not forever: a node that never comes back
+			// has to be reported as that, not left to the test's own timeout.
+			if unsettled.IsZero() {
+				unsettled = time.Now()
+			} else if time.Since(unsettled) > restartSettle {
+				return holes
+			}
+			fewest, since = -1, time.Now()
+		case fewest < 0 || len(holes) < fewest:
+			fewest, since, unsettled = len(holes), time.Now(), time.Time{}
+		case time.Since(since) > stall:
+			return holes
+		default:
+			unsettled = time.Time{}
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 }
 
-func missingCopies(ctx context.Context, byID map[string]*node, store *meta.Store, want int) []string {
+// missingCopies reports the copies a manifest names that are not on the node it
+// names, and whether the cluster was settled enough for that to mean anything.
+func missingCopies(ctx context.Context, byID map[string]*node, store *meta.Store, want int) (holes []string, settled bool) {
 	// Membership first: a node that is not a member owns nothing, so placement is
 	// still moving and every answer below would be about a layout in flux.
 	for id, n := range byID {
 		members, err := n.members()
 		if err != nil {
-			return []string{fmt.Sprintf("%s is not answering: %v", id, err)}
+			return []string{fmt.Sprintf("%s is not answering: %v", id, err)}, false
 		}
 		if len(members) != want {
-			return []string{fmt.Sprintf("%s sees %d members, want %d", id, len(members), want)}
+			return []string{fmt.Sprintf("%s sees %d members, want %d", id, len(members), want)}, false
 		}
 	}
 
 	objects, err := store.ScanObjects(ctx, "", "", 0)
 	if err != nil {
-		return []string{fmt.Sprintf("scan manifests: %v", err)}
+		return []string{fmt.Sprintf("scan manifests: %v", err)}, false
 	}
 
-	var holes []string
 	for _, o := range objects {
 		for _, ref := range o.Manifest.Chunks {
 			for i, id := range o.Manifest.Nodes {
@@ -381,7 +416,7 @@ func missingCopies(ctx context.Context, byID map[string]*node, store *meta.Store
 			}
 		}
 	}
-	return holes
+	return holes, true
 }
 
 var (
