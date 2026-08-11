@@ -266,10 +266,53 @@ acknowledged write is byte-identical and that nothing is readable in a partial s
 ## S3 subset (milestone 9)
 
 PUT, GET, DELETE, LIST, multipart upload, SigV4 — nothing else (no IAM/ACLs/versioning/
-lifecycle; anti-goal). SigV4 verification is in-house, including streaming chunked payloads
-(`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, per-chunk chained signatures — this is what
-`aws s3 cp` actually sends). References: `amwolff/awsig`, MinIO `cmd/auth-handler.go`.
-External validation: Ceph `s3-tests` via config file + tox; report the pass count.
+lifecycle; anti-goal). External validation: Ceph `s3-tests` via config file + tox; report the
+pass count.
+
+### SigV4 verification
+
+In-house, and verification only: kavo is the server, so the signature is recomputed from the
+request as it arrived. The awkward parts are all in rebuilding the string the client hashed —
+`host` and `content-length` are not in Go's header map, header values have their internal
+whitespace collapsed, the query is sorted and re-encoded with `%20` rather than `+`, and S3
+signs the request path **as sent** where every other AWS service re-escapes it. That last one
+only breaks keys containing a space, a plus, or anything non-ASCII, which is exactly the kind
+of bug that ships.
+
+Four payload modes, because a client that gets a 400 for the mode it chose cannot upload at all:
+
+| mode | what the signature covers |
+| --- | --- |
+| hex SHA-256 | the whole body, verified as it streams |
+| `UNSIGNED-PAYLOAD` | headers only — the client's choice, not the server's |
+| `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` | each `aws-chunked` chunk, chained to the one before |
+| `STREAMING-UNSIGNED-PAYLOAD-TRAILER` | headers only, `aws-chunked` framing |
+
+Both signed modes are verified **as the body streams**, never after buffering it: a body may be
+larger than memory, so the hash runs alongside the read and a mismatch is reported in place of
+the final EOF. A caller that reads to the end therefore cannot mistake unverified bytes for
+verified ones — the same discipline the chunk store uses for its checksums.
+
+Measured, not assumed: `aws-cli` 2.35 and `boto3` 1.43 were pointed at a request-dumping server,
+and **neither sends `aws-chunked` at all** — both hash the payload up front, even for 8 MB
+multipart parts read from a pipe. The streaming modes are implemented for the clients that do
+(the Java SDK, `mc`), and because streaming is the only way to send an object of unknown length
+without buffering it. The design note that `aws s3 cp` requires it is out of date.
+
+The chain is what makes streaming safe: each chunk's signature includes the previous chunk's, so
+chunks cannot be reordered, duplicated, or dropped, and a body that stops before its
+zero-length terminator is rejected rather than stored as a short object. Trailers are parsed and
+ignored — the only ones S3 clients send are whole-object checksums, and every byte has already
+been verified by the time they arrive.
+
+Credentials are one static key pair (`-access-key`/`-secret-key`). There is no user directory
+because IAM is an anti-goal: authentication is proof of holding the one secret, and
+authorization does not exist. The credential scope's region is not pinned — it is covered by the
+signature, so it cannot be forged, it just is not required to be any particular value.
+
+Tested against the AWS SDK's own signer, used as a test-only dependency. Hand-written vectors
+would only prove the implementation agrees with what its author believed the spec said; a second
+implementation disagreeing is the only thing that catches a misreading.
 
 ## Testing and benchmarks
 

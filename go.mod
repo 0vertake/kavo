@@ -3,11 +3,14 @@ module github.com/0vertake/kavo
 go 1.26.5
 
 require (
+	github.com/aws/aws-sdk-go-v2 v1.43.5
+	github.com/aws/aws-sdk-go-v2/credentials v1.19.35
 	github.com/klauspost/reedsolomon v1.14.1
 	go.etcd.io/etcd/client/v3 v3.7.1
 )
 
 require (
+	github.com/aws/smithy-go v1.27.7 // indirect
 	github.com/coreos/go-semver v0.3.1 // indirect
 	github.com/coreos/go-systemd/v22 v22.7.0 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
