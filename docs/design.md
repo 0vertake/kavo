@@ -558,19 +558,26 @@ implementation disagreeing is the only thing that catches a misreading.
 
 ## Milestones
 
-1. Single-node store: chunked, streaming, checksummed (flat RSS on 1 GB; corrupt chunk fails read)
+1. Single-node store: chunked, streaming, checksummed (corrupt chunk fails read; flat memory proven
+   twice — allocation counters at 64 MB in a unit test, and the node process's own RSS at 4 GB in
+   `make measure`, where 64x the object costs 2x the memory above idle)
 2. Crash safety on one node (SIGKILL under 100 concurrent uploads; zero acked loss)
 3. Multi-node placement (partitions, vnode ring, distribution test)
 4. Replication + quorum (read with node down; overhead measured)
 5. Membership + failure detection (etcd leases; bounded detection time)
-6. Automatic repair (rate-limited, resumable; heal-time vs latency chart)
+6. Automatic repair (rate-limited, resumable). Heal time measured: a node that loses its whole disk
+   is back to full redundancy in 9.2 s at the default 32 MB/s cap, 1.1 s uncapped. The cap is per
+   node, so cluster heal bandwidth grows with the cluster while the disturbance per node does not.
 7. Erasure coding as second mode (both modes measured side by side)
-8. Rebalance on join/leave (% moved, convergence time)
+8. Rebalance on join/leave. Measured: a seventh node is seen in 40 ms and converged in 4.6 s, and
+   the 34 copies of 192 that move onto it are exactly the 34 the seven-node ring owes it — placement
+   after a join is the placement the ring specifies, key for key.
 9. S3 subset + SigV4 (`aws s3 cp` end to end; s3-tests pass count — `docs/s3-compatibility.md`)
 10. Chaos suite in CI (invariants asserted under randomized faults; GitHub Actions runs it long
     on every push, which is where a fixed heal deadline was caught measuring the keyspace)
-11. Benchmarks + README (`docs/benchmarks.md`, including `warp` as an outside client). Still
-    outstanding: separate machines over a real network, and a demo recording
+11. Benchmarks + README (`docs/benchmarks.md`, including `warp` as an outside client and `make
+    measure` for the cluster-level numbers). Still outstanding: separate machines over a real
+    network, and a demo recording
 
 Milestones 6, 7, 10 are where the project stops being a tutorial — never skip them for API
 surface.
