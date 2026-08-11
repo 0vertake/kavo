@@ -28,6 +28,7 @@ func New(c *cluster.Coordinator, s *store.Store) http.Handler {
 	mux.HandleFunc("GET /objects/{key...}", h.get)
 	mux.HandleFunc("PUT /peer/chunks/{id}", h.putChunk)
 	mux.HandleFunc("GET /peer/chunks/{id}", h.getChunk)
+	mux.HandleFunc("HEAD /peer/chunks/{id}", h.headChunk)
 	mux.HandleFunc("GET /cluster/members", h.members)
 	return mux
 }
@@ -135,6 +136,25 @@ func (h *handler) getChunk(w http.ResponseWriter, r *http.Request) {
 		// Same as the object path: the status is already sent, so aborting the
 		// body is the only way to tell the caller not to trust these bytes.
 		log.Printf("peer get chunk %s: aborted mid-stream: %v", id, err)
+	}
+}
+
+// headChunk answers whether this node holds a chunk. Repair surveys every copy of
+// every chunk, and asking that by fetching them would move the cluster's data to
+// answer a yes-or-no question.
+//
+// No checksum header is required, because this reports presence and not integrity.
+func (h *handler) headChunk(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	held, err := h.store.HasChunk(id)
+	switch {
+	case errors.Is(err, store.ErrInvalidID):
+		http.Error(w, "invalid chunk id", http.StatusBadRequest)
+	case err != nil:
+		log.Printf("peer head chunk %s: %v", id, err)
+		http.Error(w, "chunk probe failed", http.StatusInternalServerError)
+	case !held:
+		http.Error(w, "not found", http.StatusNotFound)
 	}
 }
 
