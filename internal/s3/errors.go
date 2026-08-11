@@ -58,6 +58,8 @@ var (
 		"The body does not match the checksum the request declared."}
 	errNotImplemented = apiError{"NotImplemented", http.StatusNotImplemented,
 		"This server does not implement that operation."}
+	errBucketNotEmpty = apiError{"BucketNotEmpty", http.StatusConflict,
+		"The bucket still holds objects."}
 )
 
 // authError maps a verification failure to the code that tells the client what to

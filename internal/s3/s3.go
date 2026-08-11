@@ -4,9 +4,10 @@
 // This is the only surface clients touch. The peer and debug endpoints live on a
 // separate listener, because a client that can reach them can delete chunks.
 //
-// Buckets are key prefixes, not a namespace: there is nothing to create and
-// nothing to list. Every object's key in etcd is "bucket/key", which is what makes
-// a listing a prefix scan and keeps two buckets' objects from colliding.
+// Buckets are key prefixes rather than a namespace: every object's key in etcd is
+// "bucket/key", which is what makes a listing a prefix scan and keeps two buckets'
+// objects from colliding. A bucket therefore exists exactly when an object names
+// it, and the bucket operations in bucket.go answer for a record that is not there.
 package s3
 
 import (
@@ -44,6 +45,13 @@ func New(c *cluster.Coordinator, creds sigv4.Credentials) http.Handler {
 	// getObject sends here.
 	mux.HandleFunc("HEAD /{bucket}", h.authed(h.headBucket))
 	mux.HandleFunc("GET /{bucket}", h.authed(h.listObjects))
+	// Nothing to create or delete, but clients call these before their first
+	// upload and after their last, and an unrouted PUT /{bucket} reaches the
+	// object patterns as a redirect — an answer no client can make sense of.
+	mux.HandleFunc("PUT /{bucket}", h.authed(h.createBucket))
+	mux.HandleFunc("DELETE /{bucket}", h.authed(h.deleteBucket))
+	mux.HandleFunc("POST /{bucket}", h.authed(h.postBucket))
+	mux.HandleFunc("GET /{$}", h.authed(h.listBuckets))
 	mux.HandleFunc("/", h.authed(h.unsupported))
 	return mux
 }
@@ -159,7 +167,8 @@ func (h *handler) getObject(w http.ResponseWriter, r *http.Request) {
 func (h *handler) deleteObject(w http.ResponseWriter, r *http.Request) {
 	key, ok := objectKey(r)
 	if !ok {
-		fail(w, r, errNotImplemented, nil)
+		// A trailing slash names the bucket, same as it does for GET and HEAD.
+		h.deleteBucket(w, r)
 		return
 	}
 	if id := r.URL.Query().Get("uploadId"); id != "" {

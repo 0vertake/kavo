@@ -381,3 +381,77 @@ func errorCode(err error) string {
 	}
 	return err.Error()
 }
+
+// A part sent twice: the object gets the body that arrived last.
+//
+// Clients resend parts — a timeout, a retry, a flaky connection — and the AWS SDKs
+// do it without telling the caller. If the first body won, or if both were somehow
+// kept, an upload that merely retried would produce an object the client never sent
+// and whose ETag it would still accept, since the ETag is computed from the parts
+// the server chose. That is silent corruption arriving through the front door.
+func TestAResentPartReplacesTheFirstOne(t *testing.T) {
+	client := newGateway(t)
+	const bucket, key = "bucket", "resent.bin"
+
+	create, err := client.CreateMultipartUpload(t.Context(), &awss3.CreateMultipartUploadInput{
+		Bucket: aws.String(bucket), Key: aws.String(key),
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	id := create.UploadId
+
+	// Two parts, and the first one sent twice with different bytes. Both are
+	// larger than a chunk so that the second body has to displace the first
+	// everywhere, not just in the manifest.
+	first := bytes.Repeat([]byte("A"), 3*testChunkSize+11)
+	replacement := bytes.Repeat([]byte("B"), 3*testChunkSize+11)
+	second := bytes.Repeat([]byte("C"), testChunkSize/2)
+
+	upload := func(number int32, body []byte) string {
+		t.Helper()
+		out, err := client.UploadPart(t.Context(), &awss3.UploadPartInput{
+			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: id,
+			PartNumber: aws.Int32(number), Body: bytes.NewReader(body),
+		})
+		if err != nil {
+			t.Fatalf("upload part %d: %v", number, err)
+		}
+		return aws.ToString(out.ETag)
+	}
+
+	upload(1, first)
+	etag1 := upload(1, replacement)
+	etag2 := upload(2, second)
+
+	if _, err := client.CompleteMultipartUpload(t.Context(), &awss3.CompleteMultipartUploadInput{
+		Bucket: aws.String(bucket), Key: aws.String(key), UploadId: id,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: []types.CompletedPart{
+			{PartNumber: aws.Int32(1), ETag: aws.String(etag1)},
+			{PartNumber: aws.Int32(2), ETag: aws.String(etag2)},
+		}},
+	}); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	get, err := client.GetObject(t.Context(), &awss3.GetObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(key),
+	})
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer get.Body.Close()
+	got, err := io.ReadAll(get.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := append(append([]byte{}, replacement...), second...)
+	if !bytes.Equal(got, want) {
+		t.Errorf("the object is %d bytes and not the parts that arrived last (%d bytes)",
+			len(got), len(want))
+		if bytes.Contains(got, first[:16]) {
+			t.Error("it still carries the body of the part that was replaced")
+		}
+	}
+}

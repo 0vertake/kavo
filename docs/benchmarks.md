@@ -1,8 +1,9 @@
 # Benchmarks
 
 These are the in-repo benchmarks, run with `make bench`. They exist to decide where the time
-goes and which optimisations are worth their complexity — not to produce a headline number. The
-headline numbers belong to `warp` against the S3 API, on separate cloud VMs over a real network.
+goes and which optimisations are worth their complexity — not to produce a headline number. For a
+number nothing in this repo chose, see [what an outside client measures](#what-an-outside-client-measures)
+at the end: MinIO's `warp` against the S3 API.
 
 Everything below runs against a six-node cluster over real HTTP, real etcd and real disks, at the
 production 32 MB chunk size. Nothing is mocked, because a mocked store would measure the mock.
@@ -284,3 +285,43 @@ on purpose:
 Pipelining chunks — reading chunk N+1 while N replicates — was also considered and rejected on
 measurement: chunking runs at 6.2 GB/s against replication's ~470 MB/s, so the read is 8% of a large
 write and overlapping it buys nearly nothing for a second chunk buffer.
+
+## What an outside client measures
+
+Everything above is kavo timing itself. MinIO's [`warp`](https://github.com/minio/warp) is not: it is
+an S3 benchmark written against S3, driving the same six-node cluster `make up` starts, over the
+signed client API, through minio-go rather than through anything this repo chose.
+
+| workload | concurrency | throughput | objects/s | request latency |
+| --- | --- | --- | --- | --- |
+| `PUT` 4 KiB | 8 | 2.9 MiB/s | 731 | median 9.1 ms, p99 35 ms |
+| `GET` 4 KiB | 8 | 16.5 MiB/s | 4,235 | median 1.5 ms, p99 7.4 ms |
+| `PUT` 64 MiB | 4 | 118 MiB/s | 1.8 | TTFB median 856 ms |
+| `GET` 64 MiB | 4 | 130 MiB/s | 2.0 | TTFB median 32 ms |
+
+```sh
+make up
+warp put --host 127.0.0.1:9001 --access-key kavo --secret-key kavosecret \
+    --obj.size 4KiB --concurrent 8 --duration 30s
+```
+
+Read these with the caveat from the top of this file, and one more: `warp` itself is on the same
+laptop as all six nodes and etcd, competing for the same CPU and the same drive. The write numbers
+are a floor for a further reason too — at N=3 every client byte is three fsynced bytes, so 118 MiB/s
+of 64 MiB `PUT` is ~354 MiB/s of durable writes to one consumer NVMe.
+
+What they confirm is that the shape the in-repo benchmarks describe is real and not an artifact of
+measuring ourselves. A small write is dominated by disk barriers: 9.1 ms at eight concurrent clients
+against 25 ms for one, which is what a queue of fsyncs looks like when there is parallelism to fill
+it. A small read is dominated by one etcd round trip: 1.5 ms, matching the manifest read floor. Large
+objects run at the disk's speed in both directions.
+
+`warp` also exercised paths kavo's own tests do not reach at all. It signs every upload with
+`aws-chunked` streaming (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`) rather than a hex payload hash, so
+those 730 objects a second are 730 chained per-chunk signature verifications a second, by a client
+that implements the scheme independently. Getting it to run at all also turned up a bulk delete
+posted to `/{bucket}/` with a trailing slash, which had been answered with a redirect.
+
+The honest gap that remains: this is one host, so the network is loopback. Numbers from separate
+machines over a real network would be a different measurement, and nothing here should be read as
+one.

@@ -28,7 +28,13 @@ not API surface. Full design and milestones: `docs/design.md`. Research notes wi
  and the internal API on `8081`–`8086`. One image serves every node: nodes are symmetric, so
  only the flags differ.
 
-Run `make test` before declaring any task done.
+Ceph's `s3-tests` is external and run by hand, not from the Makefile. The pass count and the
+classification of every failure live in `docs/s3-compatibility.md`; update both if the S3 surface
+changes.
+
+Run `make test` before declaring any task done. CI (`.github/workflows/ci.yml`) runs `make lint`,
+`make test` and a five-minute chaos run on every push and pull request — the same commands a
+developer runs, because CI that drifts from them eventually only proves things about CI.
 
 ## Invariants — never violate, never weaken to make a test pass
 
@@ -73,7 +79,11 @@ Rules that make these structural:
 - Tests: table-driven; integrity/durability claims need a test that injects the failure.
 - Scope: build only what the current milestone needs (see `docs/design.md`). Do not add
   S3 API surface beyond the locked subset (no IAM, ACLs, versioning, lifecycle) — that is
-  an explicit anti-goal.
+  an explicit anti-goal. The subset is object PUT/GET/HEAD/DELETE, ListObjectsV2, multipart
+  upload, SigV4, and the six calls clients make unprompted: `CreateBucket`, `ListBuckets`,
+  `DeleteBucket`, `DeleteObjects`, `ListObjectVersions`, `GetBucketLocation`. Buckets are
+  still prefixes and nothing is versioned — those last two answer for records that do not
+  exist, because a client that cannot list or empty a bucket cannot use the store.
 
 ## Git conventions
 

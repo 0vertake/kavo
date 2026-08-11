@@ -349,3 +349,263 @@ func TestDeletedObjectsLeaveTheListing(t *testing.T) {
 		t.Errorf("listed %v, want %v", keys, want)
 	}
 }
+
+// ListObjectVersions against a store that keeps no versions. The claim is narrow:
+// every current object appears once, marked as the latest with the version id S3
+// uses for an object written before versioning existed. Clients call this to empty
+// a bucket, and one that under-reports leaves objects behind.
+func TestListingVersionsReportsEachObjectOnce(t *testing.T) {
+	client := newGateway(t)
+	keys := []string{"a.txt", "b.txt", "dir/c.txt"}
+	for _, k := range keys {
+		put(t, client, "versioned", k, []byte("payload of "+k))
+	}
+	// Overwritten, because an object written twice is where a second version
+	// would appear if anything here kept one.
+	put(t, client, "versioned", "a.txt", []byte("replacement"))
+
+	out, err := client.ListObjectVersions(t.Context(), &awss3.ListObjectVersionsInput{
+		Bucket: aws.String("versioned"),
+	})
+	if err != nil {
+		t.Fatalf("ListObjectVersions: %v", err)
+	}
+	var got []string
+	for _, v := range out.Versions {
+		got = append(got, aws.ToString(v.Key))
+		if id := aws.ToString(v.VersionId); id != "null" {
+			t.Errorf("%s has version id %q, want null", aws.ToString(v.Key), id)
+		}
+		if !aws.ToBool(v.IsLatest) {
+			t.Errorf("%s is not marked latest, and it is the only one there is", aws.ToString(v.Key))
+		}
+	}
+	if !slices.Equal(got, keys) {
+		t.Errorf("versions listed %v, want each key once: %v", got, keys)
+	}
+
+	// A client that read that listing deletes by the id it was given, and the
+	// object has to actually go.
+	if _, err := client.DeleteObject(t.Context(), &awss3.DeleteObjectInput{
+		Bucket: aws.String("versioned"), Key: aws.String("a.txt"), VersionId: aws.String("null"),
+	}); err != nil {
+		t.Fatalf("DeleteObject by version id: %v", err)
+	}
+	after, err := client.ListObjectVersions(t.Context(), &awss3.ListObjectVersionsInput{
+		Bucket: aws.String("versioned"),
+	})
+	if err != nil {
+		t.Fatalf("ListObjectVersions: %v", err)
+	}
+	if len(after.Versions) != len(keys)-1 {
+		t.Errorf("after deleting one of %d keys the listing has %d", len(keys), len(after.Versions))
+	}
+}
+
+// The case that hides: a page that ends exactly where the keyspace does.
+//
+// A listing that fills its page has no idea whether more follows unless it looks,
+// and reporting "truncated" because it did not look is wrong in the one arrangement
+// a test with an awkward key count never produces. Clients page until IsTruncated
+// is false, so this is a wasted round trip and an empty page for anything that
+// trusts the flag — and Ceph's suite is what caught it.
+func TestAFullPageThatEndsTheListingIsNotTruncated(t *testing.T) {
+	tests := []struct {
+		name      string
+		keys      []string
+		delimiter string
+		maxKeys   int32
+	}{
+		{name: "keys divide evenly into pages", keys: []string{"a", "b", "c", "d"}, maxKeys: 2},
+		{name: "one page holding everything", keys: []string{"a", "b"}, maxKeys: 2},
+		{name: "grouped prefixes divide evenly",
+			keys: []string{"x/1", "x/2", "y/1", "y/2"}, delimiter: "/", maxKeys: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := newGateway(t)
+			bucket := "exact"
+			for _, k := range tt.keys {
+				put(t, client, bucket, k, []byte("x"))
+			}
+
+			in := &awss3.ListObjectsV2Input{Bucket: aws.String(bucket), MaxKeys: aws.Int32(tt.maxKeys)}
+			if tt.delimiter != "" {
+				in.Delimiter = aws.String(tt.delimiter)
+			}
+			// Page through to the last page, which is the one under test.
+			var pages int
+			for {
+				page, err := client.ListObjectsV2(t.Context(), in)
+				if err != nil {
+					t.Fatalf("list: %v", err)
+				}
+				pages++
+				if pages > len(tt.keys)+1 {
+					t.Fatal("the listing never reported itself complete")
+				}
+				if got := len(page.Contents) + len(page.CommonPrefixes); got == 0 {
+					t.Fatalf("page %d came back empty, so the page before it was "+
+						"truncated with nothing left to read", pages)
+				}
+				if !aws.ToBool(page.IsTruncated) {
+					if token := aws.ToString(page.NextContinuationToken); token != "" {
+						t.Errorf("a complete listing still handed out the token %q", token)
+					}
+					return
+				}
+				in.ContinuationToken = page.NextContinuationToken
+			}
+		})
+	}
+}
+
+// Paging a version listing, which is how a client empties a bucket: it feeds each
+// response's markers into the next request. A marker the server leaves out arrives
+// as a null and the loop stops on the second page with objects still in the bucket,
+// which is exactly what Ceph's suite reported as fourteen errors.
+func TestPagingAVersionListingReachesEveryObject(t *testing.T) {
+	tests := []struct {
+		name      string
+		keys      []string
+		prefix    string
+		delimiter string
+		encode    bool
+		// maxKeys defaults to 1, so that every page but the last is truncated and
+		// the markers are exercised on all of them. The reordering case needs 2:
+		// the frontier is only ambiguous on a page holding both a key and a group.
+		maxKeys int32
+		// want is what a client must see across every page, in order.
+		want []string
+	}{
+		{name: "flat keys", keys: []string{"a", "b", "c", "d", "e"},
+			want: []string{"a", "b", "c", "d", "e"}},
+		{name: "grouped, so a marker names a group",
+			keys: []string{"x/1", "x/2", "y/1", "z/1"}, delimiter: "/",
+			want: []string{"x/", "y/", "z/"}},
+		// An object whose key is the listing's prefix ends in the delimiter without
+		// being a group, and treating it as one steps over everything underneath it.
+		{name: "a key that is the prefix itself",
+			keys: []string{"dir/", "dir/1", "dir/2"}, prefix: "dir/", delimiter: "/",
+			want: []string{"dir/", "dir/1", "dir/2"}},
+		// Escaping maps reserved bytes to "%", which sorts below the characters it
+		// leaves alone, so a frontier chosen from encoded keys can go backwards and
+		// report a key twice.
+		{name: "keys that reorder when escaped",
+			keys: []string{"a0/1", "a:", "b"}, delimiter: "/", encode: true, maxKeys: 2,
+			want: []string{"a0/", "a%3A", "b"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := newGateway(t)
+			for _, k := range tt.keys {
+				put(t, client, "paged", k, []byte("x"))
+			}
+
+			maxKeys := tt.maxKeys
+			if maxKeys == 0 {
+				maxKeys = 1
+			}
+			in := &awss3.ListObjectVersionsInput{
+				Bucket:  aws.String("paged"),
+				MaxKeys: aws.Int32(maxKeys),
+			}
+			if tt.delimiter != "" {
+				in.Delimiter = aws.String(tt.delimiter)
+			}
+			if tt.prefix != "" {
+				in.Prefix = aws.String(tt.prefix)
+			}
+			if tt.encode {
+				in.EncodingType = types.EncodingTypeUrl
+			}
+			var seen []string
+			for pages := 0; ; pages++ {
+				if pages > 2*len(tt.keys) {
+					t.Fatalf("the listing never completed; saw %v", seen)
+				}
+				out, err := client.ListObjectVersions(t.Context(), in)
+				if err != nil {
+					t.Fatalf("ListObjectVersions: %v", err)
+				}
+				for _, v := range out.Versions {
+					seen = append(seen, aws.ToString(v.Key))
+				}
+				for _, p := range out.CommonPrefixes {
+					seen = append(seen, aws.ToString(p.Prefix))
+				}
+				if !aws.ToBool(out.IsTruncated) {
+					break
+				}
+				// A truncated page must hand back both markers, or a client
+				// cannot ask for the next one at all.
+				if aws.ToString(out.NextKeyMarker) == "" {
+					t.Fatalf("a truncated page carries no key marker; saw %v", seen)
+				}
+				if aws.ToString(out.NextVersionIdMarker) == "" {
+					t.Fatal("a truncated page carries no version id marker")
+				}
+				in.KeyMarker = out.NextKeyMarker
+				in.VersionIdMarker = out.NextVersionIdMarker
+			}
+
+			// Sorted, because keys and grouped prefixes arrive in two lists and
+			// which one this loop drains first is not the server's business. What
+			// is: every key appears once. A lost key means the paging stopped
+			// early, a repeated one means a marker went backwards.
+			if got := slices.Sorted(slices.Values(seen)); !slices.Equal(got, slices.Sorted(slices.Values(tt.want))) {
+				t.Errorf("paging saw %v, want each of %v exactly once", seen, tt.want)
+			}
+		})
+	}
+}
+
+// What an encoded listing echoes back, and who owns what.
+//
+// Both are answers clients read rather than data they store, and both were wrong in
+// a way no round-trip test could see: the delimiter came back as "%2F" because
+// escaping did not spare "/", and fetch-owner returned nothing, which a client
+// reads as an object with no owner.
+func TestAnEncodedListingEchoesWhatTheClientSent(t *testing.T) {
+	client := newGateway(t)
+	put(t, client, "bucket", "dir/one.txt", []byte("x"))
+
+	page, err := client.ListObjectsV2(t.Context(), &awss3.ListObjectsV2Input{
+		Bucket:       aws.String("bucket"),
+		Delimiter:    aws.String("/"),
+		EncodingType: types.EncodingTypeUrl,
+		FetchOwner:   aws.Bool(true),
+	})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if got := aws.ToString(page.Delimiter); got != "/" {
+		t.Errorf("the delimiter came back as %q, want the %q that was sent", got, "/")
+	}
+	if got := aws.ToString(page.CommonPrefixes[0].Prefix); got != "dir/" {
+		t.Errorf("the grouped prefix came back as %q, want %q", got, "dir/")
+	}
+
+	flat, err := client.ListObjectsV2(t.Context(), &awss3.ListObjectsV2Input{
+		Bucket:     aws.String("bucket"),
+		FetchOwner: aws.Bool(true),
+	})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if flat.Contents[0].Owner == nil {
+		t.Fatal("fetch-owner=true returned an object with no owner")
+	}
+	if got := aws.ToString(flat.Contents[0].Owner.ID); got != creds.AccessKey {
+		t.Errorf("owner is %q, want the one key pair there is (%q)", got, creds.AccessKey)
+	}
+
+	// Not asked for, not sent: S3 omits the owner unless fetch-owner says otherwise.
+	quiet, err := client.ListObjectsV2(t.Context(), &awss3.ListObjectsV2Input{Bucket: aws.String("bucket")})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if quiet.Contents[0].Owner != nil {
+		t.Error("an owner came back for a listing that did not ask for one")
+	}
+}
