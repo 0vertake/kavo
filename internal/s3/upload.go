@@ -51,7 +51,9 @@ const maxCompleteRequest = 4 << 20
 func (h *handler) postObject(w http.ResponseWriter, r *http.Request) {
 	key, ok := objectKey(r)
 	if !ok {
-		fail(w, r, errNotImplemented, nil)
+		// A trailing slash names the bucket, as it does for GET and DELETE. Clients
+		// really do send one: minio-go posts a bulk delete to "/{bucket}/".
+		h.postBucket(w, r)
 		return
 	}
 	q := r.URL.Query()

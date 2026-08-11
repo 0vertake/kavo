@@ -261,3 +261,48 @@ func TestTheAWSCLIDescribesAndDeletes(t *testing.T) {
 		t.Errorf("head-object succeeded after rm:\n%s", out)
 	}
 }
+
+// The bucket commands, which a client runs before it has written anything and
+// after it has removed everything. Nothing is created or destroyed here — buckets
+// are prefixes — so what is being tested is whether the answers let a client that
+// does not know that get its work done.
+func TestTheAWSCLIManagesBuckets(t *testing.T) {
+	requireAWSCLI(t)
+	bin := buildKavod(t)
+	nodes := startCluster(t, bin, clusterPrefix(), 1<<20, clusterSize)
+
+	if out, err := nodes[0].aws(t, "s3", "mb", "s3://fresh"); err != nil {
+		t.Fatalf("mb: %v\n%s", err, out)
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	if err := os.WriteFile(src, bytes.Repeat([]byte("kavo"), 256), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := nodes[1].aws(t, "s3", "cp", src, "s3://fresh/thing.bin"); err != nil {
+		t.Fatalf("cp into a bucket the CLI just made: %v\n%s", err, out)
+	}
+
+	// `s3 ls` with no argument is ListBuckets, and a bucket holding an object is
+	// the only kind there is.
+	out, err := nodes[2].aws(t, "s3", "ls")
+	if err != nil {
+		t.Fatalf("ls: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "fresh") {
+		t.Errorf("`aws s3 ls` does not list the bucket that holds an object:\n%s", out)
+	}
+
+	// Removing a bucket that still holds an object has to fail, or a client
+	// deletes the bucket believing the objects went with it while every one of
+	// them is still readable.
+	if out, err := nodes[0].aws(t, "s3", "rb", "s3://fresh"); err == nil {
+		t.Errorf("rb succeeded on a bucket whose object is still there:\n%s", out)
+	}
+	if out, err := nodes[1].aws(t, "s3", "rm", "s3://fresh/thing.bin"); err != nil {
+		t.Fatalf("rm: %v\n%s", err, out)
+	}
+	if out, err := nodes[2].aws(t, "s3", "rb", "s3://fresh"); err != nil {
+		t.Fatalf("rb on an emptied bucket: %v\n%s", err, out)
+	}
+}
