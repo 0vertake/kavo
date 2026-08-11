@@ -20,8 +20,9 @@ not API surface. Full design and milestones: `docs/design.md`. Research notes wi
 - `make lint` — `go vet` + `gofmt` check
 - `make etcd` — start just etcd (idempotent)
 - `make up` / `make down` — 6-node dev cluster plus etcd via Docker Compose
- (`deploy/compose.yaml`), published on `localhost:8081`–`8086`. One image serves every node:
- nodes are symmetric, so only the flags differ.
+ (`deploy/compose.yaml`). Each node publishes two ports: the S3 API on `localhost:9001`–`9006`
+ and the internal API on `8081`–`8086`. One image serves every node: nodes are symmetric, so
+ only the flags differ.
 
 Run `make test` before declaring any task done.
 
@@ -50,6 +51,9 @@ Rules that make these structural:
 
 - Symmetric nodes: one binary `kavod` = S3 gateway + chunk store + repair participant.
   Any node coordinates any request.
+- Two listeners per node: `-s3` is the signed client API, `-addr` the internal one (peer chunk
+  transfer, cluster state). The internal port is unauthenticated and can delete chunks, so it
+  must never be the one clients reach.
 - Placement: object key → one of 256 partitions → nodes, via a consistent-hash ring with
   ~128 vnodes per node. Rebalance/repair bookkeeping is per-partition, never per-object.
 - Defaults: N=3, W=2, R=2 replication; EC mode (`-ec=6+3`) is 6 data + 3 parity, encoded per
@@ -79,7 +83,9 @@ Rules that make these structural:
 
 - Never create git commits, push, or open PRs unless explicitly asked.
 - Dependencies: prefer the standard library. Pre-approved: `klauspost/reedsolomon`,
- `go.etcd.io/etcd/client/v3`, and `aws/aws-sdk-go-v2` **in tests only** — its signer is the
- independent oracle the SigV4 tests check against. Anything else: propose it first with a
- one-line reason.
+ `go.etcd.io/etcd/client/v3`, and `aws/aws-sdk-go-v2` **in tests only** — its signer and its S3
+ client are the independent oracles the SigV4 and S3 API tests check against. Anything else:
+ propose it first with a one-line reason.
+- The `aws` CLI is a test oracle too (`test/awscli_test.go`), skipped when it is not installed.
+ It is the only thing that proves the S3 subset works for a client kavo did not choose.
 - Do not "fix" a failing chaos/integration test by loosening its assertions.

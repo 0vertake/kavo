@@ -269,6 +269,50 @@ PUT, GET, DELETE, LIST, multipart upload, SigV4 — nothing else (no IAM/ACLs/ve
 lifecycle; anti-goal). External validation: Ceph `s3-tests` via config file + tox; report the
 pass count.
 
+### Object API
+
+**Two listeners.** `-s3` is the client port; `-addr` is the internal one carrying peer chunk
+transfer and cluster state. The internal port needs no signature and can delete a chunk, so a
+client that could reach it could empty the store one chunk at a time. Splitting them is one line
+of wiring and removes the whole class of problem.
+
+**Buckets are prefixes.** An object's key in etcd is `bucket/key`, so a bucket exists as soon as
+it is named: nothing to create, nothing to delete, and a listing is a prefix scan of the manifest
+keyspace. `HEAD /bucket` therefore always succeeds — clients check before uploading, and a
+truthful "no such bucket" would stop a client that is about to create it in the same breath.
+
+**ETag is the object's MD5**, computed as the body streams past on the way to the chunkers, not
+by reading the object back. MD5 because that is the value clients compare their upload against;
+integrity is still CRC32C per chunk, verified on every read. Two hashes with two jobs.
+
+**Ranged GETs are not optional.** `aws s3 cp` downloads anything over 8 MB as concurrent ranged
+GETs — measured, not assumed — so without ranges the standard client cannot fetch a large object
+at all. Open-ended (`bytes=N-`) and suffix (`bytes=-N`) forms both appear in practice. A range is
+served by reading **every chunk the window touches in full** and discarding the surplus: a
+chunk's checksum covers the chunk, so serving a slice without reading the rest would hand back
+bytes nothing verified, and rot just outside the window would go unreported. The cost is at most
+two extra chunks of I/O; the alternative is invariant 3 with a hole in it.
+
+Anything before the response body is decided before a byte is written, because a status already
+sent cannot be withdrawn. A read that fails **after** the body started is reported by stopping
+short of the promised `Content-Length` — a truncated transfer every client treats as an error,
+which is the only remaining way to say "do not trust these bytes".
+
+**Delete removes the manifest first**, which is the instant the object stops existing, and only
+then reclaims chunks. The reverse order would drop chunks a live manifest still names. Deleting a
+key that is not there succeeds, because S3 promises an idempotent delete and clients build
+cleanup loops on it.
+
+Error bodies are S3's XML with S3's codes, because the code is the part clients act on: an SDK
+retries `SlowDown`, refuses to retry `SignatureDoesNotMatch`, and turns `NoSuchKey` into a typed
+error applications branch on. A quorum failure is `SlowDown` — it says the write may succeed
+later, where `InternalError` says nothing.
+
+Tested against the AWS SDK's S3 client and against the real `aws` CLI driving a cluster of real
+processes. The CLI is the only oracle that proves the subset is usable rather than merely
+self-consistent: it is what found the ranged-download requirement, and it is what will fail the
+day a header is quietly wrong.
+
 ### SigV4 verification
 
 In-house, and verification only: kavo is the server, so the signature is recomputed from the
@@ -359,10 +403,16 @@ implementation disagreeing is the only thing that catches a misreading.
 - **Killing a process is not killing a machine**: SIGKILL proves commit ordering and rename
   atomicity, but the page cache survives it, so the harness cannot prove fsync actually
   reached the platter. That needs power-loss or filesystem fault injection (milestone 10).
-- **Interrupted uploads and abandoned moves leak chunks**: chunks committed before a crash, before
-  a write was refused for missing quorum, or copied by a rebalance whose commit lost to a client
-  are unreachable and never reclaimed. Harmless but unbounded until a GC pass exists (manifests are
-  the only roots, so a mark-and-sweep is straightforward).
+- **Interrupted uploads, overwrites and abandoned moves leak chunks**: chunks committed before a
+  crash, before a write was refused for missing quorum, replaced by an overwrite, or copied by a
+  rebalance whose commit lost to a client are unreachable and never reclaimed. A `DELETE` does
+  reclaim its own chunks; nothing collects the rest. Harmless but unbounded until a GC pass exists
+  (manifests are the only roots, so a mark-and-sweep is straightforward).
+- **A delete can leave copies behind**: the manifest goes first, so the object is gone the moment
+  it returns, but an owner that is down when the chunks are dropped keeps its copy forever — the
+  delete does not come back for it. Same GC pass fixes it.
+- **Multi-range requests are answered with the whole object**: `bytes=0-9,20-29` returns everything
+  rather than a `multipart/byteranges` body. Allowed by HTTP, matches S3, and no S3 client asks.
 - **Metadata ceiling**: per-object manifests in etcd cap object count (etcd practical limit
   ~2–8 GB). Fine for the ~100 GB working set; the at-scale answer is volume/needle packing
   (SeaweedFS/Haystack).

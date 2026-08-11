@@ -96,6 +96,20 @@ func (s *Store) Get(ctx context.Context, key string) (object.Manifest, error) {
 	return m, nil
 }
 
+// Delete removes an object's manifest, which is the moment the object stops
+// existing: readers resolve objects only through committed manifests, so its
+// chunks become unreachable garbage the instant this returns.
+//
+// Deleting a key that is not there is not an error. S3 promises an idempotent
+// delete, and a caller that has to distinguish "gone" from "was never here" can
+// read first.
+func (s *Store) Delete(ctx context.Context, key string) error {
+	if _, err := s.client.Delete(ctx, s.key(key)); err != nil {
+		return fmt.Errorf("meta: delete manifest for %s: %w", key, err)
+	}
+	return nil
+}
+
 // ErrChanged reports that a manifest was modified since it was read, so a
 // conditional commit did nothing.
 var ErrChanged = errors.New("meta: manifest changed since it was read")

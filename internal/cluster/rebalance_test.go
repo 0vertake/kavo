@@ -225,7 +225,7 @@ func TestAClientOverwriteBeatsARebalance(t *testing.T) {
 	// bytes, so the chunk ids are unchanged and the copies the pass is about to
 	// orphan are the live manifest's copies too: deleting them early would be
 	// data loss rather than collecting garbage.
-	if _, err := owner.c.Put(context.Background(), key, bytes.NewReader(data)); err != nil {
+	if _, err := owner.c.Put(context.Background(), key, bytes.NewReader(data), cluster.PutOptions{}); err != nil {
 		t.Fatal(err)
 	}
 

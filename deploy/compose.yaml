@@ -47,35 +47,39 @@ services:
   # Each node advertises its service name, which is what its peers dial. All six
   # are published so a benchmark can drive any of them: any node coordinates any
   # request, and only measuring through one would hide that.
+  #
+  # Two published ports each: 90xx is the S3 API a client uses, 80xx the internal
+  # API the cluster uses. Publishing the internal one at all is a dev-cluster
+  # convenience — it needs no signature and can delete chunks.
   n1:
     <<: *kavod
     command: [-id=n1, -advertise=n1:8080, -data=/data]
-    ports: ["8081:8080"]
+    ports: ["9001:9000", "8081:8080"]
     volumes: [n1:/data]
   n2:
     <<: *kavod
     command: [-id=n2, -advertise=n2:8080, -data=/data]
-    ports: ["8082:8080"]
+    ports: ["9002:9000", "8082:8080"]
     volumes: [n2:/data]
   n3:
     <<: *kavod
     command: [-id=n3, -advertise=n3:8080, -data=/data]
-    ports: ["8083:8080"]
+    ports: ["9003:9000", "8083:8080"]
     volumes: [n3:/data]
   n4:
     <<: *kavod
     command: [-id=n4, -advertise=n4:8080, -data=/data]
-    ports: ["8084:8080"]
+    ports: ["9004:9000", "8084:8080"]
     volumes: [n4:/data]
   n5:
     <<: *kavod
     command: [-id=n5, -advertise=n5:8080, -data=/data]
-    ports: ["8085:8080"]
+    ports: ["9005:9000", "8085:8080"]
     volumes: [n5:/data]
   n6:
     <<: *kavod
     command: [-id=n6, -advertise=n6:8080, -data=/data]
-    ports: ["8086:8080"]
+    ports: ["9006:9000", "8086:8080"]
     volumes: [n6:/data]
 
 volumes:

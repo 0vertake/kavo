@@ -25,6 +25,7 @@ type node struct {
 	bin     string
 	dataDir string
 	addr    string
+	s3Addr  string
 	cmd     *exec.Cmd
 	logs    *bytes.Buffer
 }
@@ -38,6 +39,11 @@ const (
 	// what makes automatic healing observable in seconds and a standing check
 	// that a repair loop in the background disturbs nothing else.
 	testRepairInterval = 200 * time.Millisecond
+
+	// The credentials the S3 port expects. Fixed so the CLI test can be told
+	// them, and meaningless outside a test.
+	testAccessKey = "AKIAIOSFODNN7EXAMPLE"
+	testSecretKey = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 )
 
 // clusterPrefix isolates a test's manifests in etcd. It has to be unique per
@@ -84,11 +90,17 @@ func launch(t *testing.T, bin, id, addr, dataDir, prefix string, chunkSize int, 
 		bin:     bin,
 		dataDir: dataDir,
 		addr:    addr,
-		logs:    &bytes.Buffer{},
+		// Every node serves S3 too, on its own port: a restart has to be able to
+		// bind both, and the CLI test needs a real one to talk to.
+		s3Addr: freePort(t),
+		logs:   &bytes.Buffer{},
 	}
 	n.cmd = exec.Command(bin,
 		"-id", id,
 		"-addr", n.addr,
+		"-s3", n.s3Addr,
+		"-access-key", testAccessKey,
+		"-secret-key", testSecretKey,
 		"-data", dataDir,
 		"-chunk-size", fmt.Sprint(chunkSize),
 		"-etcd", meta.EndpointFromEnv(),
@@ -111,18 +123,25 @@ func launch(t *testing.T, bin, id, addr, dataDir, prefix string, chunkSize int, 
 	return n
 }
 
+// waitReady blocks until both listeners are up. Both, because a node whose S3
+// port failed to bind would look healthy to the cluster and be unusable to a
+// client.
 func (n *node) waitReady() {
 	n.t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", n.addr, 200*time.Millisecond)
-		if err == nil {
-			conn.Close()
-			return
+	for _, addr := range []string{n.addr, n.s3Addr} {
+		for {
+			conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+			if err == nil {
+				conn.Close()
+				break
+			}
+			if time.Now().After(deadline) {
+				n.t.Fatalf("kavod never became ready on %s; logs:\n%s", addr, n.logs)
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
-	n.t.Fatalf("kavod never became ready on %s; logs:\n%s", n.addr, n.logs)
 }
 
 // kill sends SIGKILL, the only crash worth testing: no signal handler, no
