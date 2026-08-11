@@ -164,9 +164,22 @@ A pass walks the cluster's manifests in key order and restores every copy each m
 - **Loud about data loss**: a pass that finds copies missing everywhere still finishes, because
   the rest of the cluster needs repairing, but reports `ErrUnrepairable` rather than success.
 
-Still missing: a background scrubber that re-reads chunks and verifies checksums, so rot is found
-before a reader trips over it. Repair asks whether a copy is *there*, which is a different
-question from whether it is still *good*.
+### Scrubbing
+
+Repair asks whether a copy is *there*. Rot is the other question: a disk that quietly rewrites a
+sector answers every survey correctly and fails only at the moment a client reads it, which is
+far too late for that to be the first time anyone looked.
+
+So every node also re-reads its own chunks and checksums them against their manifests. Each node
+scrubs its own disk, because it is the only node that can read it — a different rule from repair,
+where one node surveys a partition on everyone's behalf. A rotted copy is replaced from a peer
+whose copy still verifies, staged and renamed so the bad copy is never half-overwritten. Rot in
+every copy reports `ErrRotUnrecovered`: the last good copy of that data is gone, and that must be
+said out loud.
+
+Passes are paced by the same byte rate as repair and default to once a day, because a pass reads
+every byte the node stores. Rot is rare and disks are large, so scrubbing is a slow sweep rather
+than a reaction.
 
 ## Crash safety
 
@@ -210,8 +223,9 @@ External validation: Ceph `s3-tests` via config file + tox; report the pass coun
   nowhere to go, since putting it elsewhere means rewriting the manifest — that is rebalancing
   (milestone 8), not repair. So redundancy returns to N after a crash or a lost disk, but not
   after a permanent node loss.
-- **Repair sees presence, not integrity**: a chunk that has rotted still answers the survey as
-  present. Readers catch it by checksum, and the scrubber will, but repair does not.
+- **Repair sees presence, not integrity**: a chunk that has rotted still answers repair's survey
+  as present. The scrubber is what finds it, on a much slower cycle, so rot can sit undetected for
+  up to one scrub interval.
 - **Surveying costs a round trip per copy**: one `HEAD` per chunk per owner, so a pass over a
   large cluster is many small requests. Batching the question ("which of these ids do you have?")
   is the obvious fix, and waits for a benchmark that shows it matters.

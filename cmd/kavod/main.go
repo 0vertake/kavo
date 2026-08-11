@@ -30,6 +30,7 @@ func main() {
 	leaseTTL := flag.Duration("lease-ttl", meta.DefaultLeaseTTL, "how long this node may go unheard before the cluster declares it dead")
 	repairRate := flag.Int64("repair-rate", cluster.DefaultRepairRate, "bytes per second this node may use to restore missing copies (0 for unlimited)")
 	repairInterval := flag.Duration("repair-interval", cluster.DefaultRepairInterval, "pause between repair passes")
+	scrubInterval := flag.Duration("scrub-interval", cluster.DefaultScrubInterval, "pause between scrub passes, which re-read this node's chunks to find rot")
 	flag.Parse()
 
 	// Peers dial this address, so a bind address like ":8080" is not enough:
@@ -82,6 +83,10 @@ func main() {
 	// react to: nothing announces a write that was acknowledged at W of N or a
 	// disk that came back empty.
 	go c.RepairLoop(ctx, *repairRate, *repairInterval)
+
+	// Rot answers every survey correctly and only fails when a client reads it,
+	// which is far too late for that to be the first time anyone looked.
+	go c.ScrubLoop(ctx, *repairRate, *scrubInterval)
 
 	log.Printf("kavod %s node %s listening on %s (advertising %s, data %s, chunk size %d, etcd %s%s, lease %v)",
 		version.Version, *id, *addr, self, *dataDir, *chunkSize, *etcd, *prefix, *leaseTTL)
