@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -316,3 +317,70 @@ func (s *readSizes) Read(p []byte) (int, error) {
 type failingReader struct{ err error }
 
 func (f *failingReader) Read([]byte) (int, error) { return 0, f.err }
+
+// A sweep for chunks nothing references reads the disk a slice of the id space at
+// a time, so what it lists and what it reports about each file is the whole
+// contract: the wrong prefix would hide garbage, and the wrong size or time would
+// make a caller delete something it should not.
+func TestScanningChunksByIDPrefix(t *testing.T) {
+	s := mustOpen(t)
+	written := map[string]int{
+		"AB000001": 10,
+		"AB000002": 20,
+		"AC000003": 30,
+		"ZZ000004": 40,
+	}
+	for id, size := range written {
+		writeChunk(t, s, id, make([]byte, size))
+	}
+
+	for _, tc := range []struct {
+		prefix string
+		want   []string
+	}{
+		{"", []string{"AB000001", "AB000002", "AC000003", "ZZ000004"}},
+		{"A", []string{"AB000001", "AB000002", "AC000003"}},
+		{"AB", []string{"AB000001", "AB000002"}},
+		{"AB000002", []string{"AB000002"}},
+		{"Q", nil},
+	} {
+		var got []string
+		if err := s.ScanChunks(tc.prefix, func(ci ChunkInfo) error {
+			got = append(got, ci.ID)
+			if want := written[ci.ID]; int64(want) != ci.Size {
+				t.Errorf("ScanChunks(%q) reports %s as %d bytes, want %d", tc.prefix, ci.ID, ci.Size, want)
+			}
+			if ci.Modified.IsZero() {
+				t.Errorf("ScanChunks(%q) reports no write time for %s, which is what decides whether it is garbage", tc.prefix, ci.ID)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("ScanChunks(%q): %v", tc.prefix, err)
+		}
+		slices.Sort(got)
+		if !slices.Equal(got, tc.want) {
+			t.Errorf("ScanChunks(%q) = %v, want %v", tc.prefix, got, tc.want)
+		}
+	}
+}
+
+// A visit that fails stops the scan, so a caller that cannot go on says so once
+// rather than being called for every remaining chunk.
+func TestScanningChunksStopsWhenTheVisitorFails(t *testing.T) {
+	s := mustOpen(t)
+	for _, id := range []string{"AA000001", "AB000002", "AC000003"} {
+		writeChunk(t, s, id, nil)
+	}
+
+	stop := errors.New("enough")
+	seen := 0
+	if err := s.ScanChunks("", func(ChunkInfo) error {
+		seen++
+		return stop
+	}); !errors.Is(err, stop) {
+		t.Fatalf("ScanChunks returned %v, want the visitor's own error", err)
+	}
+	if seen != 1 {
+		t.Errorf("the visitor was called %d times after failing once", seen)
+	}
+}
