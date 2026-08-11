@@ -10,17 +10,18 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/0vertake/kavo/internal/cluster"
 	"github.com/0vertake/kavo/internal/meta"
-	"github.com/0vertake/kavo/internal/object"
 	"github.com/0vertake/kavo/internal/peer"
 	"github.com/0vertake/kavo/internal/store"
 )
 
 // New returns a handler serving objects on /objects/{key...} for clients, and
-// chunks on /peer/chunks/{id} for other nodes. Chunks live in s; the manifests
-// that make them an object live in m.
-func New(s *store.Store, m *meta.Store, chunkSize int64) http.Handler {
-	h := &handler{store: s, meta: m, chunkSize: chunkSize}
+// chunks on /peer/chunks/{id} for other nodes. Client requests go through the
+// coordinator, which spreads them across the cluster; peer requests act on this
+// node's own chunk store.
+func New(c *cluster.Coordinator, s *store.Store) http.Handler {
+	h := &handler{cluster: c, store: s}
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /objects/{key...}", h.put)
 	mux.HandleFunc("GET /objects/{key...}", h.get)
@@ -30,28 +31,28 @@ func New(s *store.Store, m *meta.Store, chunkSize int64) http.Handler {
 }
 
 type handler struct {
-	store     *store.Store
-	meta      *meta.Store
-	chunkSize int64
+	cluster *cluster.Coordinator
+	store   *store.Store
 }
 
-// put streams the body into chunks and then commits the manifest to etcd. The
-// commit is the acknowledgement point: until it returns, the chunks on disk are
-// unreferenced and the object does not exist.
+// put replicates the body across the partition's owners and commits the
+// manifest. The commit is the acknowledgement point: until it returns, the chunks
+// on disk are unreferenced and the object does not exist.
 func (h *handler) put(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	if key == "" {
 		http.Error(w, "empty object key", http.StatusBadRequest)
 		return
 	}
-	m, err := object.Write(h.store, r.Body, h.chunkSize)
+	m, err := h.cluster.Put(r.Context(), key, r.Body)
 	if err != nil {
-		log.Printf("put %s: write chunks: %v", key, err)
-		http.Error(w, "write failed", http.StatusInternalServerError)
-		return
-	}
-	if err := h.meta.Commit(r.Context(), key, m); err != nil {
-		log.Printf("put %s: commit manifest: %v", key, err)
+		log.Printf("put %s: %v", key, err)
+		if errors.Is(err, cluster.ErrQuorum) {
+			// The cluster cannot promise the write is durable, so it must not
+			// claim it is. Retryable once enough nodes are back.
+			http.Error(w, "not enough replicas available", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, "write failed", http.StatusInternalServerError)
 		return
 	}
@@ -142,7 +143,10 @@ func declaredCRC(r *http.Request) (uint32, error) {
 
 func (h *handler) get(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
-	m, err := h.meta.Get(r.Context(), key)
+
+	// The size has to be known before any bytes go out, so the manifest is
+	// resolved first and the body is streamed second.
+	m, err := h.cluster.Resolve(r.Context(), key)
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
 			http.Error(w, "not found", http.StatusNotFound)
@@ -154,7 +158,7 @@ func (h *handler) get(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Length", strconv.FormatInt(m.Size, 10))
-	if err := object.Read(h.store, m, w); err != nil {
+	if err := h.cluster.Stream(r.Context(), m, w); err != nil {
 		// Bytes are already on the wire, so the status cannot change. Aborting
 		// short of the promised Content-Length makes net/http drop the
 		// connection, which the client sees as an error rather than as a

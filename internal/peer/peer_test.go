@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/0vertake/kavo/internal/api"
+	"github.com/0vertake/kavo/internal/cluster"
 	"github.com/0vertake/kavo/internal/meta"
 	"github.com/0vertake/kavo/internal/peer"
 	"github.com/0vertake/kavo/internal/store"
@@ -40,7 +41,11 @@ func newPeer(t *testing.T) (addr, root string) {
 	}
 	t.Cleanup(func() { m.Close() })
 
-	srv := httptest.NewServer(api.New(s, m, 1024))
+	c, err := cluster.New("n1", map[string]string{"n1": "127.0.0.1:0"}, s, m, 1024)
+	if err != nil {
+		t.Fatalf("cluster.New: %v", err)
+	}
+	srv := httptest.NewServer(api.New(c, s))
 	t.Cleanup(srv.Close)
 	return strings.TrimPrefix(srv.URL, "http://"), root
 }

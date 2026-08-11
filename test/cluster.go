@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 // node is a kavod process under test.
 type node struct {
 	t       *testing.T
+	id      string
 	bin     string
 	dataDir string
 	addr    string
@@ -31,24 +33,57 @@ type node struct {
 // chunks were left behind in a previous run's data directory.
 func clusterPrefix() string { return "/kavo-test/" + rand.Text() }
 
-// startNode builds kavod once per test and launches it against dataDir. Handing
-// the same dataDir and prefix to a later startNode call simulates a restart.
+// startNode launches a cluster of one against dataDir. Handing the same dataDir
+// and prefix to a later startNode call simulates a restart.
 func startNode(t *testing.T, bin, dataDir, prefix string, chunkSize int) *node {
+	t.Helper()
+	return launch(t, bin, "n1", freePort(t), "", dataDir, prefix, chunkSize)
+}
+
+// startCluster launches n kavod processes that know about each other, returned in
+// id order (n1, n2, ...). Every node is given the same peer list so that they all
+// derive the same ring; disagreeing rings would scatter an object's chunks.
+func startCluster(t *testing.T, bin, prefix string, chunkSize, n int) []*node {
+	t.Helper()
+	ids := make([]string, n)
+	addrs := make([]string, n)
+	entries := make([]string, n)
+	for i := range n {
+		ids[i] = fmt.Sprintf("n%d", i+1)
+		addrs[i] = freePort(t)
+		entries[i] = ids[i] + "=" + addrs[i]
+	}
+	peers := strings.Join(entries, ",")
+
+	nodes := make([]*node, n)
+	for i := range n {
+		nodes[i] = launch(t, bin, ids[i], addrs[i], peers, t.TempDir(), prefix, chunkSize)
+	}
+	return nodes
+}
+
+func launch(t *testing.T, bin, id, addr, peers, dataDir, prefix string, chunkSize int) *node {
 	t.Helper()
 	n := &node{
 		t:       t,
+		id:      id,
 		bin:     bin,
 		dataDir: dataDir,
-		addr:    freePort(t),
+		addr:    addr,
 		logs:    &bytes.Buffer{},
 	}
-	n.cmd = exec.Command(bin,
+	args := []string{
+		"-id", id,
 		"-addr", n.addr,
 		"-data", dataDir,
 		"-chunk-size", fmt.Sprint(chunkSize),
 		"-etcd", meta.EndpointFromEnv(),
 		"-cluster", prefix,
-	)
+	}
+	if peers != "" {
+		args = append(args, "-peers", peers)
+	}
+	n.cmd = exec.Command(bin, args...)
 	n.cmd.Stdout = n.logs
 	n.cmd.Stderr = n.logs
 	if err := n.cmd.Start(); err != nil {
