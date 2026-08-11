@@ -308,6 +308,13 @@ Three things make it safe:
   S3 lets a client take days — so the pass reads part manifests too, and reads them *before*
   the objects, which is what makes a completion racing the scan safe either way round.
 
+Both of those are checked against real processes rather than argued: six clients writing
+continuously against a sweep every 10ms at a two-second grace, every acknowledged write read back
+byte for byte (`TestWritesArrivingDuringSweepsAreAllReadable`), and an upload left as nothing but
+parts through fifteen full cycles of the id space before it completes
+(`TestAnUploadOutlivingManySweepsStillCompletes`). Neither passes if the pass stops consulting the
+grace period or stops reading part manifests: both mutations turn reads into `unexpected EOF`.
+
 What the manifest says, not what exists: a copy on a node the manifest does not name is
 unreachable, because a reader tries the nodes it names and stops. That is the same rule
 rebalancing relies on when it deletes the copy it moved away from, and it is what lets this pass

@@ -1,13 +1,19 @@
 package test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/0vertake/kavo/internal/cluster"
 	"github.com/0vertake/kavo/internal/meta"
@@ -118,6 +124,157 @@ func TestCollectingWhileANodeDiesTakesOnlyGarbage(t *testing.T) {
 	for _, key := range keys {
 		getSigned(t, nodes[0], key, size)
 	}
+}
+
+// A chunk is durable before the manifest that names it is committed, so for that
+// window good data is referenced by nothing at all and only its age protects it.
+// This is that window under load: writes arriving continuously from several clients
+// at once, against a sweep running as fast as it can go, every one of which has to
+// read back exactly what was written. The grace period is short — two seconds
+// against writes that take a fraction of one — because a grace of an hour would
+// prove nothing about whether the pass consults it.
+func TestWritesArrivingDuringSweepsAreAllReadable(t *testing.T) {
+	defer withCollect("10ms", "2s")()
+	bin := buildKavod(t)
+	nodes := startCluster(t, bin, clusterPrefix(), 64<<10, 4)
+
+	const writers = 6
+	const each = 8
+	const size = 4 * 64 << 10
+
+	type written struct {
+		key  string
+		body []byte
+	}
+	acked := make([]written, 0, writers*each)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	failed := make(chan error, writers)
+
+	for w := range writers {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			// A client per writer, spread over the cluster, since which node
+			// coordinates decides which node commits and which sweeps.
+			client := s3Client(nodes[w%len(nodes)].s3Addr)
+			for i := range each {
+				key := fmt.Sprintf("collect/racing-%d-%d.bin", w, i)
+				body := payload(byte(w*each+i), size)
+				if err := putBody(t.Context(), client, key, body); err != nil {
+					failed <- fmt.Errorf("PUT %s: %w", key, err)
+					return
+				}
+				mu.Lock()
+				acked = append(acked, written{key, body})
+				mu.Unlock()
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(failed)
+	for err := range failed {
+		t.Error(err)
+	}
+
+	// Read after the writes rather than during them, so that what is being checked
+	// is what the sweeps left behind and not what a reader raced.
+	client := s3Client(nodes[0].s3Addr)
+	for _, w := range acked {
+		got, err := getBody(t.Context(), client, w.key)
+		if err != nil {
+			t.Errorf("GET %s: %v", w.key, err)
+			continue
+		}
+		if !bytes.Equal(got, w.body) {
+			t.Errorf("GET %s returned %d bytes of the wrong data, want the %d written", w.key, len(got), len(w.body))
+		}
+	}
+}
+
+// S3 lets a client take days over a multipart upload, so nothing about a part's age
+// can be what keeps it: a part's chunks are protected by the part manifest naming
+// them, and by the pass reading part manifests as well as object ones. Here the
+// upload sits through fifteen full cycles of the id space with a grace period far
+// shorter than it has been waiting, and then completes.
+func TestAnUploadOutlivingManySweepsStillCompletes(t *testing.T) {
+	// Grace long enough to cover a single part upload, which has the same
+	// commit window any write has, and nowhere near long enough to cover the wait.
+	defer withCollect("10ms", "1s")()
+	bin := buildKavod(t)
+	nodes := startCluster(t, bin, clusterPrefix(), 64<<10, 4)
+
+	client := s3Client(nodes[0].s3Addr)
+	const key = "collect/slow-upload.bin"
+	body := payload(0x5b, 6*64<<10)
+	split := len(body) / 3
+
+	create, err := client.CreateMultipartUpload(t.Context(), &awss3.CreateMultipartUploadInput{
+		Bucket: aws.String(collectBucket), Key: aws.String(key),
+	})
+	if err != nil {
+		t.Fatalf("create the upload: %v", err)
+	}
+	var parts []types.CompletedPart
+	for i, part := range [][]byte{body[:split], body[split:]} {
+		up, err := client.UploadPart(t.Context(), &awss3.UploadPartInput{
+			Bucket: aws.String(collectBucket), Key: aws.String(key), UploadId: create.UploadId,
+			PartNumber: aws.Int32(int32(i + 1)), Body: bytes.NewReader(part),
+		})
+		if err != nil {
+			t.Fatalf("upload part %d: %v", i+1, err)
+		}
+		parts = append(parts, types.CompletedPart{ETag: up.ETag, PartNumber: aws.Int32(int32(i + 1))})
+	}
+
+	// Fifteen cycles of the whole id space, so every slice the parts live in has
+	// been swept several times over while the upload was nothing but parts.
+	time.Sleep(5 * time.Second)
+
+	if _, err := client.CompleteMultipartUpload(t.Context(), &awss3.CompleteMultipartUploadInput{
+		Bucket: aws.String(collectBucket), Key: aws.String(key), UploadId: create.UploadId,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
+	}); err != nil {
+		t.Fatalf("complete the upload: %v", err)
+	}
+
+	got, err := getBody(t.Context(), client, key)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Errorf("the completed object is %d bytes of the wrong data, want the %d uploaded", len(got), len(body))
+	}
+}
+
+const collectBucket = "collect"
+
+// payload is a body that identifies itself, so that a read returning some other
+// object's bytes is a different failure from a read returning nothing.
+func payload(seed byte, size int) []byte {
+	body := make([]byte, size)
+	for i := range body {
+		body[i] = seed + byte(i%251)
+	}
+	return body
+}
+
+func putBody(ctx context.Context, client *awss3.Client, key string, body []byte) error {
+	_, err := client.PutObject(ctx, &awss3.PutObjectInput{
+		Bucket: aws.String(collectBucket), Key: aws.String(key), Body: bytes.NewReader(body),
+	})
+	return err
+}
+
+func getBody(ctx context.Context, client *awss3.Client, key string) ([]byte, error) {
+	out, err := client.GetObject(ctx, &awss3.GetObjectInput{
+		Bucket: aws.String(collectBucket), Key: aws.String(key),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer out.Body.Close()
+	return io.ReadAll(out.Body)
 }
 
 // Two background passes, each correct on its own, and the seam between them.
