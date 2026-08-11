@@ -377,33 +377,102 @@ func TestOnePassSweepsOneSliceOfTheIDSpace(t *testing.T) {
 	}
 }
 
-// A copy on a node the manifest does not name is unreachable, because a reader
-// tries the nodes the manifest names and stops. That is the residue a rebalance can
-// leave behind when it moves data and fails to delete what it moved from.
-func TestACopyNoManifestNamesIsReclaimed(t *testing.T) {
+// A copy on a node that neither the manifest nor the ring names is unreachable,
+// because a reader tries the nodes the manifest names and stops. That is the residue
+// a rebalance leaves when it moves data and the delete afterwards does not happen —
+// and it is the case this pass was written for, so it has to be built the way it
+// really arises: the ring hands the partition elsewhere.
+func TestACopyNeitherTheManifestNorTheRingNamesIsReclaimed(t *testing.T) {
 	tc := newCluster(t, 5)
-	const key = "moved.bin"
-	owners, outsider := tc.owners(t, key)
+	// Five nodes exist and everyone is told about four, so revealing the fifth is
+	// a join, and this key is one the join reassigns.
+	key := keyMovedBy(t, tc, "n5", cluster.Replicas)
+	tc.tellEveryone(tc.without("n5"))
 
-	m := mustPut(t, outsider, key, randBytes(2*testChunkSize))
+	data := randBytes(2 * testChunkSize)
+	m := mustPut(t, tc.nodes["n1"], key, data)
+	tc.tellEveryone(tc.without())
 
-	// The manifest stops naming one of its owners, without that owner's disk
-	// changing: exactly the state a move leaves when the copy it superseded
-	// outlives the manifest that pointed at it.
-	stale := owners[len(owners)-1]
+	// The move has happened: the manifest names the ring's owners and the copies
+	// are there. What is left over is the copy on the node that stopped owning it,
+	// which is what a move whose delete did not happen leaves behind.
 	moved := m
-	moved.Nodes = slices.DeleteFunc(slices.Clone(m.Nodes), func(id string) bool { return id == stale.id })
-	if err := outsider.m.Commit(context.Background(), key, moved); err != nil {
+	moved.Nodes = ownersOf(t, tc, key, len(m.Nodes))
+	stale := ""
+	for _, id := range m.Nodes {
+		if !slices.Contains(moved.Nodes, id) {
+			stale = id
+		}
+	}
+	if stale == "" {
+		t.Fatalf("the join left placement %v unchanged, so there is no residue to collect", m.Nodes)
+	}
+	for _, id := range moved.Nodes {
+		placeChunks(t, tc.nodes[id], m, data)
+	}
+	if err := tc.nodes["n1"].m.Commit(context.Background(), key, moved); err != nil {
 		t.Fatalf("commit the moved manifest: %v", err)
 	}
 
 	collectEverywhere(t, tc, 0)
 	for _, ref := range m.Chunks {
-		if slices.Contains(chunksOn(t, stale), ref.ID) {
-			t.Errorf("chunk %s survived on %s, which the manifest no longer names", ref.ID, stale.id)
+		if slices.Contains(chunksOn(t, tc.nodes[stale]), ref.ID) {
+			t.Errorf("chunk %s survived on %s, which neither the manifest nor the ring names", ref.ID, stale)
 		}
 	}
-	if got := mustGet(t, outsider, key); len(got) == 0 {
-		t.Error("the object stopped reading after its stale copy was reclaimed")
+	if got := mustGet(t, tc.nodes["n1"], key); !bytes.Equal(got, data) {
+		t.Error("the object stopped reading once its residue was reclaimed")
+	}
+}
+
+// The other side of that rule, and the seam between two passes that are each
+// correct alone. A move copies every chunk to the new owners before committing the
+// manifest that names them, and the copying is rate-limited, so for the length of a
+// move the destination holds chunks no manifest mentions. A sweep that went by the
+// manifest alone would delete them as fast as the move made them.
+func TestAChunkAMoveIsAboutToDeliverIsKept(t *testing.T) {
+	tc := newCluster(t, 5)
+	key := keyMovedBy(t, tc, "n5", cluster.Replicas)
+	tc.tellEveryone(tc.without("n5"))
+
+	data := randBytes(2 * testChunkSize)
+	m := mustPut(t, tc.nodes["n1"], key, data)
+	tc.tellEveryone(tc.without())
+
+	// Mid-move: the destination has been given a chunk, and the manifest still
+	// names the old owners because until it is committed a reader has to find the
+	// object where it was.
+	destination := ""
+	for _, id := range ownersOf(t, tc, key, len(m.Nodes)) {
+		if !slices.Contains(m.Nodes, id) {
+			destination = id
+		}
+	}
+	if destination == "" {
+		t.Fatalf("the join left placement %v unchanged, so no move is in flight", m.Nodes)
+	}
+	placeChunks(t, tc.nodes[destination], m, data)
+
+	// No grace at all, so age cannot be what saves them.
+	if st := collectEverywhere(t, tc, 0); st.Collected != 0 {
+		t.Errorf("collected %d chunks a move is in the middle of delivering", st.Collected)
+	}
+	for _, ref := range m.Chunks {
+		if !slices.Contains(chunksOn(t, tc.nodes[destination]), ref.ID) {
+			t.Errorf("chunk %s was taken from %s, which the ring makes an owner", ref.ID, destination)
+		}
+	}
+}
+
+// placeChunks writes an object's chunks onto a node's disk the way a move does, so
+// that a test can stand a cluster in the middle of one.
+func placeChunks(t testing.TB, n *node, m object.Manifest, data []byte) {
+	t.Helper()
+	var at int64
+	for _, ref := range m.Chunks {
+		if err := n.s.WriteChunkVerified(ref.ID, bytes.NewReader(data[at:at+ref.Size]), ref.CRC, ref.Size); err != nil {
+			t.Fatalf("place chunk %s on %s: %v", ref.ID, n.id, err)
+		}
+		at += ref.Size
 	}
 }

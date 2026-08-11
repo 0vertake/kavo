@@ -25,13 +25,13 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"slices"
 	"strings"
 	"time"
 
 	"github.com/0vertake/kavo/internal/ec"
 	"github.com/0vertake/kavo/internal/meta"
 	"github.com/0vertake/kavo/internal/object"
+	"github.com/0vertake/kavo/internal/ring"
 	"github.com/0vertake/kavo/internal/store"
 )
 
@@ -204,7 +204,9 @@ func (c *Coordinator) referenced(ctx context.Context, slice byte) (map[string]st
 			break
 		}
 		for _, p := range parts {
-			c.reference(referenced, p.Manifest, slice)
+			// No key, so no ring clause: a part is never moved by a rebalance, so
+			// the only thing that can make its chunks live is the part itself.
+			c.reference(referenced, "", p.Manifest, slice)
 			from = p.Key
 		}
 	}
@@ -219,7 +221,7 @@ func (c *Coordinator) referenced(ctx context.Context, slice byte) (map[string]st
 			break
 		}
 		for _, o := range objects {
-			c.reference(referenced, o.Manifest, slice)
+			c.reference(referenced, o.Key, o.Manifest, slice)
 			from = meta.After(o.Key)
 		}
 	}
@@ -233,8 +235,31 @@ func (c *Coordinator) referenced(ctx context.Context, slice byte) (map[string]st
 // stops. That is the same rule rebalancing already relies on when it deletes the
 // copy it moved away from, and it is what lets this pass reclaim the copies a
 // rebalance failed to.
-func (c *Coordinator) reference(referenced map[string]struct{}, m object.Manifest, slice byte) {
-	mine := slices.Contains(m.Nodes, c.self)
+//
+// And what the ring says, for the one case where the manifest is behind the truth
+// rather than ahead of it. A move copies every chunk to the new owners before
+// committing the manifest that names them — it has to, because until that commit a
+// reader must still find the object where the old manifest says it is — and the
+// copying is rate-limited. So for the length of a move, which is the object's size
+// over the repair rate, the destination holds chunks no manifest mentions. Without
+// this clause a sweep deletes them as fast as the move makes them, and then the
+// commit promises them and the old copies are dropped on the strength of that
+// promise. Watching it happen, repair restored what the sweep took and nothing was
+// lost, but only because some copy of each chunk outlived the window: two passes
+// racing is not a durability argument.
+//
+// This spares nothing the pass was written for. A copy a move left behind sits on a
+// node that lost the partition, so it is named by neither the manifest nor the ring.
+func (c *Coordinator) reference(referenced map[string]struct{}, key string, m object.Manifest, slice byte) {
+	mine := positionsOf(m.Nodes, c.self)
+	if key != "" {
+		want := c.live.Load().ring.Owners(ring.PartitionFor(key), len(m.Nodes))
+		mine = append(mine, positionsOf(want, c.self)...)
+	}
+	if len(mine) == 0 {
+		return
+	}
+
 	for _, ref := range m.Chunks {
 		// A shard id begins with its chunk's id, so one slice covers a chunk and
 		// all of its shards.
@@ -242,19 +267,29 @@ func (c *Coordinator) reference(referenced map[string]struct{}, m object.Manifes
 			continue
 		}
 		if m.Coding == (ec.Scheme{}) {
-			if mine {
-				referenced[ref.ID] = struct{}{}
-			}
+			referenced[ref.ID] = struct{}{}
 			continue
 		}
-		// Erasure-coded: position is identity, so this node holds the shard at
-		// its own index and no other.
-		for i, node := range m.Nodes {
-			if node == c.self {
-				referenced[ref.ShardID(i)] = struct{}{}
-			}
+		// Erasure-coded: position is identity. This node holds the shard at its
+		// own index, and a move to it would deliver the shard at the index it has
+		// in the placement being moved to.
+		for _, i := range mine {
+			referenced[ref.ShardID(i)] = struct{}{}
 		}
 	}
+}
+
+// positionsOf is where node appears in a placement. A list, because a manifest's
+// placement and the ring's may put the same node in different positions, and for a
+// coded object the position is which shard it holds.
+func positionsOf(nodes []string, node string) []int {
+	var at []int
+	for i, id := range nodes {
+		if id == node {
+			at = append(at, i)
+		}
+	}
+	return at
 }
 
 // nextSlice returns the slice of the id space this pass should sweep, and records

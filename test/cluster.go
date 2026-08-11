@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -31,7 +32,27 @@ type node struct {
 	addr      string
 	s3Addr    string
 	cmd       *exec.Cmd
-	logs      *bytes.Buffer
+	logs      *nodeLog
+}
+
+// nodeLog collects a node's output. A test that reads it while the node is still
+// running — to see what a background pass did — is reading it while the process is
+// still writing to it, so the buffer is guarded.
+type nodeLog struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *nodeLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *nodeLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
 }
 
 const (
@@ -120,7 +141,7 @@ func launch(t *testing.T, bin, id, addr, dataDir, prefix string, chunkSize int, 
 		// Every node serves S3 too, on its own port: a restart has to be able to
 		// bind both, and the CLI test needs a real one to talk to.
 		s3Addr: freePort(t),
-		logs:   &bytes.Buffer{},
+		logs:   &nodeLog{},
 	}
 	n.start()
 	t.Cleanup(n.stop)
