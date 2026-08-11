@@ -49,29 +49,6 @@ func peerTransport() *http.Transport {
 	return t
 }
 
-// DropChunk asks the node at addr to delete its copy of a chunk, and treats a
-// copy that is already gone as success.
-//
-// Only called once a rebalance has placed the chunk on its new owners and
-// committed the manifest naming them, so no reader can still be sent here for it.
-func DropChunk(ctx context.Context, addr, id string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, chunkURL(addr, id), nil)
-	if err != nil {
-		return fmt.Errorf("peer: drop chunk %s on %s: %w", id, addr, err)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("peer: drop chunk %s on %s: %w", id, addr, err)
-	}
-	resp.Body.Close()
-	switch resp.StatusCode {
-	case http.StatusOK, http.StatusNoContent, http.StatusNotFound:
-		return nil
-	default:
-		return fmt.Errorf("peer: drop chunk %s on %s: %s", id, addr, resp.Status)
-	}
-}
-
 // PushChunk streams size bytes from body to the node at addr, to be stored as
 // chunk id. It returns nil only once that node reports the chunk verified
 // against crc and fsynced, which is what makes it countable towards a write

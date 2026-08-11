@@ -25,7 +25,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/0vertake/kavo/internal/ec"
 	"github.com/0vertake/kavo/internal/meta"
 	"github.com/0vertake/kavo/internal/object"
 )
@@ -174,34 +173,16 @@ func (c *Coordinator) CompleteUpload(ctx context.Context, id string, parts []Com
 	return final, nil
 }
 
-// AbortUpload discards an upload and reclaims the parts' chunks.
+// AbortUpload discards an upload. Forgetting the parts is what makes the chunks
+// they named unreferenced, and collection is what reclaims them — abandoning an
+// upload halfway leaves exactly the same garbage, and there is no second mechanism
+// for it.
+//
+// This used to drop the parts' chunks itself, which was safe only for as long as no
+// two manifests could name the same chunk. It also raced a completion of the same
+// upload: parts read here, the object committed there, and then the chunks of a
+// committed object deleted. Neither is possible now that nothing deletes a chunk
+// except the pass that reads every manifest first.
 func (c *Coordinator) AbortUpload(ctx context.Context, id string) error {
-	stored, err := c.meta.Parts(ctx, id)
-	if err != nil {
-		return err
-	}
-	// No manifest references these chunks, so dropping them cannot make anything
-	// unreadable. A failure to drop leaks disk and is not worth failing the abort
-	// over — the client has already stopped caring about this upload.
-	for _, m := range stored {
-		c.dropChunks(ctx, m)
-	}
 	return c.meta.DeleteUpload(ctx, id)
-}
-
-// dropChunks removes every chunk a manifest names from every node that holds it.
-// Only ever called for manifests nothing can resolve.
-func (c *Coordinator) dropChunks(ctx context.Context, m object.Manifest) {
-	live := c.live.Load()
-	for _, ref := range m.Chunks {
-		for i, node := range m.Nodes {
-			id := ref.ID
-			if m.Coding != (ec.Scheme{}) {
-				id = ref.ShardID(i)
-			}
-			if err := c.drop(ctx, node, id, live); err != nil {
-				log.Printf("drop chunk %s from %s: %v", id, node, err)
-			}
-		}
-	}
 }

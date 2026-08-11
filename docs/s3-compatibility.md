@@ -4,13 +4,17 @@ Ceph's [`s3-tests`](https://github.com/ceph/s3-tests) is the suite S3 implementa
 against. It is an independent oracle in the strongest sense available: nobody involved in kavo chose
 what it asserts, and it encodes S3's behaviour as observed by people who had to match it.
 
-**151 of 886 pass. 641 fail, 94 the suite skips itself, and nothing errors** — every test reaches a
+**170 of 886 pass. 622 fail, 94 the suite skips itself, and nothing errors** — every test reaches a
 verdict rather than dying in setup. The pass count is not the interesting number on its own, because
 most of what the suite covers is deliberately absent here (see the locked subset in
 `docs/design.md`). What is interesting is the classification below: what fails because of an
 anti-goal, and what fails because of a gap.
 
-It used to be 169, and the 18 it lost are the most useful thing the suite produced. Every bucket
+It was 151 before `CopyObject`, and the 19 that operation added are the cheapest 19 in the suite: a
+copy is a manifest written under a second key, no chunk moves, and four encryption tests that had
+been failing in their setup got far enough to pass as well.
+
+Before that it was 169, and the 18 it lost are the most useful thing the suite produced. Every bucket
 subresource is a query on the bucket's own path — `?versioning`, `?acl`, `?lifecycle`, `?encryption`,
 `?policy`, `?tagging` — so a `PUT` to any of them reached the handler that creates a bucket and was
 answered with a 200. Those eighteen tests configure something and check that the call succeeded, and
@@ -64,19 +68,18 @@ running someone else's suite:
 
 It found no integrity failure: nothing in the suite got back bytes other than the ones it wrote.
 
-## Why the 641 fail
+## Why the 622 fail
 
 `docs/classify.py` produces this table from the suite's own failure list. Each test lands in exactly
-one family — the first that matches its name, in the order shown — so the counts sum to 641 rather
+one family — the first that matches its name, in the order shown — so the counts sum to 622 rather
 than counting an SSE copy twice. A test is filed under what it is about, which is not always what it
 died on: many of these never reach their assertion because a `ListObjects` v1 call or a
 `GetBucketVersioning` in their setup is refused first.
 
 | count | family | verdict |
 | --- | --- | --- |
-| 89 | server-side encryption (SSE-C, SSE-KMS) | anti-goal |
+| 122 | server-side encryption (SSE-C, SSE-KMS) | anti-goal |
 | 75 | ACLs, grants, and the public/private access matrix | anti-goal |
-| 66 | `CopyObject` and multipart copy | gap |
 | 47 | versioning: version ids, delete markers, suspend | anti-goal |
 | 46 | `ListObjects` v1 and its paging parameters | deliberate: v2 only |
 | 39 | bucket policy, public access block, ownership controls | anti-goal |
@@ -87,6 +90,7 @@ died on: many of these never reach their assertion because a `ListObjects` v1 ca
 | 28 | consequences of a bucket existing as soon as it is named | design, see below |
 | 26 | bucket and request logging | anti-goal |
 | 21 | SigV2 signing | anti-goal: SigV4 only |
+| 14 | `CopyObject` and multipart copy | gap, see below |
 | 13 | multipart upload edge cases | gap, see below |
 | 12 | CORS | anti-goal |
 | 10 | tagging | anti-goal |
@@ -102,21 +106,38 @@ died on: many of these never reach their assertion because a `ListObjects` v1 ca
 | 1 | website, torrent, select, notification, inventory, analytics, replication | anti-goal |
 | 1 | `GetBucketLocation` | suite artifact, see below |
 
-By verdict: **429 anti-goals, 48 v1 `ListObjects`, 28 consequences of buckets being prefixes, 135
+The encryption row grew by 37 without a line of kavo changing, and that is a correction rather than a
+regression: `test_copy_enc[...]` and `test_copy_part_enc[...]` pass a customer key or ask for SSE-S3,
+so no amount of copy support reaches them, but the rule that catches encryption tests matched `enc_`
+and not `enc[`. They had been counted as copy gaps. A classifier is only worth the numbers it
+produces, so it is filed here rather than quietly fixed.
+
+By verdict: **462 anti-goals, 48 v1 `ListObjects`, 28 consequences of buckets being prefixes, 83
 named gaps, and 1 artifact of the suite's own config.** The gap column is the one to read — it is the
-list of things a client might reasonably expect and not get, and two entries are most of it.
+list of things a client might reasonably expect and not get, and conditional requests are most of it.
 
 Anti-goals are listed in `docs/design.md` and are not defects: kavo is an object store with a locked
 S3 subset, not an S3 clone. The rows marked **gap** are things a client might reasonably expect that
 kavo does not do yet, and they are worth naming honestly:
 
-- **`CopyObject`** is the largest one. `aws s3 cp s3://a s3://b` and `aws s3 mv` need it, and it is
-  a server-side operation over data kavo already has — a manifest copy under a new key, with no
-  chunk movement at all, which is why it would be small to add and why chunk garbage collection has
-  to exist first: two keys would then name the same chunks.
+- **Multipart copy.** `CopyObject` itself now works — a manifest written under a second key, no
+  chunk movement, which is what makes `aws s3 mv` server-side. `UploadPartCopy`, which assembles a
+  new object out of ranges of existing ones, does not, and that is 7 of the 14 in the copy row.
+  Nothing about it is hard, since a part is already a manifest of chunk references, but a *range* of
+  a source object is not: it would have to re-chunk at the range boundaries, and re-chunking is the
+  one thing a copy currently never does.
 - **Conditional requests** (`If-Match`, `If-None-Match`, `If-Modified-Since`) are how clients cache
   and how they implement compare-and-swap on an object. Manifests carry an ETag and etcd carries a
-  revision, so the answer is available; nothing consumes it yet.
+  revision, so the answer is available; nothing consumes it yet. Two of the copy tests that *pass*
+  are here for the wrong reason: `test_copy_object_ifmatch_good` and
+  `test_copy_object_ifnonematch_failed` expect the copy to proceed, and kavo proceeds because it
+  ignores the condition. Their two mirror images, where the condition should have refused the copy,
+  fail. A header that is ignored rather than refused is the failure mode this whole document exists
+  to catch, and it is the reason the pass count is not the number to read.
+- **`x-amz-metadata-directive`** on a copy, which is `COPY` or `REPLACE`, and the three copy tests
+  that ask for it. `REPLACE` means the copy carries new user metadata, so it waits on the same
+  passthrough as the row below; it is also what makes a copy onto itself legal, which is why kavo
+  refuses that where S3 allows it.
 - **`Content-MD5`** is the one that fits the project's own thesis. A client that sends the header is
   asking the server to verify the bytes it received, kavo already computes that MD5 for the ETag as
   the body streams past, and a mismatch would simply mean never committing the manifest — so the
@@ -124,8 +145,8 @@ kavo does not do yet, and they are worth naming honestly:
 - **Re-completing a finished multipart upload** answers `NoSuchUpload` where S3 answers 200. A client
   whose completion response was lost retries and concludes the upload failed while the object is
   sitting there. Being idempotent means remembering which upload ids completed and what they
-  produced, and that record needs the same garbage collection the manifest compare-and-swap work is
-  waiting on, so it is deferred rather than half-built.
+  produced — a record with no reader other than a retry, which has to be reclaimed on some schedule
+  of its own. Collection reclaims chunks, not that.
 - **`x-amz-meta-*` user metadata** is stored for nothing today: kavo keeps `Content-Type` and drops
   the rest.
 
@@ -160,6 +181,12 @@ kavo claims:
 | family | passing |
 | --- | --- |
 | `ListObjectsV2`, all shapes | 37 of 40 |
+| single-object `CopyObject` | 10 of 22 |
 
-The three remaining are anonymous access, the `allow-unordered` extension, and an empty
+The three listing failures are anonymous access, the `allow-unordered` extension, and an empty
 `continuation-token` echoed back as an absent field rather than an empty one.
+
+The copy row counts the 22 copy tests that are not encryption, ACL, versioning or cross-tenant
+variants — those fail on the anti-goal, not on the copy. Its 12 failures are the three gaps above and
+nothing else: 7 multipart copy, 3 the metadata directive, 2 conditional. And 2 of the 10 passes are
+the accidents named above, so 8 is the honest count.

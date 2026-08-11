@@ -19,7 +19,9 @@ package test
 //
 // The workload speaks S3 with a real signature, because that is the surface a user
 // has, and because multipart upload only exists there: an upload spanning a crash
-// is a case no single-request test reaches.
+// is a case no single-request test reaches. It also copies objects server-side and
+// deletes some of the sources, which is how two keys come to name one set of chunks
+// while a sweep, a repair and a rebalance are all running under faults.
 
 import (
 	"bytes"
@@ -65,6 +67,9 @@ type write struct {
 	size      int
 	fill      byte
 	multipart bool
+	// viaCopy records that this object was made by copying another rather than by
+	// uploading, which the checker does not care about and the run's log does.
+	viaCopy bool
 	// acked is the promise. Only a 2xx sets it, and only after the whole request
 	// finished — a request whose outcome is unknown stays false, and an object
 	// that was never promised is allowed to be absent.
@@ -95,6 +100,14 @@ func TestChaos(t *testing.T) {
 		seed = time.Now().UnixNano()
 	}
 	t.Logf("chaos seed %d, duration %v (replay with -chaos.seed=%d)", seed, *chaosDuration, seed)
+
+	// Collection reclaims on a cycle, and at the shipped interval a whole run would
+	// finish inside one grace period — the sweep would never delete anything and the
+	// copies below would prove nothing. Ten seconds is still seven times the longest
+	// stall a fault here imposes (a freeze lasts at most 1.4s), which is the property
+	// grace exists for: no chunk is swept while the write that made it is still in
+	// flight. Whether the sweep really ran is checked below rather than assumed.
+	defer withCollect("1s", "10s")()
 
 	bin := buildKavod(t)
 	prefix := clusterPrefix()
@@ -208,6 +221,30 @@ func TestChaos(t *testing.T) {
 						t.Errorf("%s: %v", w.key, err)
 					}
 				}
+				// A fraction are copied server-side. This is the operation that
+				// makes two keys name one set of chunks, so it is the operation
+				// that decides whether anything may delete a chunk on the strength
+				// of a single manifest — and the source is a candidate for the
+				// delete below, which is the pairing that has to survive. The copy
+				// carries its source's size and fill, so the checker verifies its
+				// bytes with no extra machinery.
+				if entry.acked && rng.IntN(4) == 0 {
+					copied := entry
+					copied.key = fmt.Sprintf("w%d/copy%04d", w, i)
+					copied.viaCopy = true
+					_, err := clients[rng.IntN(len(clients))].CopyObject(ctx, &awss3.CopyObjectInput{
+						Bucket: aws.String(chaosBucket), Key: aws.String(copied.key),
+						CopySource: aws.String(chaosBucket + "/" + entry.key),
+					})
+					copied.acked = err == nil
+					if copied.acked {
+						mine = append(mine, copied)
+					}
+					mu.Lock()
+					history = append(history, copied)
+					mu.Unlock()
+				}
+
 				// A fraction are deleted again, so the history also covers keys
 				// that must be gone at the end rather than present.
 				if entry.acked && rng.IntN(5) == 0 {
@@ -227,7 +264,7 @@ func TestChaos(t *testing.T) {
 	stop()
 	faultsWG.Wait()
 
-	acked, deleted := 0, 0
+	acked, deleted, copies := 0, 0, 0
 	for _, w := range history {
 		if w.acked {
 			acked++
@@ -235,9 +272,27 @@ func TestChaos(t *testing.T) {
 		if w.deleted {
 			deleted++
 		}
+		if w.viaCopy {
+			copies++
+		}
 	}
-	t.Logf("history: %d writes, %d acknowledged, %d deleted again, %d reads during faults; %d faults injected:\n  %s",
-		len(history), acked, deleted, reads.Load(), len(faults), strings.Join(faults, "\n  "))
+	t.Logf("history: %d writes, %d acknowledged, %d of them server-side copies, %d deleted again, %d reads during faults; %d faults injected:\n  %s",
+		len(history), acked, copies, deleted, reads.Load(), len(faults), strings.Join(faults, "\n  "))
+
+	// A copy sharing its source's chunks only matters if something was trying to
+	// delete chunks at the time, and the only thing that deletes one is the sweep. So
+	// count what it took: nothing reclaimed means this run exercised the copies
+	// against an idle collector and the assertions below are weaker than they read.
+	// Only a run long enough to have swept is held to it — the default is 20s, which
+	// is two grace periods, and CI runs five minutes.
+	sweeps := 0
+	for _, n := range nodes {
+		sweeps += strings.Count(n.logs.String(), "collect: reclaimed")
+	}
+	t.Logf("the collector reclaimed on %d occasions during the run", sweeps)
+	if *chaosDuration >= time.Minute && sweeps == 0 {
+		t.Errorf("nothing was reclaimed in %v, so no copy here was tested against a sweep", *chaosDuration)
+	}
 	if acked == 0 {
 		t.Fatal("nothing was ever acknowledged: the workload never worked, so the invariants are vacuous")
 	}

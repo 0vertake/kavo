@@ -60,6 +60,10 @@ var (
 		"This server does not implement that operation."}
 	errBucketNotEmpty = apiError{"BucketNotEmpty", http.StatusConflict,
 		"The bucket still holds objects."}
+	errInvalidCopySource = apiError{"InvalidArgument", http.StatusBadRequest,
+		"The copy source must name a bucket and a key, and must not name a version."}
+	errCopyOntoItself = apiError{"InvalidRequest", http.StatusBadRequest,
+		"A copy onto the object itself would change nothing: there is no metadata here to rewrite."}
 )
 
 // authError maps a verification failure to the code that tells the client what to

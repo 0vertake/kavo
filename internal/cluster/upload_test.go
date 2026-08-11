@@ -65,6 +65,12 @@ func TestACompletionIsRefusedWhenPlacementMovedMidUpload(t *testing.T) {
 // An aborted upload's chunks are reclaimed. They are unreferenced the moment the
 // upload is forgotten, so leaving them would mean an interrupted 5 GB upload costs
 // 15 GB of disk until a human notices.
+//
+// The abort does not delete them itself. Nothing deletes a chunk except collection,
+// which reads every manifest in the cluster first, because since a copied object
+// shares its source's chunks there is no manifest that can be trusted on its own.
+// An upload abandoned rather than aborted leaves the same garbage and is reclaimed
+// by the same pass.
 func TestAbortReclaimsThePartsChunks(t *testing.T) {
 	tc := newCluster(t, 3)
 	driver := tc.nodes["n1"]
@@ -100,6 +106,7 @@ func TestAbortReclaimsThePartsChunks(t *testing.T) {
 	if err := driver.c.AbortUpload(ctx, id); err != nil {
 		t.Fatalf("abort: %v", err)
 	}
+	collectEverywhere(t, tc, 0)
 	for _, node := range m.Nodes {
 		for _, ref := range m.Chunks {
 			if tc.nodes[node].has(ref) {

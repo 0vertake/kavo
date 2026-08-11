@@ -11,9 +11,11 @@
 package s3
 
 import (
+	"encoding/xml"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -91,6 +93,11 @@ func (h *handler) putObject(w http.ResponseWriter, r *http.Request) {
 		h.uploadPart(w, r, id)
 		return
 	}
+	// A copy has no body, so it is answered before the length check below.
+	if source := r.Header.Get("X-Amz-Copy-Source"); source != "" {
+		h.copyObject(w, r, key, source)
+		return
+	}
 	// Without a length there is no way to tell a complete upload from a
 	// connection that died halfway, and S3 requires one.
 	if r.ContentLength < 0 {
@@ -111,6 +118,56 @@ func (h *handler) putObject(w http.ResponseWriter, r *http.Request) {
 	// the next instant and still read the object back.
 	w.Header().Set("ETag", etag(m))
 	w.WriteHeader(http.StatusOK)
+}
+
+// copyObject answers a PUT carrying X-Amz-Copy-Source: the destination becomes
+// another name for the source's chunks. Clients reach for it constantly — `aws s3 mv`
+// is a copy and a delete, and `aws s3 cp` between two keys never touches the network
+// with the object itself.
+func (h *handler) copyObject(w http.ResponseWriter, r *http.Request, key, source string) {
+	from, ok := copySource(source)
+	if !ok {
+		fail(w, r, errInvalidCopySource, nil)
+		return
+	}
+	// S3 refuses a copy onto itself, because the only thing it could mean is a
+	// metadata rewrite, and metadata is not something this store keeps to rewrite.
+	if from == key {
+		fail(w, r, errCopyOntoItself, nil)
+		return
+	}
+
+	m, err := h.cluster.Copy(r.Context(), from, key)
+	if err != nil {
+		fail(w, r, storeError(err), err)
+		return
+	}
+	writeXML(w, r, copyResult{ETag: etag(m), LastModified: m.Modified.UTC().Format(time.RFC3339)})
+}
+
+// copySource parses the header's "/bucket/key" or "bucket/key", either of which a
+// client may send, and either of which may be percent-encoded. A version id
+// suffix is refused rather than ignored: nothing here is versioned, so honouring a
+// request for one version by returning another would be a lie.
+func copySource(source string) (string, bool) {
+	if at := strings.IndexByte(source, '?'); at >= 0 {
+		return "", false
+	}
+	decoded, err := url.PathUnescape(strings.TrimPrefix(source, "/"))
+	if err != nil {
+		return "", false
+	}
+	bucket, key, found := strings.Cut(decoded, "/")
+	if !found || bucket == "" || key == "" {
+		return "", false
+	}
+	return bucket + "/" + key, true
+}
+
+type copyResult struct {
+	XMLName      xml.Name `xml:"CopyObjectResult"`
+	ETag         string
+	LastModified string
 }
 
 func (h *handler) getObject(w http.ResponseWriter, r *http.Request) {

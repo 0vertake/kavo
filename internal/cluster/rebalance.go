@@ -27,7 +27,6 @@ type RebalanceStats struct {
 	Misplaced int   // objects whose owners no longer match the ring
 	Moved     int   // objects re-placed and re-committed
 	Copies    int   // chunk copies written to a new owner
-	Dropped   int   // chunk copies deleted from a node that no longer owns them
 	Bytes     int64 // how much data that moved
 	Raced     int   // objects a client overwrote mid-move, left for the next pass
 	Failed    int   // objects that could not be moved, left where they were
@@ -45,8 +44,8 @@ func (c *Coordinator) RebalanceLoop(ctx context.Context, rate int64, interval ti
 		case err != nil:
 			log.Printf("rebalance: pass failed after %v: %v", time.Since(start), err)
 		case st.Moved > 0 || st.Raced > 0 || st.Failed > 0:
-			log.Printf("rebalance: moved %d of %d misplaced objects in %v (%d copies, %d bytes, %d dropped, %d raced, %d failed)",
-				st.Moved, st.Misplaced, time.Since(start), st.Copies, st.Bytes, st.Dropped, st.Raced, st.Failed)
+			log.Printf("rebalance: moved %d of %d misplaced objects in %v (%d copies, %d bytes, %d raced, %d failed)",
+				st.Moved, st.Misplaced, time.Since(start), st.Copies, st.Bytes, st.Raced, st.Failed)
 		}
 		if !sleep(ctx, interval) {
 			return
@@ -105,9 +104,9 @@ func (c *Coordinator) rebalanceObject(ctx context.Context, o meta.Object, st *Re
 	}
 	st.Misplaced++
 
-	// Copy first, commit second, delete third. Every reader in between resolves
-	// the old manifest and finds the old copies exactly where it expects them: at
-	// no point is the object readable only from nodes no manifest names.
+	// Copy, then commit. Every reader in between resolves the old manifest and
+	// finds the old copies exactly where it expects them: at no point is the object
+	// readable only from nodes no manifest names.
 	moved, bytes, err := c.copyToNewOwners(ctx, o, want, live, pace)
 	st.Copies += moved
 	st.Bytes += bytes
@@ -129,8 +128,11 @@ func (c *Coordinator) rebalanceObject(ctx context.Context, o meta.Object, st *Re
 	}
 	st.Moved++
 
-	// Only now is dropping the old copies safe: no manifest names them.
-	st.Dropped += c.dropFromFormerOwners(ctx, o, want, live)
+	// There is no third step. The copies this move superseded are left where they
+	// are for collection to reclaim, because "no manifest names them" is a question
+	// about every manifest in the cluster and this pass has read one. Since a copied
+	// object shares its source's chunks, the answer here would sometimes be wrong,
+	// and wrong in the direction of deleting an object nobody touched.
 	return nil
 }
 
@@ -215,50 +217,4 @@ func (c *Coordinator) moveShards(ctx context.Context, o meta.Object, want []stri
 		moved += int64(len(missing)) * shardSize(ref.Size, scheme)
 	}
 	return copies, moved, errors.Join(errs...)
-}
-
-// dropFromFormerOwners deletes the copies on nodes that no longer own the object.
-//
-// Failures are logged rather than returned: the object is already correctly
-// placed and committed, so a copy that could not be deleted is wasted disk, not
-// a durability problem. The next pass tries again.
-func (c *Coordinator) dropFromFormerOwners(ctx context.Context, o meta.Object, want []string, live *membership) int {
-	coded := o.Manifest.Coding != (ec.Scheme{})
-	dropped := 0
-	for _, ref := range o.Manifest.Chunks {
-		for i, node := range o.Manifest.Nodes {
-			if coded {
-				if i < len(want) && want[i] == node {
-					continue
-				}
-			} else if slices.Contains(want, node) {
-				continue
-			}
-			id := ref.ID
-			if coded {
-				id = ref.ShardID(i)
-			}
-			if err := c.drop(ctx, node, id, live); err != nil {
-				log.Printf("rebalance: %v", err)
-				continue
-			}
-			dropped++
-		}
-	}
-	return dropped
-}
-
-func (c *Coordinator) drop(ctx context.Context, node, id string, live *membership) error {
-	addr, member := live.peers[node]
-	switch {
-	case node == c.self:
-		return c.store.RemoveChunk(id)
-	case !member:
-		// A node that has left cannot be told to drop anything. Its disk is
-		// either gone or will be reclaimed when it rejoins and finds no manifest
-		// pointing at what it holds.
-		return nil
-	default:
-		return peer.DropChunk(ctx, addr, id)
-	}
 }
