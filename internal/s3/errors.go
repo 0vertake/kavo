@@ -101,6 +101,20 @@ func storeError(err error) apiError {
 	}
 }
 
+// writeXML sends a marshalled S3 response document.
+func writeXML(w http.ResponseWriter, r *http.Request, doc any) {
+	body, err := xml.Marshal(doc)
+	if err != nil {
+		fail(w, r, errInternal, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/xml")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)+len(xml.Header)))
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(xml.Header))
+	w.Write(body)
+}
+
 // fail writes an S3 error document. Nothing may have been written to w yet: a
 // response whose status is already sent cannot be turned into an error, which is
 // why every handler resolves what it needs before writing bytes.
