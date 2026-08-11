@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -230,6 +232,85 @@ func TestInvalidIDs(t *testing.T) {
 			t.Errorf("ReadChunk(%q) error = %v, want ErrInvalidID", id, err)
 		}
 	}
+}
+
+// A chunk arriving from a peer is copied to disk one buffer at a time, and each
+// buffer is a write syscall: at io.Copy's own 32 KB that is a thousand syscalls
+// for a 32 MB chunk, which halved write throughput under load. This pins the
+// property rather than the constant, by recording how much the store asks the
+// stream for at once.
+func TestStreamedChunksAreWrittenInBigPieces(t *testing.T) {
+	s := mustOpen(t)
+	data := make([]byte, 4<<20)
+	if _, err := rand.Read(data); err != nil {
+		t.Fatal(err)
+	}
+	crc := crc32.Checksum(data, castagnoli)
+
+	// Wrapped so it is only an io.Reader: a *bytes.Reader can write itself and
+	// would bypass the buffer, which is the case peers do not get.
+	r := &readSizes{r: bytes.NewReader(data)}
+	if err := s.WriteChunkVerified("stream", r, crc, int64(len(data))); err != nil {
+		t.Fatalf("WriteChunkVerified: %v", err)
+	}
+	if want := 256 << 10; r.largest < want {
+		t.Errorf("the largest read from the stream was %d bytes, want at least %d", r.largest, want)
+	}
+	// The other half of streaming: the buffer is bounded, so it cannot grow into
+	// holding a meaningful part of the chunk however big the chunk gets.
+	if bound := len(data) / 4; r.largest > bound {
+		t.Errorf("a %d-byte chunk was read %d bytes at a time, want at most %d", len(data), r.largest, bound)
+	}
+
+	got, err := readChunk(t, s, "stream", crc)
+	if err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("read back = (%d bytes, %v), want the %d bytes written", len(got), err, len(data))
+	}
+
+	// The declared length comes from another node, so it must not be able to ask
+	// this one for an allocation. A terabyte offered as five bytes gets rejected
+	// on its contents, but the buffer is bounded long before that.
+	liar := &readSizes{r: bytes.NewReader(data)}
+	if err := s.WriteChunkVerified("liar", liar, crc, 1<<40); !errors.Is(err, ErrVerificationFailed) {
+		t.Fatalf("WriteChunkVerified with a false length = %v, want ErrVerificationFailed", err)
+	}
+	if liar.largest > 256<<10 {
+		t.Errorf("a declared length of 1 TB got a %d-byte buffer", liar.largest)
+	}
+}
+
+// The buffer is sized to the chunk, so writing a five-byte chunk must not pay a
+// megabyte for it.
+func TestSmallChunksDoNotGetABigBuffer(t *testing.T) {
+	s := mustOpen(t)
+	data := []byte("small")
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	for i := range 8 {
+		r := &readSizes{r: bytes.NewReader(data)}
+		if _, _, err := s.WriteChunk(fmt.Sprintf("small%02d", i), r); err != nil {
+			t.Fatalf("WriteChunk: %v", err)
+		}
+	}
+	runtime.ReadMemStats(&after)
+
+	if grew := after.TotalAlloc - before.TotalAlloc; grew > 1<<20 {
+		t.Errorf("8 five-byte writes allocated %d bytes, want nowhere near a 1 MB buffer each", grew)
+	}
+}
+
+// readSizes is an io.Reader that hides whatever else its source can do, and
+// remembers the largest read it was asked for.
+type readSizes struct {
+	r       io.Reader
+	largest int
+}
+
+func (s *readSizes) Read(p []byte) (int, error) {
+	s.largest = max(s.largest, len(p))
+	return s.r.Read(p)
 }
 
 type failingReader struct{ err error }
