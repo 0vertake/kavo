@@ -16,7 +16,7 @@ lint:
 	@test -z "$$(gofmt -l .)" || (echo "gofmt needed on:" && gofmt -l . && exit 1)
 
 up:
-	docker compose -f deploy/compose.yaml up -d
+	docker compose -f deploy/compose.yaml up -d --build --wait
 
 down:
 	docker compose -f deploy/compose.yaml down -v
