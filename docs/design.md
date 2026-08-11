@@ -21,7 +21,14 @@ node is healed automatically — with published numbers behind each claim.
 1. Gateway streams the body in fixed chunks (default 32 MB), computing CRC32C per chunk and
    MD5 over the object (S3 ETag compatibility).
 2. Each chunk fans out to the N=3 nodes owning the object's partition; each node persists via
-   write temp → fsync file → rename → fsync directory, then acks.
+   write temp → fsync file → rename → fsync directory, then acks. One chunk is held in memory
+   so it can be sent to all owners from a single pass over the body — memory stays flat in
+   object size, which is the claim that matters, at a cost of one chunk per upload in flight.
+   The coordinator writes its own copy through the local store instead of over HTTP.
+   The fan-out waits for all N: the extra copy is the entire point of N > W, and a push
+   abandoned when the request ends would leave the object under-replicated until repair
+   noticed. Returning at W would cut tail latency but needs a background copy that outlives
+   the request, so it waits for a benchmark to justify it.
 3. After W=2 acks per chunk, and all chunks done, the gateway commits the object manifest
    (chunk list, locations, checksums, size, version) to etcd in one atomic `Put`. That is
    enough: etcd serializes it, so a concurrent overwrite of the same key resolves to one
@@ -32,9 +39,22 @@ node is healed automatically — with published numbers behind each claim.
 
 ### Read
 
-Resolve the committed manifest from etcd, stream chunks from any live replica (R=2 for
-freshness checks), verify CRC32C per chunk, return data or an explicit error. Readers never
-see uncommitted state, so torn objects are structurally impossible.
+Resolve the committed manifest from etcd, stream chunks from any live replica, verify CRC32C
+per chunk, return data or an explicit error. Readers never see uncommitted state, so torn
+objects are structurally impossible.
+
+**One replica is read, not R=2.** A quorum read exists to resolve disagreement between
+replicas, and there is nothing here to disagree about: chunks are immutable, and the manifest
+that names them is already the serialized truth in etcd. The chunk's checksum proves the copy
+is the right bytes, so reading a second copy would double the network cost to confirm what the
+first one already proved. Owners are tried in turn — a chunk that only reached W of N is
+genuinely absent from the rest, so a miss is expected rather than a fault — and this node's own
+copy is tried first, since it costs no round trip.
+
+The failover window closes once the first byte is on the wire. A replica that turns out to be
+corrupt mid-stream aborts the transfer instead of silently falling back, because the earlier
+bytes are already sent. That is the honest failure: an error, never a short body presented as
+complete.
 
 ### Inter-node chunk transfer
 
@@ -138,9 +158,12 @@ External validation: Ceph `s3-tests` via config file + tox; report the pass coun
   mismatch is found. The transfer then aborts short of the promised `Content-Length`, so the
   client always sees a failed transfer — but it may have received corrupt bytes. Verifying
   before sending would mean buffering a whole chunk per request. Same trade-off MinIO makes.
-- **Objects are readable only from the node that stored them, until fanout lands**: manifests
-  are cluster-wide in etcd, but chunks are still local, so another node resolves the manifest
-  and then cannot find the chunks. Replication (milestone 4) is what closes this.
+- **A degraded write stays degraded until repair runs**: acknowledging at W=2 of N=3 means the
+  third copy is genuinely missing, and nothing yet notices. Reads still succeed because owners
+  are tried in turn, but redundancy is below the configured level until milestone 6 restores it.
+- **Membership is a static flag**: every node is handed the same `-peers` list, so a node that
+  dies stays in the ring and a new one requires a restart everywhere. Nodes disagreeing about
+  the list would scatter chunks. etcd leases (milestone 5) make membership dynamic.
 - **Capacity is balanced to ~±8%, and vnodes cannot fix it**: 256 partitions over 6 nodes
   leaves a worst-case per-node deviation around 8% (measured above). The lever is more
   partitions, not more vnodes — but partition count is fixed for the life of a cluster, so
@@ -148,9 +171,10 @@ External validation: Ceph `s3-tests` via config file + tox; report the pass coun
 - **Killing a process is not killing a machine**: SIGKILL proves commit ordering and rename
   atomicity, but the page cache survives it, so the harness cannot prove fsync actually
   reached the platter. That needs power-loss or filesystem fault injection (milestone 10).
-- **Interrupted uploads leak chunks**: chunks committed before a crash whose manifest never
-  landed are unreachable and never reclaimed. Harmless but unbounded until a GC pass exists
-  (manifests are the only roots, so a mark-and-sweep is straightforward).
+- **Interrupted and refused uploads leak chunks**: chunks committed before a crash, or before a
+  write was refused for missing quorum, are unreachable and never reclaimed. Harmless but
+  unbounded until a GC pass exists (manifests are the only roots, so a mark-and-sweep is
+  straightforward).
 - **Metadata ceiling**: per-object manifests in etcd cap object count (etcd practical limit
   ~2–8 GB). Fine for the ~100 GB working set; the at-scale answer is volume/needle packing
   (SeaweedFS/Haystack).

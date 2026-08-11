@@ -24,6 +24,20 @@ func mustOpen(t *testing.T) (*store.Store, string) {
 	return s, root
 }
 
+// commitTo and fetchFrom place chunks on a local store, which is the simplest
+// backing there is; the cluster supplies replicated versions of the same pair.
+func commitTo(s *store.Store) func(ChunkRef, []byte) error {
+	return func(ref ChunkRef, data []byte) error {
+		return s.WriteChunkVerified(ref.ID, bytes.NewReader(data), ref.CRC, ref.Size)
+	}
+}
+
+func fetchFrom(s *store.Store) func(ChunkRef) (io.ReadCloser, error) {
+	return func(ref ChunkRef) (io.ReadCloser, error) {
+		return s.ReadChunk(ref.ID, ref.CRC)
+	}
+}
+
 func randBytes(n int) []byte {
 	b := make([]byte, n)
 	for i := range b {
@@ -51,7 +65,7 @@ func TestRoundTripChunkBoundaries(t *testing.T) {
 			s, _ := mustOpen(t)
 			data := randBytes(tc.size)
 
-			m, err := Write(s, bytes.NewReader(data), chunkSize)
+			m, err := Write(bytes.NewReader(data), chunkSize, commitTo(s))
 			if err != nil {
 				t.Fatalf("Write: %v", err)
 			}
@@ -63,7 +77,7 @@ func TestRoundTripChunkBoundaries(t *testing.T) {
 			}
 
 			var got bytes.Buffer
-			if err := Read(s, m, &got); err != nil {
+			if err := Read(m, &got, fetchFrom(s)); err != nil {
 				t.Fatalf("Read: %v", err)
 			}
 			if !bytes.Equal(got.Bytes(), data) {
@@ -79,7 +93,7 @@ func TestCorruptChunkFailsRead(t *testing.T) {
 	s, root := mustOpen(t)
 	data := randBytes(4096)
 
-	m, err := Write(s, bytes.NewReader(data), 1024)
+	m, err := Write(bytes.NewReader(data), 1024, commitTo(s))
 	if err != nil {
 		t.Fatalf("Write: %v", err)
 	}
@@ -95,7 +109,7 @@ func TestCorruptChunkFailsRead(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := Read(s, m, io.Discard); !errors.Is(err, store.ErrChecksumMismatch) {
+	if err := Read(m, io.Discard, fetchFrom(s)); !errors.Is(err, store.ErrChecksumMismatch) {
 		t.Fatalf("Read error = %v, want store.ErrChecksumMismatch", err)
 	}
 }
@@ -107,7 +121,7 @@ func TestWriteFailsMidStream(t *testing.T) {
 	boom := errors.New("client disconnected")
 	src := io.MultiReader(bytes.NewReader(randBytes(1500)), failingReader{err: boom})
 
-	m, err := Write(s, src, 1024)
+	m, err := Write(src, 1024, commitTo(s))
 	if !errors.Is(err, boom) {
 		t.Fatalf("Write error = %v, want %v", err, boom)
 	}
@@ -120,13 +134,13 @@ func TestWriteFailsMidStream(t *testing.T) {
 // byte count has to.
 func TestShortManifestFailsRead(t *testing.T) {
 	s, _ := mustOpen(t)
-	m, err := Write(s, bytes.NewReader(randBytes(4096)), 1024)
+	m, err := Write(bytes.NewReader(randBytes(4096)), 1024, commitTo(s))
 	if err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 	m.Chunks = m.Chunks[:len(m.Chunks)-1] // manifest still claims the full size
 
-	if err := Read(s, m, io.Discard); err == nil {
+	if err := Read(m, io.Discard, fetchFrom(s)); err == nil {
 		t.Fatal("Read succeeded on a manifest missing a chunk, want error")
 	}
 }
@@ -135,7 +149,7 @@ func TestMissingChunkFailsRead(t *testing.T) {
 	s, _ := mustOpen(t)
 	m := Manifest{Size: 1, Chunks: []ChunkRef{{ID: "nosuchchunk", Size: 1}}}
 
-	if err := Read(s, m, io.Discard); !errors.Is(err, store.ErrNotFound) {
+	if err := Read(m, io.Discard, fetchFrom(s)); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("Read error = %v, want store.ErrNotFound", err)
 	}
 }
@@ -159,11 +173,11 @@ func TestStreamingIsConstantMemory(t *testing.T) {
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
 
-	m, err := Write(s, io.LimitReader(zeroReader{}, objSize), chunkSize)
+	m, err := Write(io.LimitReader(zeroReader{}, objSize), chunkSize, commitTo(s))
 	if err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	if err := Read(s, m, io.Discard); err != nil {
+	if err := Read(m, io.Discard, fetchFrom(s)); err != nil {
 		t.Fatalf("Read: %v", err)
 	}
 

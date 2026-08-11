@@ -17,6 +17,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/0vertake/kavo/internal/cluster"
 	"github.com/0vertake/kavo/internal/meta"
 	"github.com/0vertake/kavo/internal/peer"
 	"github.com/0vertake/kavo/internal/store"
@@ -44,7 +45,14 @@ func newServerWithPrefix(t *testing.T, root, prefix string) *httptest.Server {
 	}
 	t.Cleanup(func() { m.Close() })
 
-	srv := httptest.NewServer(New(s, m, chunkSize))
+	// A cluster of one. Its own address is never dialled, because the
+	// coordinator writes local chunks through the store directly.
+	c, err := cluster.New("n1", map[string]string{"n1": "127.0.0.1:0"}, s, m, chunkSize)
+	if err != nil {
+		t.Fatalf("cluster.New: %v", err)
+	}
+
+	srv := httptest.NewServer(New(c, s))
 	t.Cleanup(srv.Close)
 	return srv
 }
