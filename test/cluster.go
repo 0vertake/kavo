@@ -56,6 +56,20 @@ const (
 // cap costs.
 var testRepairRate = "0"
 
+// testCollectGrace is how long these nodes leave an unreferenced chunk alone.
+//
+// It has to exceed the longest a single write in this suite takes, because a
+// chunk is durable before the manifest naming it is committed and for that window
+// nothing references it. Thirty seconds is far above any write here — the largest
+// is a few hundred kilobytes, and the multi-gigabyte measurement raises it — and
+// far below the hour a node uses in production. Collection runs in every process
+// test at that grace: a standing check that a sweep looking for garbage under a
+// concurrent workload, with faults arriving, never takes anything else.
+var (
+	testCollectGrace    = (30 * time.Second).String()
+	testCollectInterval = time.Second.String()
+)
+
 // clusterPrefix isolates a test's manifests in etcd. It has to be unique per
 // run: etcd outlives the test, so a reused prefix would resolve objects whose
 // chunks were left behind in a previous run's data directory.
@@ -136,6 +150,8 @@ func (n *node) start() {
 		// comes back" is observable in seconds or in minutes.
 		"-rebalance-interval", testRepairInterval.String(),
 		"-repair-rate", testRepairRate,
+		"-collect-interval", testCollectInterval,
+		"-collect-grace", testCollectGrace,
 	)
 	if n.erasure != "" {
 		n.cmd.Args = append(n.cmd.Args, "-ec", n.erasure)
