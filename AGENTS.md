@@ -24,7 +24,9 @@ not API surface. Full design and milestones: `docs/design.md`. Research notes wi
 - `make lint` — `go vet` + `gofmt` check
 - `go test ./test -run TestChaos` — the chaos suite: a concurrent S3 workload against four real
  processes while faults arrive at random, then the four invariants checked against the recorded
- history. `-chaos.duration` to run it longer, `-chaos.seed` to replay one. It runs at a short
+ history. `-chaos.duration` to run it longer, `-chaos.seed` to replay one, `-chaos.ec=4+2` to store
+ the workload erasure-coded instead of replicated — CI runs both, because the two modes fail
+ differently and running one proved the invariants for half the store. It runs at a short
  default as part of `make test`; run it long before believing a durability change.
 - `make demo` — six real processes on this host, an object, `SIGKILL` to one of its owners, and
  redundancy returning on its own. Every step is checked (digests compared, each node asked whether

@@ -10,10 +10,15 @@ node is healed automatically — with published numbers behind each claim.
 
 - **`kavod`** — the node daemon. Symmetric (MinIO-style): every node runs the S3 gateway,
   the local chunk store, and the repair participant. Any node can coordinate any request.
-- **`kavoctl`** — admin CLI: cluster status, layout changes, heal/scrub triggers.
-- **`kavo-chaos`** — chaos runner + invariant checker (milestone 10).
 - **etcd** — object manifests, membership (leases), partition layout. Single instance in dev.
 
+That is the whole of it, and two things planned here were deliberately not built. The chaos runner
+became a test (`test/chaos_test.go`) rather than a binary, because it has to start and kill real
+`kavod` processes and assert against a recorded history, which is what a test harness already does.
+And `kavoctl` has nothing left to do: cluster status is one HTTP GET on the internal port, and repair,
+scrub, rebalancing and collection are background passes with no button to press — a CLI that could
+trigger them would be a remote-control surface on an unauthenticated port, which is the one surface
+this design is otherwise careful to keep small.
 ## Data path
 
 ### Write (replicated mode)
@@ -691,6 +696,20 @@ implementation disagreeing is the only thing that catches a misreading.
   ten-second grace, still seven times the longest stall a fault here imposes — and counts what it
   reclaimed. A long run that reclaimed nothing fails: it would mean the copies had been tested
   against an idle collector, which is the version of this test that proves nothing.
+
+  It runs once per storage mode. `-chaos.ec=4+2` stores the same workload erasure-coded instead of
+  replicated, on a cluster one node wider than the code, and CI runs both. That gap was open for a
+  while and it was the wrong one to leave: the two modes fail differently — k+m shards at fixed
+  positions against N interchangeable copies, acknowledgement at k+1 shards against W copies, a lost
+  shard rebuilt from arithmetic over its siblings against a copy fetched from a peer — so a suite
+  that only ever ran replication was proving the four invariants for half the store. Every durability
+  bug found here has lived in a seam of exactly that shape. The coded run survives the same schedule,
+  including six wiped disks (up to 3,751 shards from one node in a five-minute run) and six flipped
+  bits, which means shards rebuilt by decode rather than copies fetched.
+
+  A run also checks that it stored what it was asked to store: if `-chaos.ec` is set and no manifest
+  came out coded, it fails rather than passing. Otherwise a mistyped flag would leave a green job
+  asserting nothing about the mode in its own name.
 
   Three things make it more than a smoke test.
 
