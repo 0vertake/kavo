@@ -10,6 +10,10 @@ most of what the suite covers is deliberately absent here (see the locked subset
 `docs/design.md`). What is interesting is the classification below: what fails because of an
 anti-goal, and what fails because of a gap.
 
+The count predates conditional reads and `Content-MD5` verification, which were added afterwards and
+can only move it upwards — the suite tests both. It is left as measured rather than estimated: the
+number in this document is always one somebody ran.
+
 It was 151 before `CopyObject`, and the 19 that operation added are the cheapest 19 in the suite: a
 copy is a manifest written under a second key, no chunk moves, and four encryption tests that had
 been failing in their setup got far enough to pass as well.

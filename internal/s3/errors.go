@@ -56,6 +56,12 @@ var (
 		"The authorization header is malformed."}
 	errBadDigest = apiError{"XAmzContentSHA256Mismatch", http.StatusBadRequest,
 		"The body does not match the checksum the request declared."}
+	errBadContentMD5 = apiError{"BadDigest", http.StatusBadRequest,
+		"the Content-MD5 you specified did not match what was received"}
+	errInvalidDigest = apiError{"InvalidDigest", http.StatusBadRequest,
+		"the Content-MD5 you specified is not a base64-encoded 128-bit digest"}
+	errPreconditionFailed = apiError{"PreconditionFailed", http.StatusPreconditionFailed,
+		"at least one of the preconditions you specified did not hold"}
 	errNotImplemented = apiError{"NotImplemented", http.StatusNotImplemented,
 		"This server does not implement that operation."}
 	errBucketNotEmpty = apiError{"BucketNotEmpty", http.StatusConflict,
@@ -93,7 +99,18 @@ func storeError(err error) apiError {
 	switch {
 	case errors.Is(err, meta.ErrNotFound):
 		return errNoSuchKey
+	case errors.Is(err, cluster.ErrBadDigest):
+		// The bytes arrived intact and were stored; what does not match is the
+		// digest the client declared for them. So this is the client's problem to
+		// fix and not one retrying will solve, and nothing was committed.
+		return errBadContentMD5
 	case errors.Is(err, cluster.ErrQuorum):
+		return errSlowDown
+	case errors.Is(err, meta.ErrNotWriting):
+		// This node lost etcd for longer than its membership lease while the upload
+		// was in flight, so the record keeping the upload's chunks alive was dropped
+		// and committing now would promise chunks that are being collected. The
+		// upload has to be repeated, which is what SlowDown asks a client to do.
 		return errSlowDown
 	case errors.Is(err, sigv4.ErrPayload), errors.Is(err, sigv4.ErrMismatch):
 		// The body failed its signature midway through being stored. The object
