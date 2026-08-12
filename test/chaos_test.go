@@ -42,7 +42,9 @@ import (
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
+	"github.com/0vertake/kavo/internal/cluster"
 	"github.com/0vertake/kavo/internal/meta"
+	"github.com/0vertake/kavo/internal/object"
 )
 
 var (
@@ -433,6 +435,15 @@ func waitWhole(ctx context.Context, nodes []*node, store *meta.Store, stall time
 	}
 }
 
+// wantOwners is how many nodes an object's chunks belong on: its own code's width,
+// or N for a replicated one, and never more nodes than the cluster has.
+func wantOwners(m object.Manifest, nodes int) int {
+	if m.Coding.Valid() {
+		return m.Coding.Shards()
+	}
+	return min(cluster.Replicas, nodes)
+}
+
 // missingCopies reports the copies a manifest names that are not on the node it
 // names, and whether the cluster was settled enough for that to mean anything.
 func missingCopies(ctx context.Context, byID map[string]*node, store *meta.Store, want int) (holes []string, settled bool) {
@@ -454,6 +465,19 @@ func missingCopies(ctx context.Context, byID map[string]*node, store *meta.Store
 	}
 
 	for _, o := range objects {
+		// Invariant 4 is about the configured level of redundancy, and a manifest
+		// is where an object's redundancy is promised. A write acknowledged while
+		// some of the cluster was unreachable promises fewer copies than the
+		// configuration asks for — correctly, at the time — and the rebalance pass
+		// is the only thing that widens it afterwards. Checking only that the
+		// promised copies exist calls two of two whole, which is how an object
+		// spent its whole life a copy short of its configuration with every check
+		// in this suite satisfied.
+		if want := wantOwners(o.Manifest, len(byID)); len(o.Manifest.Nodes) < want {
+			holes = append(holes, fmt.Sprintf("%s: placed on %s, want %d owners",
+				o.Key, strings.Join(o.Manifest.Nodes, ","), want))
+			continue
+		}
 		for _, ref := range o.Manifest.Chunks {
 			for i, id := range o.Manifest.Nodes {
 				owner, ok := byID[id]
@@ -466,7 +490,12 @@ func missingCopies(ctx context.Context, byID map[string]*node, store *meta.Store
 					want = ref.ShardID(i)
 				}
 				if !owner.hasChunk(want) {
-					holes = append(holes, fmt.Sprintf("%s: %s is missing chunk %s", o.Key, id, want))
+					// With the placement, because the number of nodes in it is the
+					// difference between a copy to rebuild and an object that never
+					// had a second copy to rebuild it from. Without it, a manifest
+					// naming one node looks exactly like two thirds of a heal.
+					holes = append(holes, fmt.Sprintf("%s: %s is missing chunk %s (placed on %s)",
+						o.Key, id, want, strings.Join(o.Manifest.Nodes, ",")))
 				}
 			}
 		}

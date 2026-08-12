@@ -32,6 +32,7 @@ func main() {
 	advertise := flag.String("advertise", "", "host:port other nodes should dial (default: -addr)")
 	dataDir := flag.String("data", "./data", "directory for chunks")
 	chunkSize := flag.Int64("chunk-size", object.DefaultChunkSize, "chunk size in bytes")
+	quorum := flag.Int("w", cluster.DefaultWriteQuorum, "distinct nodes that must have fsynced a chunk before the write is acknowledged; a write that cannot reach this many is refused")
 	etcd := flag.String("etcd", meta.EndpointFromEnv(), "comma-separated etcd endpoints for manifests")
 	prefix := flag.String("cluster", "/kavo", "etcd key prefix identifying this cluster")
 	leaseTTL := flag.Duration("lease-ttl", meta.DefaultLeaseTTL, "how long this node may go unheard before the cluster declares it dead")
@@ -76,6 +77,9 @@ func main() {
 		log.Fatal(err)
 	}
 	if err := c.EncodeWith(scheme); err != nil {
+		log.Fatal(err)
+	}
+	if err := c.AcknowledgeAt(*quorum); err != nil {
 		log.Fatal(err)
 	}
 	if err := m.Join(ctx, *id, self, *leaseTTL); err != nil {

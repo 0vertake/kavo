@@ -38,13 +38,11 @@ import (
 const (
 	// DefaultCollectInterval is how long a node waits between collection passes.
 	//
-	// A pass sweeps one of 32 slices of the id space, so a full cycle is 32 intervals.
-	// That is half of the answer to the question an operator actually asks — how long
-	// after a delete does the disk shrink? — and the grace period below is the other
-	// half and the larger one: nothing is reclaimed before it, so the wait is a grace
-	// period plus up to a cycle. A minute here makes the cycle half an hour, which is
-	// small next to the grace and cheap enough to pay for: the price of a pass is a
-	// scan of every manifest, so raising this trades space back for etcd reads.
+	// A pass sweeps one of 32 slices of the id space, so a full cycle is 32 intervals
+	// and that is most of the answer to the question an operator actually asks — how
+	// long after a delete does the disk shrink? A minute here makes it half an hour,
+	// plus the grace period below. The price of a pass is a scan of every manifest, so
+	// raising this trades space back for etcd reads.
 	//
 	// It is not longer because this pass is the only thing that deletes a chunk. A
 	// copied object shares its source's chunks, so no single manifest can be trusted
@@ -54,16 +52,22 @@ const (
 	// DefaultCollectGrace is how long an unreferenced chunk is left alone before
 	// it is treated as garbage.
 	//
-	// It has to exceed the longest gap between a chunk becoming durable and the
-	// manifest that references it being committed, because for that whole window
-	// a perfectly good chunk is referenced by nothing. For a single PUT that gap
-	// is one request. An hour is far longer than any request this store will
-	// finish, and the cost of being generous is only that garbage lives an hour
-	// longer than it had to.
+	// It used to be the whole defence of a write in flight, and it was an hour
+	// because a chunk is durable before the manifest naming it is committed and
+	// nobody knows how slow a client is. That was a guess about the outside world,
+	// and the wrong kind: S3 allows a single PUT of 5 GB, so a link slow enough
+	// beat it, and the write was acknowledged with its first chunks already
+	// collected.
 	//
-	// Zero is legal and means "no write is in flight", which is true of a test and
-	// of nothing else.
-	DefaultCollectGrace = time.Hour
+	// A write that can have more than one chunk now records itself before it stores
+	// any of them, and the sweep reads those records, so this defends only the gap
+	// between the last chunk of a *single*-chunk write and its commit — the tail of
+	// one request. A minute is enormous next to that, and it keeps garbage no more
+	// than a minute past the cycle that would have taken it.
+	//
+	// Zero is legal and means "trust the records completely", which is what the
+	// tests that sweep inside a write are asserting.
+	DefaultCollectGrace = time.Minute
 
 	// collectTask names this pass's cursor, which records the slice of the id
 	// space to sweep next.
@@ -87,6 +91,7 @@ type CollectStats struct {
 	Collected      int    // chunks no manifest named, and old enough to prove it
 	BytesCollected int64
 	Young          int // unreferenced, but inside the grace period and so left alone
+	Writing        int // unreferenced because the write that made them is still running
 }
 
 // CollectLoop reclaims unreferenced chunks until ctx is done, pausing between
@@ -127,7 +132,7 @@ func (c *Coordinator) Collect(ctx context.Context, grace time.Duration) (Collect
 	st := CollectStats{Slice: string(slice)}
 
 	start := time.Now()
-	referenced, err := c.referenced(ctx, slice)
+	referenced, writing, err := c.referenced(ctx, slice)
 	if err != nil {
 		return st, err
 	}
@@ -147,6 +152,12 @@ func (c *Coordinator) Collect(ctx context.Context, grace time.Duration) (Collect
 		st.Examined++
 		if _, live := referenced[ci.ID]; live {
 			st.Referenced++
+			return nil
+		}
+		// A write in flight names its chunks by prefix rather than one at a time,
+		// because it does not know yet how many there will be.
+		if inFlight(writing, ci.ID) {
+			st.Writing++
 			return nil
 		}
 		if ci.Modified.After(cutoff) {
@@ -193,8 +204,22 @@ func (c *Coordinator) Collect(ctx context.Context, grace time.Duration) (Collect
 // the metadata fits comfortably in etcd, which is a documented ceiling of its own;
 // if manifest reads ever dominate, the fix is an index from partition to keys so a
 // pass reads only the manifests that could name this node.
-func (c *Coordinator) referenced(ctx context.Context, slice byte) (map[string]struct{}, error) {
+func (c *Coordinator) referenced(ctx context.Context, slice byte) (map[string]struct{}, []string, error) {
 	referenced := make(map[string]struct{})
+
+	// Writes in flight before both scans below, and for the same kind of reason. A
+	// write's record is taken out before its first chunk is stored and removed after
+	// its manifest is committed, so reading it first means the handover cannot fall
+	// between the two: a write whose record was already gone had committed its
+	// manifest before this read, and the scans below come after it.
+	//
+	// Reading it at all is what keeps a slow upload's early chunks. Until it commits
+	// nothing names them, and by then they are older than any grace period worth
+	// having — a 5 GB PUT on a bad link takes hours.
+	writing, err := c.writesInFlight(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	// Parts before objects, which is the ordering that makes completing a
 	// multipart upload safe to race with. A part's chunks can be hours old by the
@@ -208,7 +233,7 @@ func (c *Coordinator) referenced(ctx context.Context, slice byte) (map[string]st
 	for {
 		parts, err := c.meta.ScanParts(ctx, from, scanPage)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if len(parts) == 0 {
 			break
@@ -225,7 +250,7 @@ func (c *Coordinator) referenced(ctx context.Context, slice byte) (map[string]st
 	for {
 		objects, err := c.meta.ScanObjects(ctx, "", from, scanPage)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if len(objects) == 0 {
 			break
@@ -235,7 +260,55 @@ func (c *Coordinator) referenced(ctx context.Context, slice byte) (map[string]st
 			from = meta.After(o.Key)
 		}
 	}
-	return referenced, nil
+	return referenced, writing, nil
+}
+
+// writesInFlight is the ids of the writes that are still running, and it drops the
+// records of the ones that are not.
+//
+// A record names the node coordinating the write, and a node that is no longer a
+// member is not coordinating anything: it crashed, or it cannot reach etcd, and
+// either way it cannot commit. So its record protects chunks that nothing will ever
+// name, and no other pass would remove it. Dropping it here is safe because the
+// commit is conditional on it — a writer that comes back to find its record gone
+// fails its write instead of acknowledging an object whose first chunks were
+// collected on the strength of this decision.
+func (c *Coordinator) writesInFlight(ctx context.Context) ([]string, error) {
+	writes, err := c.meta.Writing(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// An empty view is not the news that everyone died, it is a node that has not
+	// read the membership yet — a restart, one pass ahead of its first watch. Acting
+	// on it would refuse every write in the cluster, so it protects them instead.
+	// The same rule as a partial manifest scan: an answer that might be nothing at
+	// all deletes nothing at all.
+	members := c.live.Load().peers
+	unknown := len(members) == 0
+
+	ids := make([]string, 0, len(writes))
+	for id, node := range writes {
+		if _, live := members[node]; live || unknown {
+			ids = append(ids, id)
+			continue
+		}
+		if err := c.meta.DoneWriting(ctx, id); err != nil {
+			return nil, err
+		}
+	}
+	return ids, nil
+}
+
+// inFlight is whether a chunk belongs to one of the writes still running. A list
+// rather than a set: there are as many entries as there are large uploads happening
+// at this instant, which is a handful, and a prefix cannot be looked up in a map.
+func inFlight(writing []string, id string) bool {
+	for _, w := range writing {
+		if strings.HasPrefix(id, w) {
+			return true
+		}
+	}
+	return false
 }
 
 // reference adds the chunks m says this node holds, of those in the slice.
@@ -258,12 +331,16 @@ func (c *Coordinator) referenced(ctx context.Context, slice byte) (map[string]st
 // lost, but only because some copy of each chunk outlived the window: two passes
 // racing is not a durability argument.
 //
+// At the object's own redundancy rather than the width of the placement in front of
+// us, because a move that *widens* a narrow placement is the case where the two
+// differ, and its destination is exactly the owner the manifest does not name yet.
+//
 // This spares nothing the pass was written for. A copy a move left behind sits on a
 // node that lost the partition, so it is named by neither the manifest nor the ring.
 func (c *Coordinator) reference(referenced map[string]struct{}, key string, m object.Manifest, slice byte) {
 	mine := positionsOf(m.Nodes, c.self)
 	if key != "" {
-		want := c.live.Load().ring.Owners(ring.PartitionFor(key), len(m.Nodes))
+		want := c.live.Load().ring.Owners(ring.PartitionFor(key), redundancy(m))
 		mine = append(mine, positionsOf(want, c.self)...)
 	}
 	if len(mine) == 0 {

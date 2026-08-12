@@ -156,7 +156,7 @@ The gaps a client might actually notice are named in
 no `Content-MD5` verification, no `x-amz-meta-*` passthrough.
 
 Real limitations — an etcd-bound object count, rot that can sit until the next scrub, deleted space
-that takes about an hour and a half to come back because collection is the only thing that deletes a
+that takes about half an hour to come back because collection is the only thing that deletes a
 chunk — are listed with their consequences in
 [`docs/design.md`](docs/design.md#known-limitations-publish-these). They are published rather than
 fixed because a known limit is cheaper than a surprise.
@@ -179,5 +179,7 @@ test             crash-safety harness, aws CLI tests, and the chaos suite
 ```
 
 `make test` runs everything with `-race` (it starts etcd itself). `make bench` reproduces the
-numbers above. Architecture and milestones: [`docs/design.md`](docs/design.md). Research notes with
+numbers above. `make demo` is the shortest way to see the point of it: six nodes on this host, an
+object, `SIGKILL` to one of the nodes holding it, and three copies again a second or two later —
+with every step checked rather than narrated. Architecture and milestones: [`docs/design.md`](docs/design.md). Research notes with
 sources: [`docs/research.md`](docs/research.md).

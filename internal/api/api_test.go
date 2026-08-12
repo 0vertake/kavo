@@ -47,7 +47,14 @@ func newServerWithPrefix(t *testing.T, root, prefix string) *httptest.Server {
 
 	// A cluster of one. Its own address is never dialled, because the
 	// coordinator writes local chunks through the store directly.
+	//
+	// Acknowledging at one copy, because one node cannot do better and a write that
+	// cannot reach W nodes is refused rather than quietly accepted with fewer. These
+	// tests are about the HTTP surface over one store, not about replication.
 	c := cluster.New("n1", "127.0.0.1:0", s, m, chunkSize)
+	if err := c.AcknowledgeAt(1); err != nil {
+		t.Fatal(err)
+	}
 
 	srv := httptest.NewServer(New(c, s))
 	t.Cleanup(srv.Close)

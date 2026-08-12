@@ -377,3 +377,53 @@ func ownersOf(t testing.TB, tc *testCluster, key string, width int) []string {
 	}
 	return ids
 }
+
+// Redundancy has to come back for an object that never had it, not only for one
+// that lost it. A write is acknowledged at W copies, so a coordinator seeing two of
+// five nodes places on two and is right to accept it — but nothing afterwards was
+// widening that manifest to N, and the object sat one copy short of its
+// configuration forever. Nothing noticed, either: every check in this codebase asks
+// whether the copies a manifest names exist, and two of two is a full house.
+//
+// Repair cannot fix it, by design: it refuses to put a copy anywhere the manifest
+// does not already name, because that is rewriting placement. So this is
+// rebalancing's job, and the difference from the tests above is the direction —
+// they replace an owner, this one adds a third.
+func TestAWriteMadeOnASmallerRingIsWidenedBackToN(t *testing.T) {
+	tc := newCluster(t, 5)
+	const key = "written/while/most/of/the/cluster/was/away"
+
+	// Two members is the narrowest ring that can still take a write, since a
+	// coordinator that cannot reach W nodes refuses it outright.
+	tc.tellEveryone(tc.without("n3", "n4", "n5"))
+	data := randBytes(2 * testChunkSize)
+	m := mustPut(t, tc.nodes["n1"], key, data)
+	if len(m.Nodes) != cluster.DefaultWriteQuorum {
+		t.Fatalf("the write named %v; this test needs a placement narrower than N", m.Nodes)
+	}
+
+	tc.tellEveryone(tc.without())
+	want := ownersOf(t, tc, key, cluster.Replicas)
+	if st := mustRebalance(t, tc.nodes[want[0]], 0); st.Moved != 1 {
+		t.Fatalf("rebalance moved %d objects, want 1", st.Moved)
+	}
+
+	after, err := tc.nodes[want[0]].c.Resolve(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(after.Nodes, want) {
+		t.Fatalf("object still names %v, want N owners %v", after.Nodes, want)
+	}
+	// Named is not held: the manifest promising three copies is worth nothing if
+	// the third was never sent, and a read from that owner is how it is worth
+	// something.
+	for _, id := range after.Nodes {
+		if held := tc.nodes[id].holds(t, after.Chunks[0].ID); len(held) != 1 {
+			t.Errorf("owner %s names the object but does not hold its chunks", id)
+		}
+		if got := mustGet(t, tc.nodes[id], key); !bytes.Equal(got, data) {
+			t.Errorf("%s cannot serve the widened object", id)
+		}
+	}
+}

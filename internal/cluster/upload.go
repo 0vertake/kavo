@@ -81,11 +81,17 @@ func (c *Coordinator) UploadPart(ctx context.Context, id string, number int, bod
 		return "", err
 	}
 
-	m, err := c.write(ctx, u.Key, body, size)
+	m, writing, err := c.write(ctx, u.Key, body, size)
 	if err != nil {
 		return "", err
 	}
-	if err := c.meta.CommitPart(ctx, id, number, m); err != nil {
+	if writing == "" {
+		err = c.meta.CommitPart(ctx, id, number, m)
+	} else {
+		err = c.meta.CommitPartWhileWriting(ctx, id, number, m, writing)
+	}
+	c.stopWriting(ctx, writing)
+	if err != nil {
 		return "", err
 	}
 	return m.ETag, nil

@@ -12,8 +12,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"maps"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,15 +31,24 @@ import (
 const (
 	// Replicas (N) is how many nodes a chunk is placed on.
 	Replicas = 3
-	// WriteQuorum (W) is how many of those must have fsynced the chunk before
-	// the write may be acknowledged. W < N is what lets a write survive a node
-	// being down; repair restores the rest.
-	WriteQuorum = 2
+	// DefaultWriteQuorum (W) is how many of those must have fsynced the chunk
+	// before the write may be acknowledged. W < N is what lets a write survive a
+	// node being down; repair restores the rest.
+	//
+	// A default rather than a constant because W is the durability an operator is
+	// asking for, and one node running kavo can only be asking for one copy. What
+	// it is not is a function of how many nodes happen to be reachable — see the
+	// placement check in write.
+	DefaultWriteQuorum = 2
 )
 
 // ErrQuorum reports that a chunk did not reach enough nodes, so the write was
 // refused. No manifest is committed, so nothing partial becomes readable.
 var ErrQuorum = errors.New("cluster: write quorum not met")
+
+// ErrBadDigest says the body did not hash to the digest the client declared for
+// it, so the write was refused. Nothing was committed.
+var ErrBadDigest = errors.New("cluster: the body does not match the digest declared for it")
 
 // membership is an immutable snapshot of who is live and where they are, with the
 // ring that follows from it. Replacing it wholesale means a request always sees
@@ -58,6 +69,13 @@ type membership struct {
 // last one it was known at. Reading from a node that has left is safe because
 // chunks are immutable and checksum-verified — a stale address either answers with
 // the bytes the manifest names or fails.
+//
+// Which divides every peer call in this package: anything that wants *bytes* asks
+// here, and anything that hands bytes over or counts on them being somewhere uses
+// peers, since giving a copy to a node that has left, or calling one there a copy,
+// is the whole thing rebalancing exists to correct. The scrubber sat on the wrong
+// side of that line and left rot unrepaired whenever the good copies were on nodes
+// the cluster had dropped.
 func (m *membership) readAddr(node string) string {
 	return cmp.Or(m.peers[node], m.known[node])
 }
@@ -65,6 +83,7 @@ func (m *membership) readAddr(node string) string {
 // Coordinator handles client requests on behalf of the whole cluster.
 type Coordinator struct {
 	self      string
+	quorum    int
 	addr      string
 	live      atomic.Pointer[membership]
 	store     *store.Store
@@ -79,9 +98,24 @@ type Coordinator struct {
 // New builds a coordinator that initially knows only about itself. Callers feed
 // it the cluster's membership as etcd reports it.
 func New(self, addr string, s *store.Store, m *meta.Store, chunkSize int64) *Coordinator {
-	c := &Coordinator{self: self, addr: addr, store: s, meta: m, chunkSize: chunkSize}
+	c := &Coordinator{self: self, addr: addr, store: s, meta: m, chunkSize: chunkSize,
+		quorum: DefaultWriteQuorum}
 	c.SetMembers(nil)
 	return c
+}
+
+// AcknowledgeAt sets how many distinct nodes must have fsynced a chunk before the
+// write it belongs to may be acknowledged.
+//
+// Call it before serving requests, like EncodeWith and for the same reason. One is
+// the only honest setting for a single-node store, and it is honest about what it
+// gives up: nothing survives that node's disk.
+func (c *Coordinator) AcknowledgeAt(w int) error {
+	if w < 1 || w > Replicas {
+		return fmt.Errorf("cluster: write quorum %d is outside 1..%d", w, Replicas)
+	}
+	c.quorum = w
+	return nil
 }
 
 // EncodeWith switches new writes to an erasure code. The zero Scheme means
@@ -105,6 +139,26 @@ func (c *Coordinator) width() int {
 		return Replicas
 	}
 	return c.scheme.Shards()
+}
+
+// redundancy is how many nodes an object's chunks belong on.
+//
+// Read from the object rather than from this node's configuration, because an
+// object carries the code it was written with and a cluster can hold both kinds at
+// once: asking c.width() would target three nodes for a nine-shard object the
+// moment the coordinator was started in replication mode.
+//
+// It is not len(m.Nodes) either, which is the mistake this replaced. That reads the
+// object's redundancy off its current placement, so an object written while fewer
+// nodes were visible — acknowledged at W, correctly — asks the ring for as many
+// owners as it already has and stays a copy short of its configuration forever,
+// with nothing to notice it, since every other check asks only whether the copies a
+// manifest names are present.
+func redundancy(m object.Manifest) int {
+	if m.Coding.Valid() {
+		return m.Coding.Shards()
+	}
+	return Replicas
 }
 
 // SetMembers replaces this node's view of the cluster. Self is always included:
@@ -152,6 +206,11 @@ type PutOptions struct {
 	// hint for sizing the write buffer. Zero means "not declared", and nothing
 	// here is trusted for anything else.
 	Size int64
+	// MD5 is the hex digest the client declared for the body, or "" if it did
+	// not. A write whose bytes hash to something else is refused rather than
+	// committed: the client is saying it knows what it sent, and a store that
+	// accepted the other thing would have made a liar of one of them silently.
+	MD5 string
 }
 
 // Put streams an object into the cluster and returns its committed manifest.
@@ -160,14 +219,35 @@ type PutOptions struct {
 // at least W owners and the manifest is in etcd; before then the object does not
 // exist, however many chunks are already on disk.
 func (c *Coordinator) Put(ctx context.Context, key string, body io.Reader, opts PutOptions) (object.Manifest, error) {
-	m, err := c.write(ctx, key, body, opts.Size)
+	m, writing, err := c.write(ctx, key, body, opts.Size)
 	if err != nil {
 		return object.Manifest{}, err
 	}
+	// Before the commit, so a mismatch leaves an object that never existed rather
+	// than one the client has to delete. The chunks are already on disk — the
+	// digest is of the whole body, so there was nothing to compare until the last
+	// byte arrived — and they are unreferenced, which makes them collection's.
+	//
+	// Against the computed MD5 rather than the ETag below, since a caller may
+	// override that.
+	if opts.MD5 != "" && !strings.EqualFold(opts.MD5, m.ETag) {
+		c.stopWriting(ctx, writing)
+		return object.Manifest{}, fmt.Errorf("%w: declared %s, received %s", ErrBadDigest, opts.MD5, m.ETag)
+	}
+
 	m.ETag = cmp.Or(opts.ETag, m.ETag)
 	m.ContentType = opts.ContentType
 
-	if err := c.meta.Commit(ctx, key, m); err != nil {
+	if writing == "" {
+		err = c.meta.Commit(ctx, key, m)
+	} else {
+		err = c.meta.CommitWhileWriting(ctx, key, m, writing)
+	}
+	// After the commit, always: until the record is gone the sweep still treats
+	// this write's chunks as live, and a chunk protected by neither the record nor
+	// a manifest — even for an instant — is a chunk a sweep may take.
+	c.stopWriting(ctx, writing)
+	if err != nil {
 		return object.Manifest{}, err
 	}
 	return m, nil
@@ -178,10 +258,15 @@ func (c *Coordinator) Put(ctx context.Context, key string, body io.Reader, opts 
 // a caller commits a manifest that names them, which is what makes a torn object
 // impossible rather than unlikely.
 //
+// It also returns the id of the record it took out for itself, if it took one: a
+// write that can store more than one chunk says so in etcd before it stores any,
+// because until the commit nothing else says its chunks are wanted. The caller
+// commits under that record and clears it afterwards — see Put.
+//
 // Multipart upload is why this is separate from Put. A part's chunks are placed by
 // the final object's key so that completing the upload is a single manifest commit
 // — the parts are already where the object's manifest will say they are.
-func (c *Coordinator) write(ctx context.Context, key string, body io.Reader, expect int64) (object.Manifest, error) {
+func (c *Coordinator) write(ctx context.Context, key string, body io.Reader, expect int64) (object.Manifest, string, error) {
 	// One snapshot for the whole object: membership may change mid-upload, and
 	// spreading an object's chunks over two different rings would leave later
 	// chunks on nodes the manifest does not name.
@@ -189,15 +274,28 @@ func (c *Coordinator) write(ctx context.Context, key string, body io.Reader, exp
 	width := c.width()
 	owners := live.ring.Owners(ring.PartitionFor(key), width)
 	if len(owners) == 0 {
-		return object.Manifest{}, fmt.Errorf("cluster: no nodes available to place %q", key)
+		return object.Manifest{}, "", fmt.Errorf("cluster: no nodes available to place %q", key)
 	}
 	// A shard is identified by position, so a cluster smaller than the code has
-	// nowhere to put the rest. Replication can narrow to the nodes that exist;
-	// erasure coding cannot, and writing a chunk it can never rebuild would be
-	// worse than refusing it.
+	// nowhere to put the rest: writing a chunk it can never rebuild would be worse
+	// than refusing it.
 	if c.scheme != (ec.Scheme{}) && len(owners) < width {
-		return object.Manifest{}, fmt.Errorf("cluster: %s needs %d nodes, cluster has %d",
+		return object.Manifest{}, "", fmt.Errorf("cluster: %s needs %d nodes, cluster has %d",
 			c.scheme, width, len(owners))
+	}
+	// Replication does not narrow either, and that is the whole of invariant 1. A
+	// node whose peers have all lapsed still has a ring — itself — because a node is
+	// alive by definition and must not be written out of its own cluster. Placing on
+	// it alone acknowledges an object that one disk can take with it, which is what
+	// happened: with three of four nodes frozen, the survivor accepted writes with a
+	// single copy, and the wipe that followed destroyed them
+	// (TestAWriteThatCannotReachWNodesIsRefused, and the chaos seed in its comment).
+	// Refused before a byte is stored rather than after, since the answer cannot
+	// change once the placement is this narrow.
+	if c.scheme == (ec.Scheme{}) && len(owners) < c.quorum {
+		return object.Manifest{}, "", fmt.Errorf(
+			"%w: placing %q needs %d nodes, this node can see %d",
+			ErrQuorum, key, c.quorum, len(owners))
 	}
 
 	// The ETag is the object's MD5 because that is what S3 clients check an
@@ -215,7 +313,21 @@ func (c *Coordinator) write(ctx context.Context, key string, body io.Reader, exp
 	// Both only read the chunk, which is what makes this safe, and chunks are
 	// hashed in the order they are cut, which is what keeps the sum the object's.
 	sum := md5.New()
+	var writing string
 	m, err := object.Write(body, c.chunkSize, expect, func(ref *object.ChunkRef, data []byte) error {
+		// A write whose chunks will outlive the sweep's patience says so before it
+		// stores any of them. Only a write that can have a second chunk needs to:
+		// a chunk short of the chunk size is the last one, so its manifest is
+		// committed a moment after it is stored, and the window this closes does
+		// not exist. That is also why the ordinary small object pays nothing for
+		// this — it is one short chunk.
+		if writing == "" && int64(len(data)) == c.chunkSize {
+			writing = object.WriteID(ref.ID)
+			if err := c.meta.MarkWriting(ctx, writing, c.self); err != nil {
+				return err
+			}
+		}
+
 		hashed := make(chan struct{})
 		go func() {
 			defer close(hashed)
@@ -233,7 +345,11 @@ func (c *Coordinator) write(ctx context.Context, key string, body io.Reader, exp
 		return c.replicate(ctx, *ref, data, owners, live)
 	})
 	if err != nil {
-		return object.Manifest{}, err
+		// The record outlives the failure by a sweep at most: nothing will commit
+		// under it now, and leaving it would protect the chunks this write is
+		// abandoning. Clearing it is what makes them collectable.
+		c.stopWriting(ctx, writing)
+		return object.Manifest{}, "", err
 	}
 	m.Nodes = owners
 	m.Coding = c.scheme
@@ -243,7 +359,22 @@ func (c *Coordinator) write(ctx context.Context, key string, body io.Reader, exp
 	// finer resolution would have a HEAD and a listing disagree about when the same
 	// object was written.
 	m.Modified = time.Now().UTC().Truncate(time.Second)
-	return m, nil
+	return m, writing, nil
+}
+
+// stopWriting clears a write's record. A failure to clear it is logged and no more:
+// the object is already committed or already abandoned, so the client's answer does
+// not depend on this, and what is left behind is one small key that keeps some
+// chunks alive until the node stops being a member.
+func (c *Coordinator) stopWriting(ctx context.Context, writing string) {
+	if writing == "" {
+		return
+	}
+	// Not the request's context: it may already be cancelled, and that is exactly
+	// when leaving the record behind costs the most.
+	if err := c.meta.DoneWriting(context.WithoutCancel(ctx), writing); err != nil {
+		log.Printf("collect: write %s finished but its record remains: %v", writing, err)
+	}
 }
 
 // Delete removes an object, which is to say it removes the manifest: that is the
@@ -348,11 +479,13 @@ func (c *Coordinator) replicate(ctx context.Context, ref object.ChunkRef, data [
 			acks++
 		}
 	}
-	// A cluster smaller than W cannot promise W copies, so the requirement is
-	// every owner there is. Never acknowledge fewer copies than are available.
-	if want := min(WriteQuorum, len(owners)); acks < want {
+	// W copies on distinct nodes or none at all. This used to require only every
+	// owner there was, which reads as graceful degradation and behaves as data loss:
+	// see the placement check in write, which now refuses the narrow ring this was
+	// forgiving.
+	if acks < c.quorum {
 		return fmt.Errorf("%w: chunk %s reached %d of %d owners (needed %d): %w",
-			ErrQuorum, ref.ID, acks, len(owners), want, errors.Join(errs...))
+			ErrQuorum, ref.ID, acks, len(owners), c.quorum, errors.Join(errs...))
 	}
 	return nil
 }
