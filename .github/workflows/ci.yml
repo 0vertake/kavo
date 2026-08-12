@@ -44,7 +44,23 @@ jobs:
   # The chaos suite runs at a short default as part of make test. Here it runs
   # long, with the seed printed, because a durability guarantee is only worth the
   # number of faults it has survived.
+  #
+  # Once per storage mode, because the two fail differently: k+m shards at fixed
+  # positions against N interchangeable copies, acknowledgement at k+1 shards
+  # against W copies, a lost shard rebuilt from arithmetic against a copy fetched
+  # from a peer. Running only one of them proved the four invariants for half the
+  # store. 4+2 rather than the documented 6+3 so the cluster is seven processes
+  # instead of ten; the code paths are the same ones.
   chaos:
+    name: chaos (${{ matrix.mode }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: replicated
+            ec: ""
+          - mode: erasure-coded
+            ec: "4+2"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -52,4 +68,4 @@ jobs:
         with:
           go-version-file: go.mod
       - run: make etcd
-      - run: go test ./test -run TestChaos -race -v -timeout 20m -chaos.duration=5m
+      - run: go test ./test -run TestChaos -race -v -timeout 20m -chaos.duration=5m -chaos.ec=${{ matrix.ec }}

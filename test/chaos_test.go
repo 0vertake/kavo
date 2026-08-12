@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -52,6 +53,8 @@ var (
 		"how long the chaos workload runs before the invariants are checked")
 	chaosSeed = flag.Int64("chaos.seed", 0,
 		"seed for the fault schedule and workload; 0 picks one and logs it so a failure can be replayed")
+	chaosEC = flag.String("chaos.ec", "",
+		`store the workload's objects erasure-coded as "data+parity" (for example 4+2) instead of replicated`)
 )
 
 const (
@@ -101,7 +104,12 @@ func TestChaos(t *testing.T) {
 	if seed == 0 {
 		seed = time.Now().UnixNano()
 	}
-	t.Logf("chaos seed %d, duration %v (replay with -chaos.seed=%d)", seed, *chaosDuration, seed)
+	redundancy := fmt.Sprintf("%d replicas", cluster.Replicas)
+	if *chaosEC != "" {
+		redundancy = "erasure coded " + *chaosEC
+	}
+	t.Logf("chaos seed %d, duration %v, %s (replay with -chaos.seed=%d -chaos.ec=%q)",
+		seed, *chaosDuration, redundancy, seed, *chaosEC)
 
 	// Collection reclaims on a cycle, and at the shipped interval a whole run would
 	// finish inside one grace period — the sweep would never delete anything and the
@@ -118,7 +126,23 @@ func TestChaos(t *testing.T) {
 	// progress. Faults are applied to one node at a time for the same reason:
 	// refusing writes when quorum is genuinely unreachable is correct but proves
 	// nothing that TestWritesAreRefusedUntilMembershipCatchesUp does not.
-	nodes := startCluster(t, bin, prefix, chaosChunkSize, clusterSize)
+	// Replicated by default, because that is what a default deployment stores.
+	// -chaos.ec puts the same workload and the same four invariants against the
+	// other mode, and they are not the same failure modes: a chunk becomes k+m
+	// shards at fixed positions rather than N interchangeable copies, a write is
+	// acknowledged at k+1 shards rather than W of them, and a shard that is lost is
+	// rebuilt from arithmetic over its siblings rather than copied from a peer.
+	// Every durability bug this suite has found lived in a seam of exactly that
+	// shape, and until now it had only ever looked at one of the two.
+	size := clusterSize
+	if *chaosEC != "" {
+		// One node beyond what an object needs, for the reason replication runs
+		// with one beyond N: a single node down still leaves enough of the object
+		// to acknowledge a write, so the run measures a store under faults rather
+		// than a store refusing writes.
+		size = shardsIn(t, *chaosEC) + 1
+	}
+	nodes := startClusterCoded(t, bin, prefix, chaosChunkSize, size, *chaosEC)
 	clients := make([]*awss3.Client, len(nodes))
 	for i, n := range nodes {
 		clients[i] = s3Client(n.s3Addr)
@@ -301,6 +325,23 @@ func TestChaos(t *testing.T) {
 	if len(faults) < 3 {
 		t.Fatalf("only %d faults were injected; the run is too short to have tested anything", len(faults))
 	}
+	// The run stored what it was asked to store. A mistyped flag, or a daemon that
+	// ignored it, would otherwise give a green erasure-coding job that replicated
+	// everything — a whole CI job asserting nothing about the mode it names.
+	// Outliving ctx, which expired with the workload — like the heal barrier below.
+	stored, err := store.ScanObjects(context.WithoutCancel(ctx), "", "", 0)
+	if err != nil {
+		t.Fatalf("scan manifests: %v", err)
+	}
+	coded := 0
+	for _, o := range stored {
+		if o.Manifest.Coding.Valid() {
+			coded++
+		}
+	}
+	if want := *chaosEC != ""; want != (coded > 0) {
+		t.Fatalf("%d of %d objects are erasure coded, with -chaos.ec=%q", coded, len(stored), *chaosEC)
+	}
 
 	// Faults stop here. Every node comes back, because invariant 4 is about the
 	// cluster healing, not about it healing while being hit.
@@ -433,6 +474,21 @@ func waitWhole(ctx context.Context, nodes []*node, store *meta.Store, stall time
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
+}
+
+// shardsIn is how many nodes an object needs under a "data+parity" code. Parsed
+// here rather than shared with the daemon, because the daemon's parser is the thing
+// under test: a flag this suite accepted and kavod rejected would be a run that
+// never started, which is a failure either way.
+func shardsIn(t *testing.T, code string) int {
+	t.Helper()
+	data, parity, ok := strings.Cut(code, "+")
+	d, dErr := strconv.Atoi(data)
+	p, pErr := strconv.Atoi(parity)
+	if !ok || dErr != nil || pErr != nil || d < 1 || p < 1 {
+		t.Fatalf("-chaos.ec=%q is not in data+parity form, for example 4+2", code)
+	}
+	return d + p
 }
 
 // wantOwners is how many nodes an object's chunks belong on: its own code's width,
