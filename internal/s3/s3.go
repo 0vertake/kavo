@@ -11,6 +11,9 @@
 package s3
 
 import (
+	"crypto/md5"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/xml"
 	"fmt"
 	"log"
@@ -105,9 +108,18 @@ func (h *handler) putObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Before the body is read, because a digest that cannot be a digest is worth
+	// saying so about without first streaming a gigabyte to disk.
+	digest, err := contentMD5(r.Header.Get("Content-MD5"))
+	if err != nil {
+		fail(w, r, errInvalidDigest, err)
+		return
+	}
+
 	m, err := h.cluster.Put(r.Context(), key, r.Body, cluster.PutOptions{
 		ContentType: r.Header.Get("Content-Type"),
 		Size:        r.ContentLength,
+		MD5:         digest,
 	})
 	if err != nil {
 		fail(w, r, storeError(err), err)
@@ -188,6 +200,22 @@ func (h *handler) getObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Before the range, because a conditional request that fails is answered
+	// whole: a client asking for bytes 0-99 of an object it already has wants to
+	// hear that it already has it, not the bytes.
+	if status, ok := precondition(r, m); !ok {
+		if status == http.StatusNotModified {
+			// No body, and the validators it was tested against, so the client
+			// can go on using them. Not a fail(): 304 is a successful answer to
+			// the question that was asked.
+			validators(w.Header(), m)
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		fail(w, r, errPreconditionFailed, nil)
+		return
+	}
+
 	off, length, err := parseRange(r.Header.Get("Range"), m.Size)
 	if err != nil {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", m.Size))
@@ -196,8 +224,7 @@ func (h *handler) getObject(w http.ResponseWriter, r *http.Request) {
 	}
 
 	header := w.Header()
-	header.Set("ETag", etag(m))
-	header.Set("Last-Modified", m.Modified.Format(http.TimeFormat))
+	validators(header, m)
 	header.Set("Accept-Ranges", "bytes")
 	header.Set("Content-Length", strconv.FormatInt(length, 10))
 	if m.ContentType != "" {
@@ -254,6 +281,98 @@ func (h *handler) unsupported(w http.ResponseWriter, r *http.Request) {
 // etag is the ETag header's value: quoted, as clients compare it verbatim
 // including the quotes.
 func etag(m object.Manifest) string { return `"` + m.ETag + `"` }
+
+// validators writes the two headers a conditional request is answered against, so
+// that a 304 carries the same pair a 200 would and the client's next request can
+// use them.
+func validators(header http.Header, m object.Manifest) {
+	header.Set("ETag", etag(m))
+	header.Set("Last-Modified", m.Modified.Format(http.TimeFormat))
+}
+
+// precondition evaluates the conditional headers on a read against the committed
+// manifest, returning the status to answer with and whether the read may proceed.
+//
+// Answered from metadata alone, which is what makes it worth having: a client that
+// already holds the object pays one etcd read instead of the object's bytes, and
+// `aws s3 sync` asks this of every file it considers.
+//
+// The precedence is HTTP's, which S3 follows: an entity tag is a better answer than
+// a date, so If-Match beats If-Unmodified-Since and If-None-Match beats
+// If-Modified-Since. A failed If-Match is 412 because the client's assumption about
+// what it was reading is wrong; a matched If-None-Match is 304 because the client's
+// copy is current.
+func precondition(r *http.Request, m object.Manifest) (int, bool) {
+	tag := etag(m)
+	if want := r.Header.Get("If-Match"); want != "" {
+		if !matchesTag(want, tag) {
+			return http.StatusPreconditionFailed, false
+		}
+	} else if since, ok := httpDate(r.Header.Get("If-Unmodified-Since")); ok && modified(m).After(since) {
+		return http.StatusPreconditionFailed, false
+	}
+
+	if want := r.Header.Get("If-None-Match"); want != "" {
+		if matchesTag(want, tag) {
+			return http.StatusNotModified, false
+		}
+	} else if since, ok := httpDate(r.Header.Get("If-Modified-Since")); ok && !modified(m).After(since) {
+		return http.StatusNotModified, false
+	}
+	return http.StatusOK, true
+}
+
+// matchesTag reports whether a list of entity tags contains one, with "*" meaning
+// any. Weak tags are compared as strings: kavo only ever issues strong ones, so a
+// W/-prefixed tag in a request simply matches nothing.
+func matchesTag(header, tag string) bool {
+	for candidate := range strings.SplitSeq(header, ",") {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "*" || candidate == tag {
+			return true
+		}
+	}
+	return false
+}
+
+// modified is the object's Last-Modified as a client can see it. Truncated to the
+// second, because that is the resolution the header has: comparing the stored
+// nanoseconds against a date parsed from it would make an object appear modified
+// after the very timestamp it reported.
+func modified(m object.Manifest) time.Time { return m.Modified.Truncate(time.Second) }
+
+// httpDate parses one of the date-based conditional headers. An unparseable date is
+// ignored rather than rejected, which is what the HTTP spec requires.
+func httpDate(header string) (time.Time, bool) {
+	if header == "" {
+		return time.Time{}, false
+	}
+	t, err := http.ParseTime(header)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+// contentMD5 turns the Content-MD5 header into the hex digest the write path
+// computes as it streams, so the comparison is against the object's own ETag.
+//
+// S3 defines the header as exactly a base64-encoded 128-bit digest, and anything
+// else is InvalidDigest rather than a mismatch: the difference matters to a client,
+// which should retry one and fix the other.
+func contentMD5(header string) (string, error) {
+	if header == "" {
+		return "", nil
+	}
+	sum, err := base64.StdEncoding.DecodeString(header)
+	if err != nil {
+		return "", fmt.Errorf("s3: Content-MD5 %q is not base64: %w", header, err)
+	}
+	if len(sum) != md5.Size {
+		return "", fmt.Errorf("s3: Content-MD5 %q decodes to %d bytes, want %d", header, len(sum), md5.Size)
+	}
+	return hex.EncodeToString(sum), nil
+}
 
 // parseRange reads a Range header and returns the window it asks for, defaulting
 // to the whole object.

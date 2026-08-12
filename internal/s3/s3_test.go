@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"crypto/md5"
 	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -578,4 +580,147 @@ func md5sum(b []byte) []byte {
 	h := md5.New()
 	h.Write(b)
 	return h.Sum(nil)
+}
+
+// Conditional reads are how a client avoids paying for bytes it already has, and
+// `aws s3 sync` asks one of every file it considers. Answered from the committed
+// manifest, so the cost is an etcd read rather than the object.
+func TestConditionalReads(t *testing.T) {
+	client := newGateway(t)
+	data := randBytes(3 * testChunkSize)
+	put, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("conditional.bin"),
+		Body: bytes.NewReader(data),
+	})
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	tag := aws.ToString(put.ETag)
+
+	head, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("conditional.bin"),
+	})
+	if err != nil {
+		t.Fatalf("head: %v", err)
+	}
+	stored := aws.ToTime(head.LastModified)
+
+	tests := []struct {
+		name  string
+		in    awss3.GetObjectInput
+		want  int
+		bytes bool
+	}{
+		{name: "the tag the client holds is current", want: http.StatusNotModified,
+			in: awss3.GetObjectInput{IfNoneMatch: aws.String(tag)}},
+		{name: "the tag the client holds is stale", want: http.StatusOK, bytes: true,
+			in: awss3.GetObjectInput{IfNoneMatch: aws.String(`"0000"`)}},
+		{name: "the object is the one the client expects", want: http.StatusOK, bytes: true,
+			in: awss3.GetObjectInput{IfMatch: aws.String(tag)}},
+		{name: "the object is not the one the client expects", want: http.StatusPreconditionFailed,
+			in: awss3.GetObjectInput{IfMatch: aws.String(`"0000"`)}},
+		{name: "unchanged since the client last saw it", want: http.StatusNotModified,
+			in: awss3.GetObjectInput{IfModifiedSince: aws.Time(stored)}},
+		{name: "changed since the client last saw it", want: http.StatusOK, bytes: true,
+			in: awss3.GetObjectInput{IfModifiedSince: aws.Time(stored.Add(-time.Hour))}},
+		{name: "unmodified since a moment after it was stored", want: http.StatusOK, bytes: true,
+			in: awss3.GetObjectInput{IfUnmodifiedSince: aws.Time(stored.Add(time.Hour))}},
+		{name: "modified since the time the client demands", want: http.StatusPreconditionFailed,
+			in: awss3.GetObjectInput{IfUnmodifiedSince: aws.Time(stored.Add(-time.Hour))}},
+		// An entity tag is a better answer than a date, so it decides even when
+		// the date alone would have said otherwise. Both directions, because
+		// getting the precedence backwards passes one of them by luck.
+		{name: "a current tag outranks a date that says changed", want: http.StatusNotModified,
+			in: awss3.GetObjectInput{IfNoneMatch: aws.String(tag), IfModifiedSince: aws.Time(stored.Add(-time.Hour))}},
+		{name: "a matching tag outranks a date that says modified", want: http.StatusOK, bytes: true,
+			in: awss3.GetObjectInput{IfMatch: aws.String(tag), IfUnmodifiedSince: aws.Time(stored.Add(-time.Hour))}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := tt.in
+			in.Bucket, in.Key = aws.String("bucket"), aws.String("conditional.bin")
+			out, err := client.GetObject(t.Context(), &in)
+			if tt.want != http.StatusOK {
+				if got := httpStatus(err); got != tt.want {
+					t.Fatalf("get = %v (status %d), want status %d", err, got, tt.want)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			defer out.Body.Close()
+			got, err := io.ReadAll(out.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, data) {
+				t.Errorf("read %d bytes, want the %d written", len(got), len(data))
+			}
+		})
+	}
+}
+
+// A client that declares what it is sending is asking to be contradicted, and the
+// only useful answer is a refusal: an object stored under a digest it does not have
+// is corruption the client has been told is fine.
+//
+// The refusal has to be complete, which is the assertion below that matters. The
+// digest covers the whole body, so nothing can be compared until the last byte has
+// arrived and the chunks are already on disk — and if the manifest were committed
+// anyway, the client would be left deleting an object it was told had failed.
+func TestAWriteWhoseDigestDoesNotMatchIsRefusedEntirely(t *testing.T) {
+	client := newGateway(t)
+	data := randBytes(2 * testChunkSize)
+
+	_, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("misdeclared.bin"),
+		Body:       bytes.NewReader(data),
+		ContentMD5: aws.String(base64.StdEncoding.EncodeToString(md5sum(randBytes(16)))),
+	})
+	var api smithy.APIError
+	if !errors.As(err, &api) || api.ErrorCode() != "BadDigest" {
+		t.Fatalf("put = %v, want BadDigest", err)
+	}
+	if _, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("misdeclared.bin"),
+	}); httpStatus(err) != http.StatusNotFound {
+		t.Errorf("the refused write left an object behind: %v", err)
+	}
+
+	// And a digest that is not a digest is a different mistake: one the client
+	// should fix rather than retry.
+	_, err = client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("malformed.bin"),
+		Body:       bytes.NewReader(data),
+		ContentMD5: aws.String("not base64 at all"),
+	})
+	if !errors.As(err, &api) || api.ErrorCode() != "InvalidDigest" {
+		t.Fatalf("put with a malformed digest = %v, want InvalidDigest", err)
+	}
+}
+
+// The other half of the same promise: a client that declares the right digest is
+// not made to care that it did.
+func TestAWriteWhoseDigestMatchesIsStored(t *testing.T) {
+	client := newGateway(t)
+	data := randBytes(2 * testChunkSize)
+	if _, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("declared.bin"),
+		Body:       bytes.NewReader(data),
+		ContentMD5: aws.String(base64.StdEncoding.EncodeToString(md5sum(data))),
+	}); err != nil {
+		t.Fatalf("put with a matching digest: %v", err)
+	}
+	out, err := client.GetObject(t.Context(), &awss3.GetObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("declared.bin"),
+	})
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer out.Body.Close()
+	got, _ := io.ReadAll(out.Body)
+	if !bytes.Equal(got, data) {
+		t.Errorf("read %d bytes, want the %d written", len(got), len(data))
+	}
 }
