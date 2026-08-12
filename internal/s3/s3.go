@@ -110,7 +110,7 @@ func (h *handler) putObject(w http.ResponseWriter, r *http.Request) {
 
 	// Before the body is read, because a digest that cannot be a digest is worth
 	// saying so about without first streaming a gigabyte to disk.
-	digest, err := contentMD5(r.Header.Get("Content-MD5"))
+	digest, err := contentMD5(r.Header.Values("Content-MD5"))
 	if err != nil {
 		fail(w, r, errInvalidDigest, err)
 		return
@@ -147,6 +147,24 @@ func (h *handler) copyObject(w http.ResponseWriter, r *http.Request, key, source
 	if from == key {
 		fail(w, r, errCopyOntoItself, nil)
 		return
+	}
+
+	// Conditions on the source. Answered here rather than inside Copy because they
+	// are a question about a manifest, and they cost an etcd read only when a client
+	// asks one.
+	if conditions := copyConditions(r.Header); len(conditions) > 0 {
+		src, err := h.cluster.Resolve(r.Context(), from)
+		if err != nil {
+			fail(w, r, storeError(err), err)
+			return
+		}
+		if _, ok := precondition(conditions, src); !ok {
+			// A copy has no "you already have it" outcome, so a condition that
+			// does not hold is 412 whichever kind it was — where the same
+			// condition on a read would have been answered 304.
+			fail(w, r, errPreconditionFailed, nil)
+			return
+		}
 	}
 
 	m, err := h.cluster.Copy(r.Context(), from, key)
@@ -203,7 +221,7 @@ func (h *handler) getObject(w http.ResponseWriter, r *http.Request) {
 	// Before the range, because a conditional request that fails is answered
 	// whole: a client asking for bytes 0-99 of an object it already has wants to
 	// hear that it already has it, not the bytes.
-	if status, ok := precondition(r, m); !ok {
+	if status, ok := precondition(r.Header, m); !ok {
 		if status == http.StatusNotModified {
 			// No body, and the validators it was tested against, so the client
 			// can go on using them. Not a fail(): 304 is a successful answer to
@@ -302,24 +320,42 @@ func validators(header http.Header, m object.Manifest) {
 // If-Modified-Since. A failed If-Match is 412 because the client's assumption about
 // what it was reading is wrong; a matched If-None-Match is 304 because the client's
 // copy is current.
-func precondition(r *http.Request, m object.Manifest) (int, bool) {
+func precondition(header http.Header, m object.Manifest) (int, bool) {
 	tag := etag(m)
-	if want := r.Header.Get("If-Match"); want != "" {
+	if want := header.Get("If-Match"); want != "" {
 		if !matchesTag(want, tag) {
 			return http.StatusPreconditionFailed, false
 		}
-	} else if since, ok := httpDate(r.Header.Get("If-Unmodified-Since")); ok && modified(m).After(since) {
+	} else if since, ok := httpDate(header.Get("If-Unmodified-Since")); ok && modified(m).After(since) {
 		return http.StatusPreconditionFailed, false
 	}
 
-	if want := r.Header.Get("If-None-Match"); want != "" {
+	if want := header.Get("If-None-Match"); want != "" {
 		if matchesTag(want, tag) {
 			return http.StatusNotModified, false
 		}
-	} else if since, ok := httpDate(r.Header.Get("If-Modified-Since")); ok && !modified(m).After(since) {
+	} else if since, ok := httpDate(header.Get("If-Modified-Since")); ok && !modified(m).After(since) {
 		return http.StatusNotModified, false
 	}
 	return http.StatusOK, true
+}
+
+// copyConditions translates the x-amz-copy-source-if-* headers into the plain
+// conditional ones, so that a copy's conditions are evaluated by the rules above
+// rather than by a second implementation of them that drifts from the first.
+func copyConditions(header http.Header) http.Header {
+	var conditions http.Header
+	for _, name := range []string{"If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since"} {
+		value := header.Get("X-Amz-Copy-Source-" + name)
+		if value == "" {
+			continue
+		}
+		if conditions == nil {
+			conditions = http.Header{}
+		}
+		conditions.Set(name, value)
+	}
+	return conditions
 }
 
 // matchesTag reports whether a list of entity tags contains one, with "*" meaning
@@ -360,10 +396,14 @@ func httpDate(header string) (time.Time, bool) {
 // S3 defines the header as exactly a base64-encoded 128-bit digest, and anything
 // else is InvalidDigest rather than a mismatch: the difference matters to a client,
 // which should retry one and fix the other.
-func contentMD5(header string) (string, error) {
-	if header == "" {
+func contentMD5(values []string) (string, error) {
+	// Presence rather than emptiness, because the two mean different things: no
+	// header declares nothing, and an empty header declares an empty digest, which
+	// is malformed. It falls through to the length check below and is refused.
+	if len(values) == 0 {
 		return "", nil
 	}
+	header := values[0]
 	sum, err := base64.StdEncoding.DecodeString(header)
 	if err != nil {
 		return "", fmt.Errorf("s3: Content-MD5 %q is not base64: %w", header, err)

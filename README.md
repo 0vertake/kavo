@@ -113,20 +113,22 @@ acknowledge one it cannot make durable.
 ## How compatible is compatible
 
 Ceph's `s3-tests` is the suite S3 implementations are measured against, and nobody here chose what it
-asserts. It has 886 tests and kavo does not implement most of what they cover, on purpose. Of the 622
+asserts. It has 886 tests and kavo does not implement most of what they cover, on purpose. Of the 613
 that fail: **462 are explicit anti-goals** — ACLs, versioning, server-side encryption, object lock,
 bucket policy, lifecycle, logging, CORS, tagging, SigV2, browser form uploads — **48 are v1
 `ListObjects`**, which kavo answers only at v2, and **28 follow from buckets being prefixes** rather
-than records. **83 are named gaps**, a third of them conditional requests. One is the suite asserting
-Ceph's own configured region name.
+than records. **24 are conditional writes**, which would make the commit a compare-and-set and so
+need arguing for rather than adding. **50 are named gaps**, half of them multipart copy and multipart
+edge cases. One is the suite asserting Ceph's own configured region name.
 
-With that framing: **170 pass, 622 fail, 94 the suite skips, and nothing errors** — every test
+With that framing: **179 pass, 613 fail, 94 the suite skips, and nothing errors** — every test
 reaches a verdict rather than dying in setup, and every failure is accounted for in
 [`docs/s3-compatibility.md`](docs/s3-compatibility.md), which generates its breakdown from the
 suite's own output so it can be checked rather than believed. Of the tests covering the operations
-kavo does claim, 37 of 40 `ListObjectsV2` tests pass, and 10 of 22 single-object copy tests — two of
-those ten only because kavo ignores `x-amz-copy-source-if-match` rather than honouring it, which is
-the kind of pass worth subtracting out loud.
+kavo does claim, 37 of 40 `ListObjectsV2` tests pass, 12 of 23 single-object copy tests, and 12 of 12
+conditional reads. Two of those copy passes used to be hollow — kavo ignored
+`x-amz-copy-source-if-match` rather than honouring it — which is the kind of pass worth subtracting
+out loud, and it is now honoured.
 
 Two of those numbers moved for reasons worth separating. Nineteen passes came from adding
 `CopyObject`, which is a real operation clients use. Thirty-seven failures moved from the gap column

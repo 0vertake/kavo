@@ -724,3 +724,87 @@ func TestAWriteWhoseDigestMatchesIsStored(t *testing.T) {
 		t.Errorf("read %d bytes, want the %d written", len(got), len(data))
 	}
 }
+
+// A copy takes its conditions on the source, not on the destination, which keeps
+// them read-side: they are a question about the manifest being copied and need
+// nothing from the commit. `aws s3 sync` between two buckets sends them.
+//
+// The answer differs from a read's in one way, and it is the whole reason this is
+// tested separately: a copy has no "you already have it" outcome, so a condition
+// that does not hold is 412 even where the same condition on a GET would have been
+// answered 304.
+func TestConditionalCopies(t *testing.T) {
+	client := newGateway(t)
+	data := randBytes(2 * testChunkSize)
+	put, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("source.bin"),
+		Body: bytes.NewReader(data),
+	})
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	tag := aws.ToString(put.ETag)
+
+	tests := []struct {
+		name string
+		in   awss3.CopyObjectInput
+		want int
+	}{
+		{name: "the source is the one the client expects", want: http.StatusOK,
+			in: awss3.CopyObjectInput{CopySourceIfMatch: aws.String(tag)}},
+		{name: "the source is not the one the client expects", want: http.StatusPreconditionFailed,
+			in: awss3.CopyObjectInput{CopySourceIfMatch: aws.String(`"0000"`)}},
+		{name: "the client's copy of the source is stale", want: http.StatusOK,
+			in: awss3.CopyObjectInput{CopySourceIfNoneMatch: aws.String(`"0000"`)}},
+		{name: "the client already has this source", want: http.StatusPreconditionFailed,
+			in: awss3.CopyObjectInput{CopySourceIfNoneMatch: aws.String(tag)}},
+		{name: "the source is older than the client demands", want: http.StatusPreconditionFailed,
+			in: awss3.CopyObjectInput{CopySourceIfModifiedSince: aws.Time(time.Now().Add(time.Hour))}},
+		{name: "the source is older than the client requires", want: http.StatusOK,
+			in: awss3.CopyObjectInput{CopySourceIfUnmodifiedSince: aws.Time(time.Now().Add(time.Hour))}},
+	}
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := tt.in
+			in.Bucket, in.Key = aws.String("bucket"), aws.String(fmt.Sprintf("copy%d.bin", i))
+			in.CopySource = aws.String("bucket/source.bin")
+			_, err := client.CopyObject(t.Context(), &in)
+			if tt.want != http.StatusOK {
+				if got := httpStatus(err); got != tt.want {
+					t.Fatalf("copy = %v (status %d), want status %d", err, got, tt.want)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("copy: %v", err)
+			}
+			out, err := client.GetObject(t.Context(), &awss3.GetObjectInput{
+				Bucket: in.Bucket, Key: in.Key,
+			})
+			if err != nil {
+				t.Fatalf("get the copy: %v", err)
+			}
+			defer out.Body.Close()
+			got, _ := io.ReadAll(out.Body)
+			if !bytes.Equal(got, data) {
+				t.Errorf("the copy is %d bytes of something else, want the %d copied", len(got), len(data))
+			}
+		})
+	}
+}
+
+// An empty Content-MD5 is not a missing one: the client said it was declaring a
+// digest and then declared nothing. S3 calls that InvalidDigest, and treating it as
+// "no digest was sent" would store an object under a promise nobody made.
+func TestAnEmptyDeclaredDigestIsRefused(t *testing.T) {
+	client := newGateway(t)
+	_, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("empty-digest.bin"),
+		Body:       bytes.NewReader(randBytes(64)),
+		ContentMD5: aws.String(""),
+	})
+	var api smithy.APIError
+	if !errors.As(err, &api) || api.ErrorCode() != "InvalidDigest" {
+		t.Fatalf("put with an empty digest = %v, want InvalidDigest", err)
+	}
+}
