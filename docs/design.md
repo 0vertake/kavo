@@ -493,13 +493,23 @@ added for the same reason the six were:
   `If-Modified-Since`. A failed `If-Match` is 412 because the client's belief about what it is
   reading is wrong; a matched `If-None-Match` is 304 because its copy is current, and carries the
   same validators a 200 would.
+
+  The same four arrive on a copy as `x-amz-copy-source-if-*`, where they are conditions on the
+  *source* — still a question about a manifest, still nothing to do with the commit. They are
+  answered by translating them into the plain headers and running the rules above, rather than by a
+  second implementation that drifts from the first, with one difference in the answer: a copy has no
+  "you already have it" outcome to report, so an unmet condition is 412 whichever kind it was, where
+  a read would have said 304. Ceph's suite disagreed with the first version of this, which had
+  returned 304 for a copy nobody asked to be told about.
 - **`Content-MD5`.** A client declaring what it sent is asking to be contradicted, and the only
   useful answer is a refusal — an object stored under a digest it does not have is corruption the
   client has been told is fine. Checked before the manifest commits, so the write is refused
   *entirely*: the digest covers the whole body, so the chunks are already on disk when the answer is
   known, and they are left unreferenced for collection rather than committed and left for the client
   to delete. A malformed digest is `InvalidDigest` and a mismatch is `BadDigest`, because one is the
-  client's bug and the other may be the network's.
+  client's bug and the other may be the network's. An *empty* `Content-MD5` is malformed rather than
+  absent: the client said it was declaring a digest and then declared none, and reading that as "no
+  digest was sent" would store the object under a promise nobody made.
 
 Conditional *writes* are deliberately not here. `If-None-Match: *` on a PUT means "create only if
 absent", which needs the manifest commit to be a compare-and-set rather than a `Put`, and that is a
@@ -512,13 +522,14 @@ empties a bucket by listing versions and bulk-deleting what it finds. None of th
 new: a bucket is still a prefix, and the version listing reports every object once with the id
 `null`, which is S3's own answer for a bucket that was never versioned.
 
-External validation: Ceph `s3-tests`. **151 of 886 pass, nothing errors**, and every failure is
+External validation: Ceph `s3-tests`. **179 of 886 pass, nothing errors**, and every failure is
 classified in `docs/s3-compatibility.md` — as an anti-goal, a consequence of buckets being prefixes,
 or a named gap. The suite found four real defects, three of which kavo's own tests could not see;
 they are listed there too. It also found eighteen passes that were not real: a `PUT` to any bucket
 subresource reached the create-bucket handler and answered 200, so kavo was claiming to have
 configured lifecycle rules, policies and encryption it has no code for. Refusing them is what took
-the count from 169 to 151.
+the count from 169 to 151, and `CopyObject`, conditional reads and `Content-MD5` are what took it
+back to 179.
 
 ### Object API
 
