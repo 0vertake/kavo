@@ -91,7 +91,11 @@ func (c *Coordinator) rebalanceObject(ctx context.Context, o meta.Object, st *Re
 	}
 	st.Objects++
 
-	want := live.ring.Owners(ring.PartitionFor(o.Key), len(o.Manifest.Nodes))
+	// The object's own redundancy, so this pass widens as well as moves: a write
+	// acknowledged while fewer nodes were visible names fewer nodes, and only this
+	// pass can add the owner it is missing — repair will not put a copy anywhere the
+	// manifest does not already name.
+	want := live.ring.Owners(ring.PartitionFor(o.Key), redundancy(o.Manifest))
 	if len(want) < len(o.Manifest.Nodes) {
 		// The cluster is smaller than the object's redundancy. Moving it now
 		// would commit a manifest promising fewer copies than the object was

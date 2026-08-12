@@ -477,3 +477,104 @@ func placeChunks(t testing.TB, n *node, m object.Manifest, data []byte) {
 		at += ref.Size
 	}
 }
+
+// A write's chunks are unreferenced until its manifest commits, and the sweep's
+// only defence for them is their age. So the hazard is a write that takes longer
+// than the grace period: its first chunks are old, nothing names them yet, and a
+// sweep in the middle of the upload is entitled to take them. S3 allows a single
+// PUT of 5 GB, and a client slow enough to need an hour for it is a bad link
+// rather than a bad actor.
+//
+// Made deterministic rather than slow: the body runs a whole collection cycle
+// between two chunks, with a zero grace, which is every sweep a real upload could
+// meet compressed into the worst possible one.
+func TestASweepInsideAWriteLeavesItAlone(t *testing.T) {
+	for _, declared := range []bool{true, false} {
+		name := "length declared"
+		if !declared {
+			name = "length unknown"
+		}
+		t.Run(name, func(t *testing.T) {
+			tc := newCluster(t, 3)
+			data := randBytes(3 * testChunkSize)
+
+			swept := false
+			body := &sweepingReader{r: bytes.NewReader(data), at: testChunkSize + 1, sweep: func() {
+				swept = true
+				collectEverywhere(t, tc, 0)
+			}}
+
+			// The declared size is the client's Content-Length, and it is what
+			// tells a write up front that it will store more than one chunk.
+			// Zero is the case where it does not know: an aws-chunked upload,
+			// or a client that lied.
+			var opts cluster.PutOptions
+			if declared {
+				opts.Size = int64(len(data))
+			}
+			if _, err := tc.nodes["n1"].c.Put(context.Background(), "slow.bin", body, opts); err != nil {
+				t.Fatalf("a write that met a sweep failed: %v", err)
+			}
+			if !swept {
+				t.Fatal("the body never reached the chunk the sweep was armed at")
+			}
+			if got := mustGet(t, tc.nodes["n1"], "slow.bin"); !bytes.Equal(got, data) {
+				t.Errorf("the object is %d bytes of something else, want the %d written", len(got), len(data))
+			}
+		})
+	}
+}
+
+// sweepingReader calls sweep once, as soon as the reader has handed over at bytes.
+// Which is the point of it: the sweep happens while the write is between chunks,
+// with the earlier ones already fsynced and nothing naming them.
+type sweepingReader struct {
+	r     *bytes.Reader
+	at    int
+	read  int
+	sweep func()
+	done  bool
+}
+
+func (s *sweepingReader) Read(p []byte) (int, error) {
+	if !s.done && s.read >= s.at {
+		s.done = true
+		s.sweep()
+	}
+	// One byte past the trigger at a time, so the trigger is not skipped over by
+	// a read that spans it.
+	if !s.done && s.read+len(p) > s.at {
+		p = p[:s.at-s.read]
+	}
+	n, err := s.r.Read(p)
+	s.read += n
+	return n, err
+}
+
+// A record protects chunks nothing else does, so a record left by a node that has
+// since died would protect garbage for as long as the cluster runs. The sweep drops
+// those, and only those: the membership lease is already the cluster's answer to who
+// is still working.
+func TestARecordFromANodeThatIsGoneIsDropped(t *testing.T) {
+	tc := newCluster(t, 3)
+	n := tc.nodes["n1"]
+	ctx := context.Background()
+
+	for _, w := range []struct{ id, node string }{{"GONEWRITE", "n9"}, {"LIVEWRITE", "n1"}} {
+		if err := n.m.MarkWriting(ctx, w.id, w.node); err != nil {
+			t.Fatal(err)
+		}
+	}
+	collectEverywhere(t, tc, 0)
+
+	writes, err := n.m.Writing(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := writes["GONEWRITE"]; ok {
+		t.Error("a record from a node that is not a member survived the sweep")
+	}
+	if writes["LIVEWRITE"] != "n1" {
+		t.Errorf("writes in flight: %v, want the record of the live node kept", writes)
+	}
+}

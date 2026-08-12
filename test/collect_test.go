@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"slices"
 	"strings"
 	"sync"
@@ -127,14 +128,18 @@ func TestCollectingWhileANodeDiesTakesOnlyGarbage(t *testing.T) {
 }
 
 // A chunk is durable before the manifest that names it is committed, so for that
-// window good data is referenced by nothing at all and only its age protects it.
-// This is that window under load: writes arriving continuously from several clients
-// at once, against a sweep running as fast as it can go, every one of which has to
-// read back exactly what was written. The grace period is short — two seconds
-// against writes that take a fraction of one — because a grace of an hour would
-// prove nothing about whether the pass consults it.
+// window good data is referenced by nothing at all. This is that window under load:
+// writes arriving continuously from several clients at once, against a sweep running
+// as fast as it can go, every one of which has to read back exactly what was written.
+//
+// At a grace of zero, which is the point of it. Age used to be the only thing
+// protecting these writes, and a short grace was as much as a test could ask for.
+// Now that a write records itself before storing anything, age can be taken away
+// entirely and the records are all that is left holding the objects up — through the
+// real S3 API, four real processes, and 64 KB chunks so that every object here is a
+// multi-chunk write and takes a record.
 func TestWritesArrivingDuringSweepsAreAllReadable(t *testing.T) {
-	defer withCollect("10ms", "2s")()
+	defer withCollect("10ms", "0s")()
 	bin := buildKavod(t)
 	nodes := startCluster(t, bin, clusterPrefix(), 64<<10, 4)
 
@@ -446,4 +451,71 @@ func keysWhoseOwnersAllChange(t *testing.T, nodes []*node, joining []string, buc
 		t.Fatalf("found %d keys whose owners all change, want %d", len(keys), want)
 	}
 	return keys
+}
+
+// A slow client is the entire reason a write records itself, so proving the record
+// works takes one. This hands over eight chunks with a pause between each, against a
+// sweep every 10ms at a grace of zero: the pass visits the object's slice several
+// times while the upload is in flight, and every visit finds chunks that no manifest
+// names and that nothing but the record says are wanted.
+//
+// Through the S3 API and four real processes, because the claim is about a client on
+// a bad link rather than about a function. Ignoring the records makes this fail with
+// a read that cannot find the object's first chunk anywhere.
+func TestASlowUploadIsNotSweptWhileItArrives(t *testing.T) {
+	defer withCollect("10ms", "0s")()
+	bin := buildKavod(t)
+	nodes := startCluster(t, bin, clusterPrefix(), 64<<10, 4)
+
+	const chunk = 64 << 10
+	body := payload(9, 8*chunk)
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPut,
+		"http://"+nodes[0].s3Addr+"/"+collectBucket+"/slow-client.bin",
+		&paced{r: bytes.NewReader(body), every: chunk, pause: 150 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.ContentLength = int64(len(body))
+	sign(t, req, "UNSIGNED-PAYLOAD")
+
+	resp, err := (&http.Client{Timeout: time.Minute}).Do(req)
+	if err != nil {
+		t.Fatalf("the slow PUT failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		out, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<12))
+		t.Fatalf("the slow PUT: status %d: %s", resp.StatusCode, out)
+	}
+
+	got, err := getBody(t.Context(), s3Client(nodes[0].s3Addr), "slow-client.bin")
+	if err != nil {
+		t.Fatalf("reading back an object uploaded slowly: %v", err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Errorf("read back %d bytes of something else, want the %d uploaded", len(got), len(body))
+	}
+}
+
+// paced hands over its source in bursts of every bytes and waits between them.
+type paced struct {
+	r     io.Reader
+	every int
+	pause time.Duration
+	sent  int
+}
+
+func (p *paced) Read(b []byte) (int, error) {
+	if p.sent > 0 && p.sent%p.every == 0 {
+		time.Sleep(p.pause)
+	}
+	// Never across a burst boundary, so the pause lands between chunks rather than
+	// wherever the transport happened to split the read.
+	if room := p.every - p.sent%p.every; len(b) > room {
+		b = b[:room]
+	}
+	n, err := p.r.Read(b)
+	p.sent += n
+	return n, err
 }

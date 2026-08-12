@@ -29,10 +29,13 @@ type node struct {
 	prefix    string
 	chunkSize int
 	erasure   string
-	addr      string
-	s3Addr    string
-	cmd       *exec.Cmd
-	logs      *nodeLog
+	// extra is flags this node needs beyond the common set, kept on the node so a
+	// restart is the same command as the start.
+	extra  []string
+	addr   string
+	s3Addr string
+	cmd    *exec.Cmd
+	logs   *nodeLog
 }
 
 // nodeLog collects a node's output. A test that reads it while the node is still
@@ -98,9 +101,18 @@ func clusterPrefix() string { return "/kavo-test/" + rand.Text() }
 
 // startNode launches a cluster of one against dataDir. Handing the same dataDir
 // and prefix to a later startNode call simulates a restart.
+// startNode launches a cluster of one, which is what the crash harness needs: its
+// claim is about what one node's disk holds after the process is killed, and a second
+// node would answer the reads from a copy and prove nothing about the first.
+//
+// So it acknowledges at one copy. That is the whole of the difference from a real
+// deployment, and it is declared rather than inferred — a node that cannot reach W
+// nodes refuses the write, since being alone and being cut off are the same thing
+// seen from inside.
 func startNode(t *testing.T, bin, dataDir, prefix string, chunkSize int) *node {
 	t.Helper()
-	return launch(t, bin, "n1", freePort(t), dataDir, prefix, chunkSize, "")
+	n := launch(t, bin, "n1", freePort(t), dataDir, prefix, chunkSize, "", "-w", "1")
+	return n
 }
 
 // startCluster launches n kavod processes into the same cluster, returned in id
@@ -127,7 +139,7 @@ func startClusterCoded(t *testing.T, bin, prefix string, chunkSize, n int, erasu
 	return nodes
 }
 
-func launch(t *testing.T, bin, id, addr, dataDir, prefix string, chunkSize int, erasure string) *node {
+func launch(t *testing.T, bin, id, addr, dataDir, prefix string, chunkSize int, erasure string, extra ...string) *node {
 	t.Helper()
 	n := &node{
 		t:         t,
@@ -142,6 +154,7 @@ func launch(t *testing.T, bin, id, addr, dataDir, prefix string, chunkSize int, 
 		// bind both, and the CLI test needs a real one to talk to.
 		s3Addr: freePort(t),
 		logs:   &nodeLog{},
+		extra:  extra,
 	}
 	n.start()
 	t.Cleanup(n.stop)
@@ -177,6 +190,7 @@ func (n *node) start() {
 	if n.erasure != "" {
 		n.cmd.Args = append(n.cmd.Args, "-ec", n.erasure)
 	}
+	n.cmd.Args = append(n.cmd.Args, n.extra...)
 	n.cmd.Stdout = n.logs
 	n.cmd.Stderr = n.logs
 	if err := n.cmd.Start(); err != nil {

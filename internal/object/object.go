@@ -47,6 +47,20 @@ type ChunkRef struct {
 // address every shard without the manifest listing them.
 func (c ChunkRef) ShardID(i int) string { return fmt.Sprintf("%ss%02d", c.ID, i) }
 
+// indexWidth is how many trailing digits of a chunk id are the chunk's index within
+// its write. Everything before them is the write's own random prefix.
+const indexWidth = 6
+
+// WriteID is the id of the write a chunk came from. Every chunk of one write shares
+// it, and a shard id extends its chunk's, so it names an upload's whole footprint —
+// which is what lets one small record stand for a five-gigabyte upload in flight.
+func WriteID(chunkID string) string {
+	if len(chunkID) <= indexWidth {
+		return ""
+	}
+	return chunkID[:len(chunkID)-indexWidth]
+}
+
 // Manifest describes a stored object. It is the unit committed to etcd: an
 // object exists only once its manifest is committed.
 type Manifest struct {
@@ -129,7 +143,7 @@ func Write(r io.Reader, chunkSize, expect int64, commit func(*ChunkRef, []byte) 
 
 		data := buf[:n]
 		ref := ChunkRef{
-			ID:   fmt.Sprintf("%s%06d", prefix, i),
+			ID:   fmt.Sprintf("%s%0*d", prefix, indexWidth, i),
 			Size: int64(n),
 			CRC:  crc32.Checksum(data, castagnoli),
 		}

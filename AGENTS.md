@@ -26,6 +26,11 @@ not API surface. Full design and milestones: `docs/design.md`. Research notes wi
  processes while faults arrive at random, then the four invariants checked against the recorded
  history. `-chaos.duration` to run it longer, `-chaos.seed` to replay one. It runs at a short
  default as part of `make test`; run it long before believing a durability change.
+- `make demo` — six real processes on this host, an object, `SIGKILL` to one of its owners, and
+ redundancy returning on its own. Every step is checked (digests compared, each node asked whether
+ it holds the chunk) rather than narrated, so it doubles as a smoke test of the deployment path.
+ Processes rather than containers on purpose: `docs/benchmarks.md` measures Docker Desktop
+ absorbing `F_FULLFSYNC`, and a demo about durability should not run on top of that. Needs `aws`.
 - `make etcd` — start just etcd (idempotent)
 - `make up` / `make down` — 6-node dev cluster plus etcd via Docker Compose
  (`deploy/compose.yaml`). Each node publishes two ports: the S3 API on `localhost:9001`–`9006`
@@ -49,8 +54,20 @@ developer runs, because CI that drifts from them eventually only proves things a
 
 Rules that make these structural:
 
+- **A write in flight is recorded, not inferred**: a write that can store more than one chunk puts
+  one key in etcd naming itself before it stores any of them, and clears it after the commit — in
+  that order. Every chunk of a write shares an id prefix, so one key protects a 5 GB upload, and a
+  write with a single short chunk needs none. Collection reads those records before it reads any
+  manifest, and drops the ones belonging to nodes that are no longer members; the commit of a
+  recorded write is conditional on its record still being there, so a writer that lost etcd fails
+  its write rather than acknowledging an object whose early chunks were collected. Never make the
+  grace period the argument again: it is a backstop for the tail of a single-chunk write.
 - **Commit point**: a write is acknowledged only when W chunk replicas (or the required EC
- shards) are fsynced on distinct nodes AND the object manifest is committed to etcd. Readers
+  shards) are fsynced on distinct nodes AND the object manifest is committed to etcd. W never
+  narrows to however many nodes happen to be visible: a coordinator that can see fewer than W
+  refuses the write. A node keeps itself in its own ring, so "the cluster is small" and "I am
+  cut off" look identical from inside, and the forgiving reading of that cost an acknowledged
+  object in chaos (`-chaos.seed=1786500476032706000`). Readers
  resolve objects only through committed manifests. A plain etcd `Put` is enough for this: it
  is atomic and serialized, so a concurrent overwrite yields one manifest or the other, never a
  mix. It stays a plain `Put`: garbage collection is mark-and-sweep and so does not need the
@@ -85,12 +102,19 @@ Rules that make these structural:
 - Placement: object key → one of 256 partitions → nodes, via a consistent-hash ring with
   ~128 vnodes per node. Rebalance/repair bookkeeping is per-partition, never per-object.
 - Defaults: N=3, W=2, R=2 replication; EC mode (`-ec=6+3`) is 6 data + 3 parity, encoded per
- chunk, acknowledged at k+1 shards. The code is recorded per object, so both modes coexist.
+ chunk, acknowledged at k+1 shards. The code is recorded per object, so both modes coexist. W is
+ declared with `-w` and never inferred from how many nodes are reachable; `-w 1` is how a
+ single-node store (the crash harness) asks for one copy.
 - Metadata: etcd only (manifests, membership leases, partition layout). Chunks are immutable —
   no vector clocks, no sloppy quorums, no read repair for correctness.
 - Four background passes, all resumable by cursor and all rate-limited or sliced so they never
   grow with the disk: repair (missing copies), scrub (rot), rebalance (misplaced copies),
-  collect (chunks no manifest references).
+  collect (chunks no manifest references). Repair restores copies only on the nodes a manifest
+  already names; changing *where* copies belong is rebalancing's alone, which is why rebalancing
+  is also what widens a placement narrower than N — an object written while part of the cluster
+  was unreachable, which nothing widened until it was made to. Both passes take the width from
+  the object's own recorded code, never from the placement in front of them and never from this
+  node's mode.
 - Inter-node chunk transfer: plain HTTP with streaming bodies. No gRPC.
 
 ## Conventions
@@ -103,6 +127,10 @@ Rules that make these structural:
   an explicit anti-goal. The subset is object PUT/GET/HEAD/DELETE, ListObjectsV2, multipart
   upload, SigV4, `CopyObject`, and the six calls clients make unprompted: `CreateBucket`,
   `ListBuckets`, `DeleteBucket`, `DeleteObjects`, `ListObjectVersions`, `GetBucketLocation`.
+  Conditional *reads* (`If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`) and
+  `Content-MD5` verification are in too, being headers on calls that already exist rather than new
+  surface. Conditional *writes* are not: `If-None-Match: *` on a PUT needs the commit to become a
+  compare-and-set, which is a change to the commit point and has to be argued for.
   Buckets are still prefixes and nothing is versioned — those last two answer for records that
   do not exist, because a client that cannot list or empty a bucket cannot use the store.
   `CopyObject` is in because `aws s3 mv` is a copy and a delete, and because a copy that made the
