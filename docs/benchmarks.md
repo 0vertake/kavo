@@ -184,9 +184,9 @@ cluster and finding no name for them.
 
 So the residue is a measured duration rather than a caveat now. With the collector turned up to a
 1-second interval and a 10-second grace it reclaimed all 32 in 37 seconds, which is one full cycle of
-the id space plus the grace. At the shipped defaults — a minute and an hour — the same residue lives
-about an hour and a half. That is the price of the copy operation, paid in disk rather than in
-durability, and it is why the interval is a minute rather than the ten it was.
+the id space plus the grace. At the shipped defaults — a minute of interval and a minute of grace —
+the same residue lives about half an hour. That is the price of the copy operation, paid in disk
+rather than in durability, and it is why the interval is a minute rather than the ten it was.
 
 Thirty-two, not the thirty-four that moved: a sweep had already taken two by the time the count was
 made. The measurement waits for the number to reach zero rather than asserting what it starts at,
@@ -407,6 +407,49 @@ those 730 objects a second are 730 chained per-chunk signature verifications a s
 that implements the scheme independently. Getting it to run at all also turned up a bulk delete
 posted to `/{bucket}/` with a trailing slash, which had been answered with a redirect.
 
-The honest gap that remains: this is one host, so the network is loopback. Numbers from separate
-machines over a real network would be a different measurement, and nothing here should be read as
-one.
+## The network these numbers are not crossing
+
+Every figure above was measured with six nodes on one host, so a chunk reaches its second owner
+across a memory copy. The per-chunk round trip that dominates small writes on real hardware is
+missing from all of them, and nothing here should be read as a network measurement.
+
+What running it elsewhere needs is an address rather than a new harness. The S3 benchmarks drive
+whatever cluster `KAVO_BENCH_ENDPOINT` names:
+
+```sh
+# On each host: same etcd, same cluster prefix, its own reachable address.
+kavod -id n1 -addr 0.0.0.0:8080 -advertise 10.0.0.11:8080 -s3 0.0.0.0:9000       -data /var/lib/kavo -etcd 10.0.0.10:2379 -cluster /kavo
+
+# From anywhere that can reach them:
+KAVO_BENCH_ENDPOINT=http://10.0.0.11:9000 go test ./internal/s3 -run XXX -bench . -timeout 1800s
+```
+
+Only the gateway benchmarks can go remote; the internal-API ones drive a coordinator in the test
+process, which is what makes them a measurement of the code rather than of a deployment. `warp` takes
+`--host` and needs nothing new either.
+
+What to predict when someone runs it: a write pushes to its W owners in parallel, so a PUT should
+gain roughly one round trip per chunk rather than per copy — at 0.25 ms RTT that is noise against a
+25 ms small write, which is fsync, and it stays noise until the disks are fast enough for the network
+to be the slower of the two. Large writes should be bandwidth-bound: 469 MB/s of client throughput is
+1.4 GB/s of chunk traffic leaving the coordinator, which is more than a 10 GbE link carries, so a
+single-NIC node caps a large PUT near 400 MB/s before anything in kavo does. Heal rate has the same
+ceiling and is already rate-limited well below it.
+
+**A containerised cluster on one host is not a substitute, and measuring it is how that became
+clear.** Pointing the same benchmarks at the six-node `make up` cluster on macOS moves every number,
+in both directions:
+
+| operation | six nodes in process | six containers, same host |
+| --- | --- | --- |
+| PUT 4 KB | 25 ms | 5.0 ms |
+| PUT 1 MB | 28 ms / 37 MB/s | 18 ms / 58 MB/s |
+| PUT 64 MB | 143 ms / 469 MB/s | 743 ms / 90 MB/s |
+| GET 4 KB | 0.74 ms | 0.76 ms |
+
+The small write got **five times faster** by being containerised, which is not a speedup: it is
+Docker Desktop's virtual machine absorbing `F_FULLFSYNC` into a page cache the host has not
+promised anything about. The large write got five times *slower*, because the same virtualised
+filesystem and network cap bandwidth. Distortion in both directions, from the same layer — so these
+numbers are recorded here as a caution and are not the ones published above. An object store
+benchmarked in Docker Desktop is measuring Docker Desktop.
