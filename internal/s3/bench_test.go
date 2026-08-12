@@ -12,17 +12,21 @@ package s3_test
 
 import (
 	"bytes"
+	"cmp"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"sync/atomic"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/0vertake/kavo/internal/object"
+	"github.com/0vertake/kavo/internal/sigv4"
 )
 
 const benchNodes = 6
@@ -38,9 +42,38 @@ func sizeName(n int64) string {
 	return strconv.FormatInt(n>>10, 10) + "KB"
 }
 
+// benchGateway is the cluster these benchmarks drive: six nodes started here, or
+// whatever cluster KAVO_BENCH_ENDPOINT names.
+//
+// The second case is the only way these numbers stop being loopback numbers. Every
+// figure in docs/benchmarks.md was measured with six nodes on one host, so a chunk
+// reaches its second owner across a memory copy rather than a network, and the
+// per-chunk round trip that dominates small writes on real hardware is missing from
+// all of them. Pointing the same benchmarks at nodes on separate machines is the
+// measurement that settles it, and it needs no separate harness — only an address:
+//
+//	KAVO_BENCH_ENDPOINT=http://node1:9001 make bench
+//
+// Credentials come from KAVO_BENCH_KEY and KAVO_BENCH_SECRET, defaulting to kavod's
+// own defaults so a cluster from `make up` needs neither.
 func benchGateway(b *testing.B) *awss3.Client {
 	b.Helper()
-	return newGatewaySized(b, benchNodes, object.DefaultChunkSize)
+	endpoint := os.Getenv("KAVO_BENCH_ENDPOINT")
+	if endpoint == "" {
+		return newGatewaySized(b, benchNodes, object.DefaultChunkSize)
+	}
+	remote := sigv4.Credentials{
+		AccessKey: cmp.Or(os.Getenv("KAVO_BENCH_KEY"), "kavo"),
+		SecretKey: cmp.Or(os.Getenv("KAVO_BENCH_SECRET"), "kavosecret"),
+	}
+	b.Logf("benchmarking the cluster at %s, not one started here", endpoint)
+	return awss3.NewFromConfig(aws.Config{
+		Region:      "us-east-1",
+		Credentials: credentials.NewStaticCredentialsProvider(remote.AccessKey, remote.SecretKey, ""),
+	}, func(o *awss3.Options) {
+		o.BaseEndpoint = aws.String(endpoint)
+		o.UsePathStyle = true
+	})
 }
 
 func benchPut(b *testing.B, client *awss3.Client, key string, data []byte) {
