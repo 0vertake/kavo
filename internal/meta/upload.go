@@ -27,6 +27,10 @@ type Upload struct {
 	Key         string
 	ContentType string
 	Created     time.Time
+	// Meta is what the client attached when it began the upload. S3 takes the
+	// object's metadata from the creation call rather than from the parts or the
+	// completion, so it has to survive here for as long as the upload does.
+	Meta map[string]string `json:",omitempty"`
 }
 
 // CreateUpload records a new multipart upload.
@@ -149,6 +153,126 @@ func (s *Store) ScanParts(ctx context.Context, from string, limit int64) ([]Part
 		parts = append(parts, PartRef{Key: key, Manifest: m})
 	}
 	return parts, nil
+}
+
+// UploadRef is an in-flight upload and the id it is listed under.
+type UploadRef struct {
+	ID     string
+	Upload Upload
+}
+
+// scanBudget bounds how many etcd keys one listing may read. An upload's parts
+// share its prefix, so the keys in this range are uploads *and* their parts, and a
+// store with a few thousand abandoned uploads should not turn one listing into an
+// unbounded read. A listing that runs out of budget says so and hands back a marker,
+// which is what pagination is for.
+const scanBudget = 1024
+
+// Uploads returns in-flight uploads whose object key begins with prefix, in id
+// order, starting after the id after, and no more than limit of them. The second
+// result reports whether the scan stopped early, meaning there may be more.
+//
+// Id order rather than key order, which is what S3 documents: ordering by key would
+// mean reading every in-flight upload in the store into memory to sort them, and
+// nothing here reads an unbounded set to answer one request. The markers work, so a
+// client that pages sees every upload exactly once.
+func (s *Store) Uploads(ctx context.Context, prefix, after string, limit int) ([]UploadRef, bool, error) {
+	start := path.Join(s.prefix, "uploads") + "/"
+	if after != "" {
+		start = After(s.uploadPrefix(after))
+	}
+	end := clientv3.GetPrefixRangeEnd(path.Join(s.prefix, "uploads") + "/")
+	if start >= end {
+		return nil, false, nil
+	}
+	resp, err := s.client.Get(ctx, start,
+		clientv3.WithRange(end),
+		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend),
+		clientv3.WithLimit(scanBudget),
+	)
+	if err != nil {
+		return nil, false, fmt.Errorf("meta: list uploads after %q: %w", after, err)
+	}
+
+	uploads := make([]UploadRef, 0, limit)
+	for _, kv := range resp.Kvs {
+		key := string(kv.Key)
+		if !strings.HasSuffix(key, "/upload") {
+			continue // A part of some upload, not the record of one.
+		}
+		var u Upload
+		if err := json.Unmarshal(kv.Value, &u); err != nil {
+			return nil, false, fmt.Errorf("meta: corrupt upload %s: %w", key, err)
+		}
+		if !strings.HasPrefix(u.Key, prefix) {
+			continue
+		}
+		if len(uploads) == limit {
+			return uploads, true, nil
+		}
+		id := path.Base(path.Dir(key))
+		uploads = append(uploads, UploadRef{ID: id, Upload: u})
+	}
+	// More is also true when the budget ran out mid-range: the range may hold
+	// nothing else, but saying "no more" and being wrong loses an upload.
+	return uploads, resp.More || int64(len(resp.Kvs)) == scanBudget, nil
+}
+
+// Completion is what an upload turned into, remembered after the upload itself is
+// gone so that a client repeating a completion it never saw the answer to gets the
+// answer rather than NoSuchUpload.
+type Completion struct {
+	Key   string
+	ETag  string
+	When  time.Time
+	Parts int
+}
+
+// CompletionMemory is how long a finished upload id is remembered. Long enough for
+// a client to retry a request whose response was lost — which is the only thing that
+// asks — and short enough that the records cannot accumulate. It is an etcd lease
+// rather than a background pass, so the record goes even if every node is down.
+const CompletionMemory = time.Hour
+
+// FinishUpload records what an upload became. It is called after the object's
+// manifest is committed: this record is a convenience for retries, and an upload
+// that failed to leave one is still an object.
+func (s *Store) FinishUpload(ctx context.Context, id string, c Completion) error {
+	data, err := json.Marshal(c)
+	if err != nil {
+		return fmt.Errorf("meta: marshal completion %s: %w", id, err)
+	}
+	lease, err := s.client.Grant(ctx, int64(CompletionMemory.Seconds()))
+	if err != nil {
+		return fmt.Errorf("meta: lease for completion %s: %w", id, err)
+	}
+	if _, err := s.client.Put(ctx, s.completionKey(id), string(data), clientv3.WithLease(lease.ID)); err != nil {
+		return fmt.Errorf("meta: record completion %s: %w", id, err)
+	}
+	return nil
+}
+
+// Completion returns what an upload became, or ErrNotFound if this id was never
+// completed or was completed longer ago than CompletionMemory.
+func (s *Store) Completion(ctx context.Context, id string) (Completion, error) {
+	resp, err := s.client.Get(ctx, s.completionKey(id))
+	if err != nil {
+		return Completion{}, fmt.Errorf("meta: read completion %s: %w", id, err)
+	}
+	if len(resp.Kvs) == 0 {
+		return Completion{}, fmt.Errorf("%w: completion %s", ErrNotFound, id)
+	}
+	var c Completion
+	if err := json.Unmarshal(resp.Kvs[0].Value, &c); err != nil {
+		return Completion{}, fmt.Errorf("meta: corrupt completion %s: %w", id, err)
+	}
+	return c, nil
+}
+
+// completionKey lives outside the uploads range, so that a finished upload is not
+// something a scan of in-flight uploads has to know to skip.
+func (s *Store) completionKey(id string) string {
+	return path.Join(s.prefix, "completed", id)
 }
 
 // DeleteUpload forgets an upload and its parts. It says nothing about the parts'

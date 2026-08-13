@@ -206,6 +206,9 @@ type PutOptions struct {
 	// hint for sizing the write buffer. Zero means "not declared", and nothing
 	// here is trusted for anything else.
 	Size int64
+	// Meta is stored with the object and returned on every read. It is not
+	// interpreted, so it is also not validated beyond its size: see MaxMeta.
+	Meta map[string]string
 	// MD5 is the hex digest the client declared for the body, or "" if it did
 	// not. A write whose bytes hash to something else is refused rather than
 	// committed: the client is saying it knows what it sent, and a store that
@@ -237,6 +240,7 @@ func (c *Coordinator) Put(ctx context.Context, key string, body io.Reader, opts 
 
 	m.ETag = cmp.Or(opts.ETag, m.ETag)
 	m.ContentType = opts.ContentType
+	m.Meta = opts.Meta
 
 	if writing == "" {
 		err = c.meta.Commit(ctx, key, m)
@@ -408,16 +412,32 @@ func (c *Coordinator) Delete(ctx context.Context, key string) error {
 // move it in the background; until it does, the copy is readable exactly where the
 // source is. What it must not do is drop the source's copies once it has moved the
 // destination's — the reason the move no longer drops anything at all.
-func (c *Coordinator) Copy(ctx context.Context, from, to string) (object.Manifest, error) {
+func (c *Coordinator) Copy(ctx context.Context, from, to string, opts CopyOptions) (object.Manifest, error) {
 	m, err := c.meta.Get(ctx, from)
 	if err != nil {
 		return object.Manifest{}, err
 	}
 	m.Modified = time.Now().UTC().Truncate(time.Second)
+	if opts.Replace {
+		// Not merged with the source's: REPLACE with no metadata headers means
+		// the copy has none, which is how a client strips metadata from an
+		// object it cannot otherwise edit.
+		m.ContentType, m.Meta = opts.ContentType, opts.Meta
+	}
 	if err := c.meta.Commit(ctx, to, m); err != nil {
 		return object.Manifest{}, err
 	}
 	return m, nil
+}
+
+// CopyOptions carries the destination's metadata when the client asked to replace
+// it rather than keep the source's, which is x-amz-metadata-directive: REPLACE.
+// Replace is explicit because "replace with nothing" and "keep the source's" are
+// different requests that both arrive with an empty Meta.
+type CopyOptions struct {
+	Replace     bool
+	ContentType string
+	Meta        map[string]string
 }
 
 // Resolve returns the committed manifest for an object key, or meta.ErrNotFound.

@@ -129,10 +129,19 @@ Rules that make these structural:
   an explicit anti-goal. The subset is object PUT/GET/HEAD/DELETE, ListObjectsV2, multipart
   upload, SigV4, `CopyObject`, and the six calls clients make unprompted: `CreateBucket`,
   `ListBuckets`, `DeleteBucket`, `DeleteObjects`, `ListObjectVersions`, `GetBucketLocation`.
-  Conditional *reads* (`If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`) and
-  `Content-MD5` verification are in too, being headers on calls that already exist rather than new
-  surface. Conditional *writes* are not: `If-None-Match: *` on a PUT needs the commit to become a
+  Conditional *reads* (`If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, and
+  the same four as `x-amz-copy-source-if-*` on a copy), `Content-MD5` verification, and user metadata
+  (`x-amz-meta-*`, `Cache-Control`, `Content-Disposition`, `Content-Encoding`, `Content-Language`,
+  `Expires`, and `x-amz-metadata-directive` on a copy) are in too, being headers on calls that already
+  exist rather than new surface. `ListParts` and `ListMultipartUploads` are in because they are part of
+  multipart upload, and because both are a `GET` that was being answered by the object handler — a
+  client asking which parts had arrived was told `NoSuchKey`. Conditional *writes* are not: `If-None-Match: *` on a PUT needs the commit to become a
   compare-and-set, which is a change to the commit point and has to be argued for.
+  A request for something outside the subset is **refused, not ignored**: a request carrying
+  `x-amz-server-side-encryption*` or a customer key is answered 501, because storing the object in
+  plaintext and answering 200 tells a client its data is encrypted while anyone can read it. Ignoring
+  those headers was worth twenty-two `s3-tests` passes, which is the clearest argument on record that
+  a pass count is not a measure of a store.
   Buckets are still prefixes and nothing is versioned — those last two answer for records that
   do not exist, because a client that cannot list or empty a bucket cannot use the store.
   `CopyObject` is in because `aws s3 mv` is a copy and a delete, and because a copy that made the

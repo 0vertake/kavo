@@ -235,12 +235,17 @@ func TestAbortingAnUploadLeavesNothing(t *testing.T) {
 	if code := errorCode(err); code != "NoSuchUpload" {
 		t.Errorf("completing an aborted upload: error code %q, want NoSuchUpload", code)
 	}
-	// Aborting twice is what a client's cleanup loop does. It must not become an
-	// error the second time round.
+	// Aborting twice is NoSuchUpload, which reverses what this test used to
+	// assert. It had aborting be idempotent on the grounds that a cleanup loop
+	// aborts what it already aborted, but S3 answers 404 there and Ceph's suite
+	// checks it (test_abort_multipart_upload_not_found): a client told it
+	// successfully aborted an id that never existed cannot tell that from having
+	// aborted the wrong one, and a cleanup loop that mistyped an id would report
+	// success.
 	if _, err := client.AbortMultipartUpload(t.Context(), &awss3.AbortMultipartUploadInput{
 		Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
-	}); err != nil {
-		t.Errorf("aborting twice: %v", err)
+	}); errorCode(err) != "NoSuchUpload" {
+		t.Errorf("aborting twice: %v, want NoSuchUpload", err)
 	}
 }
 
@@ -453,5 +458,144 @@ func TestAResentPartReplacesTheFirstOne(t *testing.T) {
 		if bytes.Contains(got, first[:16]) {
 			t.Error("it still carries the body of the part that was replaced")
 		}
+	}
+}
+
+// upload creates an upload and sends one part, returning the id and the part's
+// entry, since three tests below need exactly that much of a multipart upload.
+func upload(t *testing.T, client *awss3.Client, key string) (*string, types.CompletedPart) {
+	t.Helper()
+	create, err := client.CreateMultipartUpload(t.Context(), &awss3.CreateMultipartUploadInput{
+		Bucket: aws.String("bucket"), Key: aws.String(key),
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	part, err := client.UploadPart(t.Context(), &awss3.UploadPartInput{
+		Bucket: aws.String("bucket"), Key: aws.String(key),
+		UploadId: create.UploadId, PartNumber: aws.Int32(1),
+		Body: bytes.NewReader(randBytes(testChunkSize + 3)),
+	})
+	if err != nil {
+		t.Fatalf("upload part: %v", err)
+	}
+	return create.UploadId, types.CompletedPart{ETag: part.ETag, PartNumber: aws.Int32(1)}
+}
+
+// A completion whose response never arrived is retried by every SDK. Answering the
+// retry with NoSuchUpload tells the client its upload failed while the object is
+// sitting there, so the id is remembered for as long as a retry could plausibly
+// take (meta.CompletionMemory) and answers with what the upload produced.
+func TestRecompletingAnUploadAnswersWithWhatItProduced(t *testing.T) {
+	client := newGateway(t)
+	id, part := upload(t, client, "retried.bin")
+	in := &awss3.CompleteMultipartUploadInput{
+		Bucket: aws.String("bucket"), Key: aws.String("retried.bin"), UploadId: id,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: []types.CompletedPart{part}},
+	}
+	first, err := client.CompleteMultipartUpload(t.Context(), in)
+	if err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	again, err := client.CompleteMultipartUpload(t.Context(), in)
+	if err != nil {
+		t.Fatalf("complete a second time: %v", err)
+	}
+	if aws.ToString(again.ETag) != aws.ToString(first.ETag) {
+		t.Errorf("the retry answered %s, want the first answer %s",
+			aws.ToString(again.ETag), aws.ToString(first.ETag))
+	}
+
+	// And the object is the one the first completion made, not a second object
+	// assembled out of parts that no longer exist.
+	head, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("retried.bin"),
+	})
+	if err != nil {
+		t.Fatalf("head: %v", err)
+	}
+	if aws.ToString(head.ETag) != aws.ToString(first.ETag) {
+		t.Errorf("the object is %s, want %s", aws.ToString(head.ETag), aws.ToString(first.ETag))
+	}
+}
+
+// Aborting an upload id that never existed used to succeed, which tells a client
+// cleaning up that it cleaned up something it invented.
+func TestAbortingAnUploadThatDoesNotExistSaysSo(t *testing.T) {
+	client := newGateway(t)
+	_, err := client.AbortMultipartUpload(t.Context(), &awss3.AbortMultipartUploadInput{
+		Bucket: aws.String("bucket"), Key: aws.String("invented.bin"),
+		UploadId: aws.String("NEVEREXISTEDATALL"),
+	})
+	var api smithy.APIError
+	if !errors.As(err, &api) || api.ErrorCode() != "NoSuchUpload" {
+		t.Fatalf("abort of an unknown id = %v, want NoSuchUpload", err)
+	}
+}
+
+// A client resuming an upload asks which parts arrived. This used to be answered by
+// the object read handler, so it said NoSuchKey — telling a client whose parts are
+// all safely stored that there is nothing there.
+func TestListingThePartsOfAnUpload(t *testing.T) {
+	client := newGateway(t)
+	id, part := upload(t, client, "resumed.bin")
+
+	parts, err := client.ListParts(t.Context(), &awss3.ListPartsInput{
+		Bucket: aws.String("bucket"), Key: aws.String("resumed.bin"), UploadId: id,
+	})
+	if err != nil {
+		t.Fatalf("list parts: %v", err)
+	}
+	if len(parts.Parts) != 1 {
+		t.Fatalf("listed %d parts, want the 1 that was uploaded", len(parts.Parts))
+	}
+	if got := parts.Parts[0]; aws.ToInt32(got.PartNumber) != 1 ||
+		aws.ToString(got.ETag) != aws.ToString(part.ETag) ||
+		aws.ToInt64(got.Size) != int64(testChunkSize+3) {
+		t.Errorf("listed part = %d/%s/%d, want 1/%s/%d", aws.ToInt32(got.PartNumber),
+			aws.ToString(got.ETag), aws.ToInt64(got.Size), aws.ToString(part.ETag), testChunkSize+3)
+	}
+
+	_, err = client.ListParts(t.Context(), &awss3.ListPartsInput{
+		Bucket: aws.String("bucket"), Key: aws.String("resumed.bin"),
+		UploadId: aws.String("NEVEREXISTEDATALL"),
+	})
+	var api smithy.APIError
+	if !errors.As(err, &api) || api.ErrorCode() != "NoSuchUpload" {
+		t.Fatalf("listing the parts of an unknown upload = %v, want NoSuchUpload", err)
+	}
+}
+
+// Listing uploads in flight is how a client finds what it abandoned. Answering it
+// with an object listing, which is what a GET on the bucket used to do, parses as
+// "nothing in flight" — worse than a refusal, because the client believes it.
+func TestListingUploadsInFlight(t *testing.T) {
+	client := newGateway(t)
+	first, _ := upload(t, client, "flight/one.bin")
+	second, _ := upload(t, client, "flight/two.bin")
+	finished, part := upload(t, client, "flight/done.bin")
+	if _, err := client.CompleteMultipartUpload(t.Context(), &awss3.CompleteMultipartUploadInput{
+		Bucket: aws.String("bucket"), Key: aws.String("flight/done.bin"), UploadId: finished,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: []types.CompletedPart{part}},
+	}); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	list, err := client.ListMultipartUploads(t.Context(), &awss3.ListMultipartUploadsInput{
+		Bucket: aws.String("bucket"),
+	})
+	if err != nil {
+		t.Fatalf("list uploads: %v", err)
+	}
+	got := make(map[string]string, len(list.Uploads))
+	for _, u := range list.Uploads {
+		got[aws.ToString(u.UploadId)] = aws.ToString(u.Key)
+	}
+	if len(got) != 2 || got[aws.ToString(first)] != "flight/one.bin" ||
+		got[aws.ToString(second)] != "flight/two.bin" {
+		t.Errorf("uploads in flight = %v, want the two that are", got)
+	}
+	if _, ok := got[aws.ToString(finished)]; ok {
+		t.Error("a completed upload is still listed as in flight")
 	}
 }

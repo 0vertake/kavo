@@ -35,7 +35,7 @@ func TestACompletionIsRefusedWhenPlacementMovedMidUpload(t *testing.T) {
 	fewer := tc.without("n5")
 	key := movedKey(t, full, fewer)
 
-	id, err := driver.c.CreateUpload(ctx, key, "")
+	id, err := driver.c.CreateUpload(ctx, key, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestAbortReclaimsThePartsChunks(t *testing.T) {
 	ctx := context.Background()
 	const key = "aborted/object"
 
-	id, err := driver.c.CreateUpload(ctx, key, "")
+	id, err := driver.c.CreateUpload(ctx, key, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
