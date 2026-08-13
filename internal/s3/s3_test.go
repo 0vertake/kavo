@@ -1115,3 +1115,182 @@ func TestARequestForEncryptionIsRefused(t *testing.T) {
 		t.Fatalf("get with a customer key = %v, want NotImplemented", err)
 	}
 }
+
+// S3 addresses an object's subresources as a query on the object's own path, so a
+// server that ignores the query answers them with the object operation instead.
+// That is how this store came to destroy objects: `put-object-tagging` reached the
+// object PUT and replaced the object with the tagging XML, `put-object-acl`
+// truncated it to nothing because its request carries no body, and
+// `delete-object-tagging` deleted it — each answered 200, so a client tagging an
+// object destroyed it and was told the tag was set.
+//
+// The assertion that matters is the last one in each case: not that the call is
+// refused, but that the object is still there afterwards.
+func TestAnObjectSubresourceCannotTouchTheObject(t *testing.T) {
+	client := newGateway(t)
+	data := randBytes(2 * testChunkSize)
+	intact := func(t *testing.T, what string) {
+		t.Helper()
+		out, err := client.GetObject(t.Context(), &awss3.GetObjectInput{
+			Bucket: aws.String("bucket"), Key: aws.String("described.bin"),
+		})
+		if err != nil {
+			t.Fatalf("the object is gone after %s: %v", what, err)
+		}
+		defer out.Body.Close()
+		got, _ := io.ReadAll(out.Body)
+		if !bytes.Equal(got, data) {
+			t.Fatalf("after %s the object is %d bytes of something else, want the %d written",
+				what, len(got), len(data))
+		}
+	}
+
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{"put-object-tagging", func() error {
+			_, err := client.PutObjectTagging(t.Context(), &awss3.PutObjectTaggingInput{
+				Bucket: aws.String("bucket"), Key: aws.String("described.bin"),
+				Tagging: &types.Tagging{TagSet: []types.Tag{
+					{Key: aws.String("colour"), Value: aws.String("octarine")},
+				}},
+			})
+			return err
+		}},
+		{"delete-object-tagging", func() error {
+			_, err := client.DeleteObjectTagging(t.Context(), &awss3.DeleteObjectTaggingInput{
+				Bucket: aws.String("bucket"), Key: aws.String("described.bin"),
+			})
+			return err
+		}},
+		{"get-object-tagging", func() error {
+			_, err := client.GetObjectTagging(t.Context(), &awss3.GetObjectTaggingInput{
+				Bucket: aws.String("bucket"), Key: aws.String("described.bin"),
+			})
+			return err
+		}},
+		{"put-object-acl", func() error {
+			_, err := client.PutObjectAcl(t.Context(), &awss3.PutObjectAclInput{
+				Bucket: aws.String("bucket"), Key: aws.String("described.bin"),
+				ACL: types.ObjectCannedACLPrivate,
+			})
+			return err
+		}},
+		{"put-object-legal-hold", func() error {
+			_, err := client.PutObjectLegalHold(t.Context(), &awss3.PutObjectLegalHoldInput{
+				Bucket: aws.String("bucket"), Key: aws.String("described.bin"),
+				LegalHold: &types.ObjectLockLegalHold{Status: types.ObjectLockLegalHoldStatusOn},
+			})
+			return err
+		}},
+		{"put-object-retention", func() error {
+			_, err := client.PutObjectRetention(t.Context(), &awss3.PutObjectRetentionInput{
+				Bucket: aws.String("bucket"), Key: aws.String("described.bin"),
+				Retention: &types.ObjectLockRetention{
+					Mode:            types.ObjectLockRetentionModeGovernance,
+					RetainUntilDate: aws.Time(time.Now().Add(time.Hour)),
+				},
+			})
+			return err
+		}},
+		{"get-object-attributes", func() error {
+			_, err := client.GetObjectAttributes(t.Context(), &awss3.GetObjectAttributesInput{
+				Bucket: aws.String("bucket"), Key: aws.String("described.bin"),
+				ObjectAttributes: []types.ObjectAttributes{types.ObjectAttributesEtag},
+			})
+			return err
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Rewritten for each, so that one call destroying the object cannot
+			// be hidden by an earlier one having already replaced it.
+			if _, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+				Bucket: aws.String("bucket"), Key: aws.String("described.bin"),
+				Body: bytes.NewReader(data),
+			}); err != nil {
+				t.Fatalf("put: %v", err)
+			}
+			var api smithy.APIError
+			if err := tt.call(); !errors.As(err, &api) || api.ErrorCode() != "NotImplemented" {
+				t.Errorf("%s = %v, want NotImplemented", tt.name, err)
+			}
+			intact(t, tt.name)
+		})
+	}
+}
+
+// A part copied from another object is UploadPartCopy. Ignoring the header read the
+// request as a part with an empty body and answered 200, so `aws s3 cp` of anything
+// over 8 MB between two keys assembled an empty object and reported success.
+func TestCopyingIntoAPartIsRefusedRatherThanStoringNothing(t *testing.T) {
+	client := newGateway(t)
+	data := randBytes(2 * testChunkSize)
+	if _, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("source.bin"),
+		Body: bytes.NewReader(data),
+	}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	create, err := client.CreateMultipartUpload(t.Context(), &awss3.CreateMultipartUploadInput{
+		Bucket: aws.String("bucket"), Key: aws.String("assembled.bin"),
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	_, err = client.UploadPartCopy(t.Context(), &awss3.UploadPartCopyInput{
+		Bucket: aws.String("bucket"), Key: aws.String("assembled.bin"),
+		UploadId: create.UploadId, PartNumber: aws.Int32(1),
+		CopySource: aws.String("bucket/source.bin"),
+	})
+	var api smithy.APIError
+	if !errors.As(err, &api) || api.ErrorCode() != "NotImplemented" {
+		t.Fatalf("upload-part-copy = %v, want NotImplemented", err)
+	}
+
+	// And nothing was stored under that part number, so a completion cannot
+	// assemble an object out of a copy that never happened.
+	parts, err := client.ListParts(t.Context(), &awss3.ListPartsInput{
+		Bucket: aws.String("bucket"), Key: aws.String("assembled.bin"),
+		UploadId: create.UploadId,
+	})
+	if err != nil {
+		t.Fatalf("list parts: %v", err)
+	}
+	if len(parts.Parts) != 0 {
+		t.Errorf("the refused copy left %d parts behind, want none", len(parts.Parts))
+	}
+}
+
+// A version id kavo never issued names something that does not exist. Answering it
+// with the current object means a client asking to delete one old version deletes
+// the live one instead — the same mistake as the subresources above, arriving
+// through a query whose value is the part that matters. "null" is the exception,
+// because that is the id ListObjectVersions reports for every object, and it is how
+// a client empties a bucket.
+func TestAVersionIdThatWasNeverIssuedIsRefused(t *testing.T) {
+	client := newGateway(t)
+	data := randBytes(64)
+	if _, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("versioned.bin"),
+		Body: bytes.NewReader(data),
+	}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	_, err := client.DeleteObject(t.Context(), &awss3.DeleteObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("versioned.bin"),
+		VersionId: aws.String("deadbeef"),
+	})
+	var api smithy.APIError
+	if !errors.As(err, &api) || api.ErrorCode() != "NotImplemented" {
+		t.Fatalf("delete of an invented version = %v, want NotImplemented", err)
+	}
+	if _, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("versioned.bin"),
+	}); err != nil {
+		t.Fatalf("the object is gone after a delete of a version that never existed: %v", err)
+	}
+}

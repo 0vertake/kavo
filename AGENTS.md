@@ -142,6 +142,14 @@ Rules that make these structural:
   plaintext and answering 200 tells a client its data is encrypted while anyone can read it. Ignoring
   those headers was worth twenty-two `s3-tests` passes, which is the clearest argument on record that
   a pass count is not a measure of a store.
+  The same rule is structural for **subresources**, because S3 addresses them as a query on the same
+  path an object or bucket already has, so ignoring the query does not drop the request — it runs a
+  different one. Both paths take an allowlist of the queries they understand (`knownObjectQuery`,
+  `bucketOnly`) and answer 501 to anything else. This is not stylistic: before the object-side
+  allowlist existed, `PUT /key?tagging` reached the object PUT and replaced the object with the
+  tagging XML, `PUT /key?acl` truncated it to nothing, `DELETE /key?tagging` deleted it, and
+  `UploadPartCopy` stored an empty part — each answered with a success. Never widen either allowlist
+  to make a client happy without asking what the handler on the other side of it does.
   Buckets are still prefixes and nothing is versioned — those last two answer for records that
   do not exist, because a client that cannot list or empty a bucket cannot use the store.
   `CopyObject` is in because `aws s3 mv` is a copy and a delete, and because a copy that made the

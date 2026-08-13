@@ -242,6 +242,15 @@ func boundedInt(value string, fallback int) int {
 // uploadPart stores one part. It is a PUT to the object's path with a part number
 // and an upload id, which is why the object PUT route has to check for them first.
 func (h *handler) uploadPart(w http.ResponseWriter, r *http.Request, id string) {
+	// A part whose bytes come from another object is UploadPartCopy, which this
+	// server does not implement. Ignoring the header reads the request as a part
+	// with an empty body, which is what it did: `aws s3 cp` of anything over 8 MB
+	// between two keys was answered 200 for every part and assembled an empty
+	// object out of them.
+	if r.Header.Get("X-Amz-Copy-Source") != "" {
+		fail(w, r, errNotImplemented, nil)
+		return
+	}
 	number, err := strconv.Atoi(r.URL.Query().Get("partNumber"))
 	if err != nil {
 		fail(w, r, apiError{"InvalidArgument", http.StatusBadRequest,

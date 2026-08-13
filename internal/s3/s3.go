@@ -74,8 +74,58 @@ func (h *handler) authed(next http.HandlerFunc) http.HandlerFunc {
 			fail(w, r, errEncryptionNotImplemented, nil)
 			return
 		}
+		if key := r.PathValue("key"); key != "" {
+			for name := range r.URL.Query() {
+				if !knownObjectQuery(r.Method, name, r.URL.Query().Get(name)) {
+					fail(w, r, errNotImplemented, nil)
+					return
+				}
+			}
+		}
 		next(w, r)
 	}
+}
+
+// knownObjectQuery reports whether an object request may carry this query
+// parameter. Everything else hanging off an object's path — ?tagging, ?acl,
+// ?retention, ?legal-hold, ?attributes, ?versionId, the response-header overrides —
+// names a subresource this server does not implement.
+//
+// It is an allowlist because the failure is asymmetric, and this was not a
+// cosmetic bug. S3 addresses an object's subresources as a query on the object's
+// own path, so a server that ignores the query answers them with the object
+// operation instead: `put-object-tagging` reached the object PUT and replaced the
+// object with the tagging XML, `put-object-acl` truncated it to nothing because its
+// request has no body, and `delete-object-tagging` deleted it. All three answered
+// 200. A client tagging an object destroyed it and was told the tag was set.
+//
+// The bucket path has had the same guard since the suite found the same shape of
+// bug there (`bucketOnly`), where it only cost honesty. Here it cost the object.
+func knownObjectQuery(method, name, value string) bool {
+	switch name {
+	case "x-id": // The SDKs' own operation label. It names no subresource.
+		return true
+	case "uploadId": // Every multipart call names one, on all four methods.
+		return true
+	case "partNumber":
+		// On a PUT it numbers the part being uploaded. On a GET it asks for one
+		// part of a completed object, which is not implemented — and answering
+		// that with the whole object is the same class of mistake as the above.
+		return method == http.MethodPut
+	case "uploads":
+		return method == http.MethodPost
+	case "max-parts", "part-number-marker":
+		return method == http.MethodGet
+	case "versionId":
+		// Nothing here is versioned, and every object is reported by
+		// ListObjectVersions as the single version "null", so a request naming
+		// that version names the object — which is how a client empties a
+		// bucket. Any other id names a version that never existed, and answering
+		// it with the current object would return or delete something the client
+		// did not ask for.
+		return value == "null"
+	}
+	return false
 }
 
 // encryptionRequested reports whether a request asks for server-side encryption, in

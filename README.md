@@ -113,29 +113,41 @@ acknowledge one it cannot make durable.
 ## How compatible is compatible
 
 Ceph's `s3-tests` is the suite S3 implementations are measured against, and nobody here chose what it
-asserts. It has 886 tests and kavo does not implement most of what they cover, on purpose. Of the 615
-that fail: **478 are explicit anti-goals** — ACLs, versioning, server-side encryption, object lock,
+asserts. It has 886 tests and kavo does not implement most of what they cover, on purpose. Of the 623
+that fail: **487 are explicit anti-goals** — ACLs, versioning, server-side encryption, object lock,
 bucket policy, lifecycle, logging, CORS, tagging, SigV2, browser form uploads — **47 are v1
 `ListObjects`**, which kavo answers only at v2, and **28 follow from buckets being prefixes** rather
 than records. **24 are conditional writes**, which would make the commit a compare-and-set and so
-need arguing for rather than adding. **36 are named gaps**, led by `UploadPartCopy` and reads of a
+need arguing for rather than adding. **35 are named gaps**, led by `UploadPartCopy` and reads of a
 single part. Two are artifacts of the suite's own environment.
 
-With that framing: **177 pass, 615 fail, 94 the suite skips, and nothing errors** — every test
+With that framing: **169 pass, 623 fail, 94 the suite skips, and nothing errors** — every test
 reaches a verdict rather than dying in setup, and every failure is accounted for in
 [`docs/s3-compatibility.md`](docs/s3-compatibility.md), which generates its breakdown from the
 suite's own output so it can be checked rather than believed. Of the tests covering the operations
 kavo does claim, 37 of 40 `ListObjectsV2` tests pass, 15 of 23 single-object copy, 14 of 25
 multipart, 12 of 12 conditional reads, and 6 of 7 user metadata.
 
-The pass count has gone down twice on purpose, and those two moves are the most useful thing the
+The pass count has gone down three times on purpose, and those moves are the most useful thing the
 suite produced. It started at 169, of which eighteen came from answering `PUT ?lifecycle`, `?policy`
 and `?encryption` with a 200 — kavo was passing by claiming to have configured things that exist
 nowhere in the code. Later it reached 196, and twenty-two of those were requests for server-side
 encryption that kavo *ignored*: a client sending a customer key was told its object was stored, which
-it was, in plaintext that anyone could read back without the key. Both sets are refused now, and 177
-is the honest number. A pass count rewards a store for answering; only reading the failures tells you
-what it answered with.
+it was, in plaintext that anyone could read back without the key. Both sets are refused now. The third move is the one to read: an object's
+subresources are a query on the object's own path, so `PUT /key?tagging` reached the handler that
+writes an object and **replaced the object with the tagging XML**, `PUT /key?acl` truncated it to
+nothing, and `DELETE /key?tagging` deleted it — each answered 200, so a client tagging an object
+destroyed it and was told the tag was set. Eight passes were tests doing precisely that. 169 is the
+honest number, and its landing exactly where the measurement started is a coincidence worth
+distrusting: the same number now covers `CopyObject`, conditional reads, `Content-MD5`, user
+metadata and three multipart calls that did not exist then. A pass count rewards a store for answering; only reading the failures tells you what
+it answered with.
+
+That last one the suite did not find, and neither did kavo's own tests. Ten tagging tests were
+failing already, filed under an anti-goal, which is the easiest kind of failure to stop reading.
+What found it was `aws s3 cp` of a 20 MB object between two keys: past 8 MB the CLI copies by
+multipart, and the first call it makes is `GetObjectTagging`. Every guarantee here had been tested
+with the real CLI on the near side of that threshold.
 
 Running the suite found four real defects too, three of which kavo's own tests could not see —
 including a listing that reported itself truncated when it had ended exactly on a page boundary, and
