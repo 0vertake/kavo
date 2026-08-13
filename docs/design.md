@@ -548,7 +548,7 @@ is encrypted while anyone can read it back without the key. That is the one fail
 cannot detect for itself, and it is worth being explicit that this rule *cost* pass count rather than
 earning it.
 
-External validation: Ceph `s3-tests`. **177 of 886 pass, nothing errors**, and every failure is
+External validation: Ceph `s3-tests`. **169 of 886 pass, nothing errors**, and every failure is
 classified in `docs/s3-compatibility.md` — as an anti-goal, a consequence of buckets being prefixes,
 or a named gap. The suite found four real defects, three of which kavo's own tests could not see;
 they are listed there too. It also found two sets of passes that were not real. Eighteen came from a
@@ -556,7 +556,22 @@ they are listed there too. It also found two sets of passes that were not real. 
 claiming to have configured lifecycle rules, policies and encryption it has no code for. Twenty-two
 more came from ignoring the encryption headers above. Refusing the first set took the count from 169
 to 151; `CopyObject`, conditional reads, `Content-MD5`, metadata and the missing multipart calls took
-it to 196; refusing the second set brought it back to 177, which is the honest figure.
+it to 196; refusing the second set brought it back to 177, and refusing an object's subresources —
+which had been answered by overwriting the object — brought it to 169, which is the honest figure.
+That it is the number the measurement opened with is a coincidence: the same count now covers
+`CopyObject`, conditional reads, `Content-MD5`, user metadata and three multipart calls that did
+not exist then.
+
+The third set was the serious one, and the suite did not find it — it was found by copying a 20 MB
+object with the `aws` CLI, which above 8 MB copies by multipart and begins by reading the source's
+tags. Because S3 addresses an object's subresources as a query on the object's own path, ignoring
+the query does not drop the request, it performs a different one: `PUT /key?tagging` wrote the
+tagging XML *as the object*, `PUT /key?acl` truncated the object to nothing, `DELETE /key?tagging`
+deleted it, and `UploadPartCopy` — whose source is named in a header rather than the query — stored
+an empty part. Every one answered success. An object request now carries an allowlist of the
+queries it can mean (`knownObjectQuery`), matching the one buckets have had since the same shape of
+bug was found there, and the tests that cover it assert that the object is unchanged afterwards
+rather than that the call was refused.
 
 ### Object API
 
