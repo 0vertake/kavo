@@ -144,7 +144,7 @@ func TestChunksOfAnUploadInProgressAreKept(t *testing.T) {
 	const key = "big/object.bin"
 	_, outsider := tc.owners(t, key)
 
-	id, err := outsider.c.CreateUpload(context.Background(), key, "application/octet-stream")
+	id, err := outsider.c.CreateUpload(context.Background(), key, "application/octet-stream", nil)
 	if err != nil {
 		t.Fatalf("create upload: %v", err)
 	}

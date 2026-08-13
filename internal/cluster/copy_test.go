@@ -6,6 +6,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/0vertake/kavo/internal/cluster"
 	"github.com/0vertake/kavo/internal/object"
 )
 
@@ -17,7 +18,7 @@ func TestACopySharesTheSourcesChunks(t *testing.T) {
 	data := randBytes(2 * testChunkSize)
 	m := mustPut(t, tc.nodes["n1"], from, data)
 
-	copied, err := tc.nodes["n1"].c.Copy(context.Background(), from, to)
+	copied, err := tc.nodes["n1"].c.Copy(context.Background(), from, to, cluster.CopyOptions{})
 	if err != nil {
 		t.Fatalf("copy: %v", err)
 	}
@@ -40,7 +41,7 @@ func TestDeletingTheSourceLeavesTheCopyReadable(t *testing.T) {
 	const from, to = "original.bin", "duplicate.bin"
 	data := randBytes(2 * testChunkSize)
 	mustPut(t, tc.nodes["n1"], from, data)
-	if _, err := tc.nodes["n1"].c.Copy(context.Background(), from, to); err != nil {
+	if _, err := tc.nodes["n1"].c.Copy(context.Background(), from, to, cluster.CopyOptions{}); err != nil {
 		t.Fatalf("copy: %v", err)
 	}
 
@@ -70,7 +71,7 @@ func TestMovingACopyLeavesTheSourceReadable(t *testing.T) {
 	from := "original.bin"
 	m := mustPut(t, tc.nodes["n1"], from, data)
 	to := keyOwnedElsewhere(t, tc, m.Nodes)
-	if _, err := tc.nodes["n1"].c.Copy(context.Background(), from, to); err != nil {
+	if _, err := tc.nodes["n1"].c.Copy(context.Background(), from, to, cluster.CopyOptions{}); err != nil {
 		t.Fatalf("copy: %v", err)
 	}
 

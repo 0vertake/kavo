@@ -75,6 +75,14 @@ type Manifest struct {
 	// affects how the object is stored.
 	ContentType string
 	Modified    time.Time
+	// Meta is what a client attached to the object and expects back verbatim: its
+	// x-amz-meta-* headers, and the few standard ones that describe the bytes
+	// rather than the transfer (Cache-Control, Content-Disposition,
+	// Content-Encoding, Content-Language, Expires). Stored in canonical HTTP
+	// form so a read replays it without a translation table, and never
+	// interpreted here — a store that acted on Content-Encoding would be
+	// deciding what the bytes mean, which is the client's business.
+	Meta map[string]string `json:",omitempty"`
 	// Nodes are the partition owners the chunks were written to. All chunks of
 	// an object share a partition, so one list covers them all.
 	//

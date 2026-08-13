@@ -113,49 +113,53 @@ acknowledge one it cannot make durable.
 ## How compatible is compatible
 
 Ceph's `s3-tests` is the suite S3 implementations are measured against, and nobody here chose what it
-asserts. It has 886 tests and kavo does not implement most of what they cover, on purpose. Of the 613
-that fail: **462 are explicit anti-goals** — ACLs, versioning, server-side encryption, object lock,
-bucket policy, lifecycle, logging, CORS, tagging, SigV2, browser form uploads — **48 are v1
+asserts. It has 886 tests and kavo does not implement most of what they cover, on purpose. Of the 615
+that fail: **478 are explicit anti-goals** — ACLs, versioning, server-side encryption, object lock,
+bucket policy, lifecycle, logging, CORS, tagging, SigV2, browser form uploads — **47 are v1
 `ListObjects`**, which kavo answers only at v2, and **28 follow from buckets being prefixes** rather
 than records. **24 are conditional writes**, which would make the commit a compare-and-set and so
-need arguing for rather than adding. **50 are named gaps**, half of them multipart copy and multipart
-edge cases. One is the suite asserting Ceph's own configured region name.
+need arguing for rather than adding. **36 are named gaps**, led by `UploadPartCopy` and reads of a
+single part. Two are artifacts of the suite's own environment.
 
-With that framing: **179 pass, 613 fail, 94 the suite skips, and nothing errors** — every test
+With that framing: **177 pass, 615 fail, 94 the suite skips, and nothing errors** — every test
 reaches a verdict rather than dying in setup, and every failure is accounted for in
 [`docs/s3-compatibility.md`](docs/s3-compatibility.md), which generates its breakdown from the
 suite's own output so it can be checked rather than believed. Of the tests covering the operations
-kavo does claim, 37 of 40 `ListObjectsV2` tests pass, 12 of 23 single-object copy tests, and 12 of 12
-conditional reads. Two of those copy passes used to be hollow — kavo ignored
-`x-amz-copy-source-if-match` rather than honouring it — which is the kind of pass worth subtracting
-out loud, and it is now honoured.
+kavo does claim, 37 of 40 `ListObjectsV2` tests pass, 15 of 23 single-object copy, 14 of 25
+multipart, 12 of 12 conditional reads, and 6 of 7 user metadata.
 
-Two of those numbers moved for reasons worth separating. Nineteen passes came from adding
-`CopyObject`, which is a real operation clients use. Thirty-seven failures moved from the gap column
-to the anti-goal column because they were misfiled: the encryption tests whose names read as copies
-(`test_copy_enc[...]`) can never pass without SSE, and the classifier's rule for them matched `enc_`
-but not `enc[`. Nothing improved; a number that was wrong got fixed, which is the risk of any
-self-generated breakdown and the reason the script and its input are both in the repo.
+The pass count has gone down twice on purpose, and those two moves are the most useful thing the
+suite produced. It started at 169, of which eighteen came from answering `PUT ?lifecycle`, `?policy`
+and `?encryption` with a 200 — kavo was passing by claiming to have configured things that exist
+nowhere in the code. Later it reached 196, and twenty-two of those were requests for server-side
+encryption that kavo *ignored*: a client sending a customer key was told its object was stored, which
+it was, in plaintext that anyone could read back without the key. Both sets are refused now, and 177
+is the honest number. A pass count rewards a store for answering; only reading the failures tells you
+what it answered with.
 
-Running it was worth more than the number, twice over. It found four real defects, three of which
-kavo's own tests could not see — including a listing that reported itself truncated when it had ended
-exactly on a page boundary, which the in-repo test missed because it used three keys and a page size
-of two. And it started at 169: eighteen of those passes came from answering `PUT ?lifecycle`,
-`?policy` and `?encryption` with a 200, so kavo was passing by claiming to have configured things
-that exist nowhere in the code. Refusing them cost eighteen tests and is the right answer.
+Running the suite found four real defects too, three of which kavo's own tests could not see —
+including a listing that reported itself truncated when it had ended exactly on a page boundary, and
+metadata keys replayed as `X-Amz-Meta-Colour` where S3 sends `x-amz-meta-colour`. That one was
+invisible in-repo because kavo's tests use the AWS Go SDK, which lowercases those keys before handing
+them over; botocore does not, and seven tests died on it.
 
 ## What it does not do
 
 Deliberate anti-goals, not a roadmap: no IAM, no ACLs, no versioning, no lifecycle rules, no
 bucket policies, no `ListObjects` v1. The S3 subset is PUT, GET (including ranges), HEAD, DELETE,
-`ListObjectsV2`, multipart upload and `CopyObject`, with SigV4 verification — plus the handful of
-calls clients make without being asked, which answer for records that do not exist: `CreateBucket` succeeds
-because a bucket is a prefix, `ListBuckets` is a root listing, `DeleteBucket` refuses while objects
-remain, and `ListObjectVersions` reports every object once as version `null`.
+`ListObjectsV2`, multipart upload and `CopyObject`, with SigV4 verification, conditional reads,
+`Content-MD5` verification and `x-amz-meta-*` passthrough — plus the handful of calls clients make
+without being asked, which answer for records that do not exist: `CreateBucket` succeeds because a
+bucket is a prefix, `ListBuckets` is a root listing, `DeleteBucket` refuses while objects remain, and
+`ListObjectVersions` reports every object once as version `null`.
+
+A request kavo cannot honour is refused rather than ignored, which is a rule and not a habit: asking
+for server-side encryption gets a 501 saying so, because storing the object in plaintext and
+answering 200 tells a client its data is encrypted when it is readable by anyone.
 
 The gaps a client might actually notice are named in
-[`docs/s3-compatibility.md`](docs/s3-compatibility.md) rather than buried: no conditional requests,
-no `Content-MD5` verification, no `x-amz-meta-*` passthrough.
+[`docs/s3-compatibility.md`](docs/s3-compatibility.md) rather than buried: no `UploadPartCopy`, no
+reads of a single part, no checksum algorithms other than MD5.
 
 Real limitations — an etcd-bound object count, rot that can sit until the next scrub, deleted space
 that takes about half an hour to come back because collection is the only thing that deletes a

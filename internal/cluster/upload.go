@@ -52,12 +52,12 @@ type CompletedPart struct {
 }
 
 // CreateUpload begins a multipart upload and returns its id.
-func (c *Coordinator) CreateUpload(ctx context.Context, key, contentType string) (string, error) {
+func (c *Coordinator) CreateUpload(ctx context.Context, key, contentType string, metadata map[string]string) (string, error) {
 	// Random rather than derived from the key: two clients uploading the same key
 	// at once are two independent uploads, and each must be able to abort its own
 	// without touching the other's parts.
 	id := rand.Text()
-	u := meta.Upload{Key: key, ContentType: contentType, Created: time.Now().UTC()}
+	u := meta.Upload{Key: key, ContentType: contentType, Created: time.Now().UTC(), Meta: metadata}
 	if err := c.meta.CreateUpload(ctx, id, u); err != nil {
 		return "", err
 	}
@@ -106,6 +106,17 @@ func (c *Coordinator) UploadPart(ctx context.Context, id string, number int, bod
 // that is readable, checksum-valid, and not what anybody uploaded.
 func (c *Coordinator) CompleteUpload(ctx context.Context, id string, parts []CompletedPart) (object.Manifest, error) {
 	u, err := c.meta.Upload(ctx, id)
+	if errors.Is(err, meta.ErrNotFound) {
+		// The upload may have completed already, with the client never seeing the
+		// answer: every SDK retries a request whose connection died, and telling
+		// it NoSuchUpload says the upload failed while the object is sitting
+		// there. What is returned is what this upload produced, which is not
+		// necessarily what is at the key now — the answer is about the upload.
+		if done, dErr := c.meta.Completion(ctx, id); dErr == nil {
+			return object.Manifest{ETag: done.ETag, Modified: done.When}, nil
+		}
+		return object.Manifest{}, err
+	}
 	if err != nil {
 		return object.Manifest{}, err
 	}
@@ -124,7 +135,7 @@ func (c *Coordinator) CompleteUpload(ctx context.Context, id string, parts []Com
 		return object.Manifest{}, fmt.Errorf("%w: a completion listed its parts descending", ErrPartOrder)
 	}
 
-	final := object.Manifest{ContentType: u.ContentType}
+	final := object.Manifest{ContentType: u.ContentType, Meta: u.Meta}
 	// The multipart ETag is the MD5 of the parts' MD5s, with the part count after
 	// a dash. Clients recompute it to check an upload, so it is not free to be
 	// anything simpler.
@@ -171,6 +182,15 @@ func (c *Coordinator) CompleteUpload(ctx context.Context, id string, parts []Com
 	if err := c.meta.Commit(ctx, u.Key, final); err != nil {
 		return object.Manifest{}, err
 	}
+	// Before forgetting the upload, so that there is no instant in which the id is
+	// neither in flight nor remembered — a retry landing there would be told its
+	// upload never existed.
+	done := meta.Completion{Key: u.Key, ETag: final.ETag, When: final.Modified, Parts: len(parts)}
+	if err := c.meta.FinishUpload(ctx, id, done); err != nil {
+		// The object is committed, so this is only about what a retry will be
+		// told: NoSuchUpload rather than the answer it missed.
+		log.Printf("complete upload %s: remember completion: %v", id, err)
+	}
 	if err := c.meta.DeleteUpload(ctx, id); err != nil {
 		// The object is committed and readable; a leftover upload record is
 		// clutter, not corruption.
@@ -190,5 +210,46 @@ func (c *Coordinator) CompleteUpload(ctx context.Context, id string, parts []Com
 // committed object deleted. Neither is possible now that nothing deletes a chunk
 // except the pass that reads every manifest first.
 func (c *Coordinator) AbortUpload(ctx context.Context, id string) error {
+	// Read before deleting, so that aborting an id that never existed is an error
+	// rather than a success. A client that is told it cleaned up something it made
+	// up cannot tell that from having cleaned up the wrong thing, and S3 answers
+	// NoSuchUpload.
+	if _, err := c.meta.Upload(ctx, id); err != nil {
+		return err
+	}
 	return c.meta.DeleteUpload(ctx, id)
+}
+
+// Part is one uploaded part as a listing reports it.
+type Part struct {
+	Number   int
+	ETag     string
+	Size     int64
+	Modified time.Time
+}
+
+// Parts lists an upload's parts in part-number order. An upload has at most
+// MaxParts of them, so this is bounded by the protocol rather than by the store.
+func (c *Coordinator) Parts(ctx context.Context, id string) ([]Part, error) {
+	// So that listing the parts of an upload that does not exist says so, rather
+	// than reporting that it has none.
+	if _, err := c.meta.Upload(ctx, id); err != nil {
+		return nil, err
+	}
+	stored, err := c.meta.Parts(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	parts := make([]Part, 0, len(stored))
+	for number, m := range stored {
+		parts = append(parts, Part{Number: number, ETag: m.ETag, Size: m.Size, Modified: m.Modified})
+	}
+	slices.SortFunc(parts, func(a, b Part) int { return a.Number - b.Number })
+	return parts, nil
+}
+
+// Uploads lists in-flight uploads under a key prefix. See meta.Store.Uploads for
+// the order they come back in and why it is not S3's.
+func (c *Coordinator) Uploads(ctx context.Context, prefix, after string, limit int) ([]meta.UploadRef, bool, error) {
+	return c.meta.Uploads(ctx, prefix, after, limit)
 }

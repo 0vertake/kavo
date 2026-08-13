@@ -68,8 +68,34 @@ func (h *handler) authed(next http.HandlerFunc) http.HandlerFunc {
 			fail(w, r, authError(err), err)
 			return
 		}
+		// After the signature, so that an unsigned request is told about the
+		// signature rather than about this.
+		if encryptionRequested(r.Header) {
+			fail(w, r, errEncryptionNotImplemented, nil)
+			return
+		}
 		next(w, r)
 	}
+}
+
+// encryptionRequested reports whether a request asks for server-side encryption, in
+// any of its forms: SSE-S3, SSE-KMS, a customer key, or a customer key for a copy's
+// source.
+//
+// Refused rather than ignored, which is what this used to do. Encryption at rest is
+// an anti-goal, and ignoring the headers meant a client that sent a customer key was
+// answered 200 for an object stored in plaintext that anyone without the key could
+// read — the client believing otherwise being the whole point of sending the key.
+// Ceph's suite scored that arrangement as twenty passes, which is the clearest
+// argument available that a pass count is not a measure of a store.
+func encryptionRequested(header http.Header) bool {
+	for name := range header {
+		if strings.HasPrefix(name, "X-Amz-Server-Side-Encryption") ||
+			strings.HasPrefix(name, "X-Amz-Copy-Source-Server-Side-Encryption") {
+			return true
+		}
+	}
+	return false
 }
 
 // key is the etcd key for an object: the bucket and the key within it. Both parts
@@ -116,10 +142,17 @@ func (h *handler) putObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	stored, err := storedMeta(r.Header)
+	if err != nil {
+		fail(w, r, errMetadataTooLarge, err)
+		return
+	}
+
 	m, err := h.cluster.Put(r.Context(), key, r.Body, cluster.PutOptions{
 		ContentType: r.Header.Get("Content-Type"),
 		Size:        r.ContentLength,
 		MD5:         digest,
+		Meta:        stored,
 	})
 	if err != nil {
 		fail(w, r, storeError(err), err)
@@ -142,10 +175,24 @@ func (h *handler) copyObject(w http.ResponseWriter, r *http.Request, key, source
 		fail(w, r, errInvalidCopySource, nil)
 		return
 	}
-	// S3 refuses a copy onto itself, because the only thing it could mean is a
-	// metadata rewrite, and metadata is not something this store keeps to rewrite.
-	if from == key {
+	directive := r.Header.Get("X-Amz-Metadata-Directive")
+	replace := strings.EqualFold(directive, "REPLACE")
+	if directive != "" && !replace && !strings.EqualFold(directive, "COPY") {
+		fail(w, r, errInvalidDirective, nil)
+		return
+	}
+	// A copy onto itself is only meaningful as a metadata rewrite, so S3 allows it
+	// exactly when the request replaces the metadata. Without REPLACE it is a
+	// request to overwrite an object with itself, which is either a mistake or a
+	// client that meant to say REPLACE.
+	if from == key && !replace {
 		fail(w, r, errCopyOntoItself, nil)
+		return
+	}
+
+	stored, err := storedMeta(r.Header)
+	if err != nil {
+		fail(w, r, errMetadataTooLarge, err)
 		return
 	}
 
@@ -167,7 +214,11 @@ func (h *handler) copyObject(w http.ResponseWriter, r *http.Request, key, source
 		}
 	}
 
-	m, err := h.cluster.Copy(r.Context(), from, key)
+	m, err := h.cluster.Copy(r.Context(), from, key, cluster.CopyOptions{
+		Replace:     replace,
+		ContentType: r.Header.Get("Content-Type"),
+		Meta:        stored,
+	})
 	if err != nil {
 		fail(w, r, storeError(err), err)
 		return
@@ -212,6 +263,14 @@ func (h *handler) getObject(w http.ResponseWriter, r *http.Request) {
 		h.listObjects(w, r)
 		return
 	}
+	// A GET carrying an upload id asks what parts have arrived, not for the object:
+	// the object does not exist yet, and answering NoSuchKey tells a client
+	// resuming an upload that its work is gone.
+	if id := r.URL.Query().Get("uploadId"); id != "" {
+		h.listParts(w, r, key, id)
+		return
+	}
+
 	m, err := h.cluster.Resolve(r.Context(), key)
 	if err != nil {
 		fail(w, r, storeError(err), err)
@@ -243,6 +302,14 @@ func (h *handler) getObject(w http.ResponseWriter, r *http.Request) {
 
 	header := w.Header()
 	validators(header, m)
+	// Assigned rather than Set, because the map keys are already the form these
+	// go out in and Set would canonicalise them — see storedMeta. Before the
+	// headers below, so that a stored header can never displace one describing
+	// this particular response: a Content-Length kept from an upload would make a
+	// range read unreadable.
+	for name, value := range m.Meta {
+		header[name] = []string{value}
+	}
 	header.Set("Accept-Ranges", "bytes")
 	header.Set("Content-Length", strconv.FormatInt(length, 10))
 	if m.ContentType != "" {
@@ -338,6 +405,75 @@ func precondition(header http.Header, m object.Manifest) (int, bool) {
 		return http.StatusNotModified, false
 	}
 	return http.StatusOK, true
+}
+
+// passthrough are the standard headers a write stores and a read replays. They
+// describe the bytes rather than the transfer, which is what makes them the
+// object's business and not this request's: Content-Length and Content-MD5 are
+// about one HTTP exchange, and storing them would answer a later reader with facts
+// about an exchange that is over.
+var passthrough = []string{
+	"Cache-Control",
+	"Content-Disposition",
+	"Content-Encoding",
+	"Content-Language",
+	"Expires",
+}
+
+// MaxMeta bounds what one object can carry, as S3 does. Unbounded metadata is
+// unbounded manifests, and a manifest is read by every request for the object and
+// by every background pass over it.
+const MaxMeta = 2 << 10
+
+// storedMeta collects what the object should carry: the client's x-amz-meta-*, and
+// the passthrough headers above, in canonical HTTP form.
+func storedMeta(header http.Header) (map[string]string, error) {
+	var stored map[string]string
+	size := 0
+	keep := func(name, value string) {
+		if stored == nil {
+			stored = make(map[string]string)
+		}
+		stored[name] = value
+		size += len(name) + len(value)
+	}
+	for name, values := range header {
+		if strings.HasPrefix(name, "X-Amz-Meta-") && len(values) > 0 {
+			// Lowercased, which is what S3 does and what clients compare
+			// against: botocore hands the caller whatever case the response
+			// used, so "Colour" and "colour" are different keys to the code on
+			// the other end. Go canonicalises header names on the way in, so
+			// without this every key comes back capitalised.
+			keep(strings.ToLower(name), values[0])
+		}
+	}
+	for _, name := range passthrough {
+		if value := header.Get(name); value != "" {
+			if name == "Content-Encoding" {
+				// aws-chunked is the framing of the body that just arrived, and
+				// kavo decoded it. Keeping it would tell a later reader the
+				// stored bytes are chunk-framed, which they are not.
+				if value = withoutAWSChunked(value); value == "" {
+					continue
+				}
+			}
+			keep(name, value)
+		}
+	}
+	if size > MaxMeta {
+		return nil, fmt.Errorf("%d bytes of metadata, at most %d", size, MaxMeta)
+	}
+	return stored, nil
+}
+
+func withoutAWSChunked(encoding string) string {
+	kept := make([]string, 0, 2)
+	for part := range strings.SplitSeq(encoding, ",") {
+		if part = strings.TrimSpace(part); part != "" && !strings.EqualFold(part, "aws-chunked") {
+			kept = append(kept, part)
+		}
+	}
+	return strings.Join(kept, ", ")
 }
 
 // copyConditions translates the x-amz-copy-source-if-* headers into the plain

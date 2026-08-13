@@ -4,26 +4,45 @@ Ceph's [`s3-tests`](https://github.com/ceph/s3-tests) is the suite S3 implementa
 against. It is an independent oracle in the strongest sense available: nobody involved in kavo chose
 what it asserts, and it encodes S3's behaviour as observed by people who had to match it.
 
-**179 of 886 pass. 613 fail, 94 the suite skips itself, and nothing errors** — every test reaches a
+**177 of 886 pass. 615 fail, 94 the suite skips itself, and nothing errors** — every test reaches a
 verdict rather than dying in setup. The pass count is not the interesting number on its own, because
 most of what the suite covers is deliberately absent here (see the locked subset in
 `docs/design.md`). What is interesting is the classification below: what fails because of an
 anti-goal, and what fails because of a gap.
 
-It was 170 before conditional reads and `Content-MD5`, and the nine that arrived with them are worth
-naming, because the suite disagreed with the first version of both in ways that reading the
-specification had not: an `If-Match` that fails is a 412 while an `If-None-Match` that matches is a
-304, so the same unmet condition has two answers depending on which way it was asked; the four date
-and tag headers have a precedence order rather than being four independent tests; a condition on a
-copy is 412 either way, since a copy has no "you already have it" outcome to report; and an *empty*
-`Content-MD5` is a malformed digest rather than an absent one. Two rounds of nine tests, and none of
-them was the feature — they were all the edges of it.
+The count has moved five times, and twice it moved down on purpose:
 
-Before that it was 151, and the 19 `CopyObject` added are the cheapest 19 in the suite: a
-copy is a manifest written under a second key, no chunk moves, and four encryption tests that had
-been failing in their setup got far enough to pass as well.
+| count | what changed |
+| --- | --- |
+| 169 | where it started being measured |
+| 151 | refusing bucket subresource writes that had been answered with a 200 |
+| 170 | `CopyObject` |
+| 179 | conditional reads and `Content-MD5` |
+| 196 | user metadata, header passthrough, and the multipart calls the API was missing |
+| 177 | refusing requests for encryption instead of ignoring them |
 
-Earlier still it was 169, and the 18 it lost are the most useful thing the suite produced. Every bucket
+The last line is the one worth reading. kavo does not encrypt objects, and it used to *ignore* the
+headers asking it to: a client that sent a customer key was answered `200`, its object stored in
+plaintext that anyone could read back without the key, and the suite scored that arrangement as
+twenty-two passes. Three of them arrived in this very round, as a side effect of unrelated multipart
+work — which is how the problem surfaced, since an encryption test passing on a store with no
+encryption can only be passing for a bad reason. They are refused now, all of them, and the count
+is nineteen lower and honest. The 20 real gains in the same round are in the row above it.
+
+The nine that came with conditional reads and `Content-MD5` are worth naming too, because the suite
+disagreed with the first version of both in ways that reading the specification had not: an
+`If-Match` that fails is a 412 while an `If-None-Match` that matches is a 304, so the same unmet
+condition has two answers depending on which way it was asked; the four date and tag headers have a
+precedence order rather than being four independent tests; a condition on a copy is 412 either way,
+since a copy has no "you already have it" outcome to report; and an *empty* `Content-MD5` is a
+malformed digest rather than an absent one. None of them was the feature — they were all the edges
+of it.
+
+The 19 `CopyObject` added are the cheapest 19 in the suite: a copy is a manifest written under a
+second key, no chunk moves, and four encryption tests that had been failing in their setup got far
+enough to pass as well.
+
+The 18 lost before that are the most useful thing the suite produced. Every bucket
 subresource is a query on the bucket's own path — `?versioning`, `?acl`, `?lifecycle`, `?encryption`,
 `?policy`, `?tagging` — so a `PUT` to any of them reached the handler that creates a bucket and was
 answered with a 200. Those eighteen tests configure something and check that the call succeeded, and
@@ -77,20 +96,20 @@ running someone else's suite:
 
 It found no integrity failure: nothing in the suite got back bytes other than the ones it wrote.
 
-## Why the 613 fail
+## Why the 615 fail
 
 `docs/classify.py` produces this table from the suite's own failure list. Each test lands in exactly
-one family — the first that matches its name, in the order shown — so the counts sum to 613 rather
+one family — the first that matches its name, in the order shown — so the counts sum to 615 rather
 than counting an SSE copy twice. A test is filed under what it is about, which is not always what it
 died on: many of these never reach their assertion because a `ListObjects` v1 call or a
 `GetBucketVersioning` in their setup is refused first.
 
 | count | family | verdict |
 | --- | --- | --- |
-| 122 | server-side encryption (SSE-C, SSE-KMS) | anti-goal |
+| 138 | server-side encryption (SSE-C, SSE-KMS) | anti-goal, and refused rather than ignored |
 | 75 | ACLs, grants, and the public/private access matrix | anti-goal |
 | 47 | versioning: version ids, delete markers, suspend | anti-goal |
-| 46 | `ListObjects` v1 and its paging parameters | deliberate: v2 only |
+| 45 | `ListObjects` v1 and its paging parameters | deliberate: v2 only |
 | 39 | bucket policy, public access block, ownership controls | anti-goal |
 | 36 | object lock, retention, legal hold, governance | anti-goal |
 | 34 | lifecycle and expiration | anti-goal |
@@ -99,13 +118,12 @@ died on: many of these never reach their assertion because a `ListObjects` v1 ca
 | 26 | bucket and request logging | anti-goal |
 | 24 | conditional writes and deletes (`If-Match` on `PUT`, `DELETE`) | deliberate, see below |
 | 21 | SigV2 signing | anti-goal: SigV4 only |
-| 13 | multipart upload edge cases | gap, see below |
-| 12 | `CopyObject` and multipart copy | gap, see below |
 | 12 | CORS | anti-goal |
 | 10 | tagging | anti-goal |
+| 9 | `UploadPartCopy` and cross-account copy | gap and anti-goal, see below |
+| 9 | multipart upload edge cases | mixed, see below |
 | 9 | non-MD5 checksum algorithms (CRC32, CRC32C, SHA-1) | gap |
 | 8 | anonymous and unsigned access | anti-goal: one key pair, everything signed |
-| 7 | user metadata (`x-amz-meta-*`) and header passthrough | gap |
 | 6 | error codes for malformed authorization and date headers | gap |
 | 3 | `100-continue` and `Expect` | gap |
 | 2 | bulk delete, both failing in setup on a v1 listing | deliberate: v2 only |
@@ -113,17 +131,18 @@ died on: many of these never reach their assertion because a `ListObjects` v1 ca
 | 1 | `GetObjectAttributes` | anti-goal |
 | 1 | website, torrent, select, notification, inventory, analytics, replication | anti-goal |
 | 1 | `GetBucketLocation` | suite artifact, see below |
+| 1 | non-ASCII metadata | suite artifact, see below |
 
-The encryption row grew by 37 without a line of kavo changing, and that is a correction rather than a
-regression: `test_copy_enc[...]` and `test_copy_part_enc[...]` pass a customer key or ask for SSE-S3,
-so no amount of copy support reaches them, but the rule that catches encryption tests matched `enc_`
-and not `enc[`. They had been counted as copy gaps. A classifier is only worth the numbers it
-produces, so it is filed here rather than quietly fixed.
+The encryption row has grown twice without encryption being any nearer. Once by 37, when the rule
+that catches encryption tests was found to match `enc_` and not `enc[`, so the parametrised
+`test_copy_enc[...]` cases had been counted as copy gaps. Once by 16, when kavo started refusing the
+requests it had been ignoring, which moved tests that had been passing into this row. A classifier is
+only worth the numbers it produces, so both are filed here rather than quietly fixed.
 
-By verdict: **462 anti-goals, 48 v1 `ListObjects`, 28 consequences of buckets being prefixes, 24
-conditional writes, 50 named gaps, and 1 artifact of the suite's own config.** The gap column is the
-one to read — it is the list of things a client might reasonably expect and not get. It is now led by
-multipart, from both ends: 13 upload edge cases and 12 copy, of which 6 are `UploadPartCopy`.
+By verdict: **478 anti-goals, 47 v1 `ListObjects`, 28 consequences of buckets being prefixes, 24
+conditional writes, 36 named gaps, and 2 artifacts of the suite's own environment.** The gap column
+is the one to read — it is the list of things a client might reasonably expect and not get. It is led
+by `UploadPartCopy` (6) and by `?partNumber` reads (3), with the rest in checksums and error codes.
 
 Not one conditional *read* fails. The 24 in the row above are all `If-Match` on a `PUT` or a
 `DELETE`, and they are an exclusion rather than an oversight: a conditional write makes the commit a
@@ -136,28 +155,55 @@ Anti-goals are listed in `docs/design.md` and are not defects: kavo is an object
 S3 subset, not an S3 clone. The rows marked **gap** are things a client might reasonably expect that
 kavo does not do yet, and they are worth naming honestly:
 
-- **Multipart copy.** `CopyObject` itself now works — a manifest written under a second key, no
-  chunk movement, which is what makes `aws s3 mv` server-side. `UploadPartCopy`, which assembles a
-  new object out of ranges of existing ones, does not, and that is 6 of the 12 in the copy row.
-  Nothing about it is hard, since a part is already a manifest of chunk references, but a *range* of
-  a source object is not: it would have to re-chunk at the range boundaries, and re-chunking is the
-  one thing a copy currently never does.
-- **`x-amz-metadata-directive`** on a copy, which is `COPY` or `REPLACE`, and the three copy tests
-  that ask for it. `REPLACE` means the copy carries new user metadata, so it waits on the same
-  passthrough as the row below; it is also what makes a copy onto itself legal, which is why kavo
-  refuses that where S3 allows it.
-- **Re-completing a finished multipart upload** answers `NoSuchUpload` where S3 answers 200. A client
-  whose completion response was lost retries and concludes the upload failed while the object is
-  sitting there. Being idempotent means remembering which upload ids completed and what they
-  produced — a record with no reader other than a retry, which has to be reclaimed on some schedule
-  of its own. Collection reclaims chunks, not that.
-- **`x-amz-meta-*` user metadata** is stored for nothing today: kavo keeps `Content-Type` and drops
-  the rest.
+- **`UploadPartCopy`.** `CopyObject` works — a manifest written under a second key, no chunk
+  movement, which is what makes `aws s3 mv` server-side. Assembling a new object out of *ranges* of
+  existing ones does not, and that is 6 of the 9 in the copy row. A part is already a manifest of
+  chunk references, so copying a whole object into a part would be easy; a range of one is not,
+  because it would have to re-chunk at the range boundaries, and re-chunking is the one thing a copy
+  never does. The other 3 are cross-account, which needs a second key pair to exist.
+- **`?partNumber` on a read**, which returns one part of a multipart object and the `PartsCount` of
+  the whole, and the 3 tests that ask for it. The manifest records the object's chunks but not where
+  its parts ended, so answering this means recording part boundaries at completion — a change to what
+  a manifest is, for a feature whose only user is a client parallelising a download it could do with
+  ranges.
+- **Non-MD5 checksums** (`x-amz-checksum-crc32`, `-crc32c`, `-sha1`, `-sha256`). This one is
+  half-built already and in the right direction: chunks are CRC32C-checksummed on disk and verified
+  on every read. What is missing is the S3 surface for a client to declare one and read it back,
+  including its trailer form on a streaming upload.
+- **Error codes for malformed authorization and date headers**, where kavo answers a plausible
+  refusal with the wrong code — a client is told `AccessDenied` where S3 says
+  `MissingSecurityHeader`. Both refuse, so nothing is stored on a bad signature; a client
+  distinguishing the two programmatically gets the wrong answer.
 
-One failure is neither: `test_bucket_get_location` asserts that `GetBucketLocation` returns
+Three failures are deliberate rather than missing, and each is a case where the suite asks kavo to
+be more forgiving than it is willing to be:
+
+- **A part smaller than 5 MiB** is accepted where S3 answers `EntityTooSmall`
+  (`test_multipart_upload_size_too_small`). The limit exists to bound the part count, which kavo
+  bounds directly at 10,000 parts, and enforcing it would cost more than it buys: every multipart
+  test in this repository — including the chaos suite, which writes thousands of objects while
+  killing nodes — would have to move 5 MiB per part. Taxing the test that proves durability to gain
+  a compatibility test is the wrong trade, and the alternative, a minimum part size that tests can
+  turn off, is a protocol constant pretending to be configuration.
+- **A completion that names the same part twice**, with two different etags, is refused where S3
+  picks one (`test_multipart_resend_first_finishes_last`, which uploads part 1 twice concurrently and
+  then lists both etags). The client has sent contradictory instructions; committing either version
+  produces an object nobody uploaded, and refusing is the same rule that makes any completion naming
+  a part it did not upload change nothing.
+- **A conditional write** is refused, as described above.
+
+Two failures are neither defect nor decision, but artifacts of the environment the suite runs in.
+`test_bucket_get_location` asserts that `GetBucketLocation` returns
 `default`, which is the region name in Ceph's own config file rather than anything S3 defines. kavo
 returns the empty constraint, which is what AWS returns for `us-east-1` and what botocore surfaces
 as `None`. Matching the suite here would mean being wrong for every real client.
+
+`test_object_set_get_unicode_metadata` is the other. It sends a metadata value as UTF-8 and reads the
+response back as latin-1, so passing it requires the server to re-encode between the two — to guess
+the charset of a header whose charset HTTP does not carry. kavo stores the bytes it was given and
+returns them unchanged, which round-trips for any client that reads the header the way it wrote it.
+The suite marks this one as failing on Ceph too, with the comment that the decoding "is not happening
+properly for unknown reasons".
 
 ### Buckets exist as soon as they are named
 
@@ -185,17 +231,31 @@ kavo claims:
 | family | passing |
 | --- | --- |
 | `ListObjectsV2`, all shapes | 37 of 40 |
-| single-object `CopyObject` | 12 of 23 |
+| multipart upload, end to end | 14 of 25 |
+| single-object `CopyObject` | 15 of 23 |
 | conditional reads: 8 on `GET`, 4 on a copy source | 12 of 12 |
+| user metadata and header passthrough | 6 of 7 |
 
 The three listing failures are anonymous access, the `allow-unordered` extension, and an empty
 `continuation-token` echoed back as an absent field rather than an empty one.
 
+The multipart row counts the 25 multipart tests that are not encryption, ACL, versioning, lock,
+policy, logging, tagging, attributes or copy variants. It was 9 of 25 before this round. Its 11
+remaining failures are the 3 `?partNumber` reads, 3 conditional writes, 2 lifecycle expiry of an
+abandoned upload, 1 owner reporting, and the 2 deliberate refusals above.
+
 The copy row counts the 23 copy tests that are not encryption, ACL, versioning, tagging, lock,
-policy, logging or cross-tenant variants — those fail on the anti-goal, not on the copy. Its 11
-failures are 6 multipart copy, 3 the metadata directive, and 2 cross-account, which needs a second
-key pair to exist. Two of those 12 passes were accidents until recently: `test_copy_object_ifmatch_good`
-and `test_copy_object_ifnonematch_failed` expect a copy to proceed, and kavo proceeded because it
-ignored the condition. Their mirror images, where the condition should refuse the copy, are two of
-the nine tests the conditional work added — which is the argument for reading the failures rather
-than the passes, and for having written down that those two were hollow while they were.
+policy, logging or cross-tenant variants — those fail on the anti-goal, not on the copy. Its 8
+failures are 6 `UploadPartCopy` and 2 cross-account. Two of the 15 passes were accidents until
+recently: `test_copy_object_ifmatch_good` and `test_copy_object_ifnonematch_failed` expect a copy to
+proceed, and kavo proceeded because it ignored the condition. Their mirror images, where the
+condition should refuse the copy, are two of the nine tests the conditional work added — which is the
+argument for reading the failures rather than the passes, and for having written down that those two
+were hollow while they were.
+
+The metadata row's one failure is the charset artifact above. This row is the reason to keep an
+independent client in the loop: kavo's own tests use the AWS Go SDK, which lowercases the metadata
+keys of a response before handing them over, so it could not see that kavo was replaying
+`X-Amz-Meta-Colour` where S3 sends `x-amz-meta-colour`. Every one of these seven tests failed on that
+alone, and every one of kavo's own passed. The claim now has a test that can fail
+(`TestStoredMetadata`, which asserts the stored key rather than a client's reading of it).

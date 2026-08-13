@@ -60,10 +60,16 @@ var (
 		"the Content-MD5 you specified did not match what was received"}
 	errInvalidDigest = apiError{"InvalidDigest", http.StatusBadRequest,
 		"the Content-MD5 you specified is not a base64-encoded 128-bit digest"}
+	errMetadataTooLarge = apiError{"MetadataTooLarge", http.StatusBadRequest,
+		"the metadata headers exceed the maximum allowed size"}
+	errInvalidDirective = apiError{"InvalidArgument", http.StatusBadRequest,
+		"x-amz-metadata-directive must be COPY or REPLACE"}
 	errPreconditionFailed = apiError{"PreconditionFailed", http.StatusPreconditionFailed,
 		"at least one of the preconditions you specified did not hold"}
 	errNotImplemented = apiError{"NotImplemented", http.StatusNotImplemented,
 		"This server does not implement that operation."}
+	errEncryptionNotImplemented = apiError{"NotImplemented", http.StatusNotImplemented,
+		"This server does not encrypt objects, and will not pretend to have encrypted one."}
 	errBucketNotEmpty = apiError{"BucketNotEmpty", http.StatusConflict,
 		"The bucket still holds objects."}
 	errInvalidCopySource = apiError{"InvalidArgument", http.StatusBadRequest,

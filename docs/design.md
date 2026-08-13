@@ -482,7 +482,7 @@ being asked to: `CreateBucket`, `ListBuckets`, `DeleteBucket`, `DeleteObjects`,
 `ListObjectVersions` and `GetBucketLocation`. Nothing else (no IAM/ACLs/versioning/lifecycle;
 anti-goal).
 
-Two things clients send as *headers* on those calls rather than as calls of their own, and both were
+Three things clients send as *headers* on those calls rather than as calls of their own, and all were
 added for the same reason the six were:
 
 - **Conditional reads.** `If-Match`, `If-None-Match`, `If-Modified-Since` and `If-Unmodified-Since`
@@ -511,6 +511,25 @@ added for the same reason the six were:
   absent: the client said it was declaring a digest and then declared none, and reading that as "no
   digest was sent" would store the object under a promise nobody made.
 
+- **User metadata and the headers that describe the bytes.** `x-amz-meta-*`, plus `Cache-Control`,
+  `Content-Disposition`, `Content-Encoding`, `Content-Language` and `Expires`: stored with the
+  manifest and replayed on every read, never interpreted. The line between these and the headers kavo
+  drops is whether they describe the *object* or the *exchange that delivered it* — `Content-Length`
+  and `Content-MD5` are facts about one HTTP request, and answering a later reader with them would be
+  describing a conversation that is over. `aws-chunked` is dropped from `Content-Encoding` for the
+  same reason: it is the framing of the body that arrived, which kavo decoded, so keeping it would
+  tell every future reader the stored bytes are chunk-framed when they are not.
+
+  A multipart object takes its metadata from the call that began the upload, because that is the only
+  call a client can attach it to, so the upload record carries it until the completion commits. On a
+  copy, `x-amz-metadata-directive` selects `COPY` (the source's, which is the default) or `REPLACE`
+  (the request's, and *only* the request's — replacing with nothing is how a client strips metadata).
+  `REPLACE` is also what makes a copy onto itself meaningful, and so what makes it legal: without it
+  a copy onto itself is a request to overwrite an object with itself.
+
+  Metadata is capped at 2 KB per object, as S3 caps it. Unbounded metadata is unbounded manifests, and
+  a manifest is read by every request for the object and by every background pass over it.
+
 Conditional *writes* are deliberately not here. `If-None-Match: *` on a PUT means "create only if
 absent", which needs the manifest commit to be a compare-and-set rather than a `Put`, and that is a
 change to the commit point — the one place in this store where an extra condition has to be argued
@@ -522,14 +541,22 @@ empties a bucket by listing versions and bulk-deleting what it finds. None of th
 new: a bucket is still a prefix, and the version listing reports every object once with the id
 `null`, which is S3's own answer for a bucket that was never versioned.
 
-External validation: Ceph `s3-tests`. **179 of 886 pass, nothing errors**, and every failure is
+A request for something kavo does not do is refused, not ignored. Server-side encryption is the case
+that matters: any request carrying `x-amz-server-side-encryption*` or a customer key is answered 501,
+because the alternative — storing the object in plaintext and answering 200 — tells a client its data
+is encrypted while anyone can read it back without the key. That is the one failure mode a client
+cannot detect for itself, and it is worth being explicit that this rule *cost* pass count rather than
+earning it.
+
+External validation: Ceph `s3-tests`. **177 of 886 pass, nothing errors**, and every failure is
 classified in `docs/s3-compatibility.md` — as an anti-goal, a consequence of buckets being prefixes,
 or a named gap. The suite found four real defects, three of which kavo's own tests could not see;
-they are listed there too. It also found eighteen passes that were not real: a `PUT` to any bucket
-subresource reached the create-bucket handler and answered 200, so kavo was claiming to have
-configured lifecycle rules, policies and encryption it has no code for. Refusing them is what took
-the count from 169 to 151, and `CopyObject`, conditional reads and `Content-MD5` are what took it
-back to 179.
+they are listed there too. It also found two sets of passes that were not real. Eighteen came from a
+`PUT` to any bucket subresource reaching the create-bucket handler and answering 200, so kavo was
+claiming to have configured lifecycle rules, policies and encryption it has no code for. Twenty-two
+more came from ignoring the encryption headers above. Refusing the first set took the count from 169
+to 151; `CopyObject`, conditional reads, `Content-MD5`, metadata and the missing multipart calls took
+it to 196; refusing the second set brought it back to 177, which is the honest figure.
 
 ### Object API
 
@@ -633,8 +660,37 @@ any single manifest, and the completion is refused rather than committed against
 held the chunks. Tested by changing membership mid-upload.
 
 The ETag is the MD5 of the parts' MD5s with the part count after a dash, because that is the value
-clients recompute to check the upload. `ListParts` and `ListMultipartUploads` are not implemented:
-nothing in the locked subset needs them, and no client kavo is tested against asks.
+clients recompute to check the upload.
+
+**The API answers all of its own calls.** `ListParts` and `ListMultipartUploads` used to be missing,
+which is worse than it sounds: both are a `GET`, so a client asking which parts had arrived was
+answered by the object read handler with `NoSuchKey` — telling a client whose parts are all safely
+stored that there is nothing there — and a client asking what uploads were in flight got an object
+listing, which parses cleanly as "none". A listing that is empty for the wrong reason is the failure
+mode this subset is meant to avoid, and it is the reason both exist now.
+
+`ListMultipartUploads` pages in upload-id order rather than S3's key order, and says so here because
+a client cannot tell from the response. Ordering by key means either reading every in-flight upload in
+the store into memory to sort it, which is the one thing no request here is allowed to do, or keeping
+a second index by key that can disagree with the first. The markers work, so a client that pages sees
+every upload exactly once; only the order differs. The scan is bounded in the same breath: an upload's
+parts share its prefix, so a listing reads a fixed number of etcd keys and reports itself truncated
+rather than reading however many there are.
+
+**A completion is idempotent for as long as a retry could take.** Every SDK retries a request whose
+connection died, and a completion whose response was lost used to be answered `NoSuchUpload` — telling
+the client its upload failed while the object was sitting there committed. The upload id is now
+remembered with what it produced for an hour (`meta.CompletionMemory`), written *before* the upload
+record is deleted so there is no instant in which the id is neither in flight nor remembered. It is an
+etcd lease rather than a background pass, so the record expires even if every node is down. What a
+retry gets back is what *that upload* produced, which is not necessarily what is at the key now: the
+question a retry is asking is about its own request.
+
+**Aborting an upload that does not exist is an error**, which reverses an earlier decision here. It
+had been idempotent on the grounds that a cleanup loop aborts what it has already aborted, but S3
+answers `NoSuchUpload` and Ceph's suite checks it: a client told it successfully aborted an id that
+never existed cannot distinguish that from having aborted the wrong one, so a cleanup loop with a
+typo in it reports success.
 
 Error bodies are S3's XML with S3's codes, because the code is the part clients act on: an SDK
 retries `SlowDown`, refuses to retry `SignatureDoesNotMatch`, and turns `NoSuchKey` into a typed

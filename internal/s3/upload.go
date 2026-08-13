@@ -5,7 +5,10 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"path"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/0vertake/kavo/internal/cluster"
 	"github.com/0vertake/kavo/internal/meta"
@@ -69,7 +72,14 @@ func (h *handler) postObject(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) createUpload(w http.ResponseWriter, r *http.Request, key string) {
-	id, err := h.cluster.CreateUpload(r.Context(), key, r.Header.Get("Content-Type"))
+	stored, err := storedMeta(r.Header)
+	if err != nil {
+		fail(w, r, errMetadataTooLarge, err)
+		return
+	}
+	// S3 takes a multipart object's metadata from this call and not from the
+	// completion, so it is recorded now and carried by the upload.
+	id, err := h.cluster.CreateUpload(r.Context(), key, r.Header.Get("Content-Type"), stored)
 	if err != nil {
 		fail(w, r, storeError(err), err)
 		return
@@ -80,6 +90,153 @@ func (h *handler) createUpload(w http.ResponseWriter, r *http.Request, key strin
 		Key:      r.PathValue("key"),
 		UploadID: id,
 	})
+}
+
+// listPartsResult is the ListParts response. A client that lost track of what it
+// has already sent asks this before resuming, so answering it with an object read —
+// which is what a GET carrying an upload id used to do — told the client its object
+// did not exist.
+type listPartsResult struct {
+	XMLName              xml.Name    `xml:"ListPartsResult"`
+	XMLNS                string      `xml:"xmlns,attr"`
+	Bucket               string      `xml:"Bucket"`
+	Key                  string      `xml:"Key"`
+	UploadID             string      `xml:"UploadId"`
+	PartNumberMarker     int         `xml:"PartNumberMarker"`
+	NextPartNumberMarker int         `xml:"NextPartNumberMarker,omitempty"`
+	MaxParts             int         `xml:"MaxParts"`
+	IsTruncated          bool        `xml:"IsTruncated"`
+	Parts                []partEntry `xml:"Part"`
+}
+
+type partEntry struct {
+	Number   int    `xml:"PartNumber"`
+	Modified string `xml:"LastModified"`
+	ETag     string `xml:"ETag"`
+	Size     int64  `xml:"Size"`
+}
+
+type listUploadsResult struct {
+	XMLName            xml.Name      `xml:"ListMultipartUploadsResult"`
+	XMLNS              string        `xml:"xmlns,attr"`
+	Bucket             string        `xml:"Bucket"`
+	Prefix             string        `xml:"Prefix,omitempty"`
+	KeyMarker          string        `xml:"KeyMarker"`
+	UploadIDMarker     string        `xml:"UploadIdMarker"`
+	NextKeyMarker      string        `xml:"NextKeyMarker,omitempty"`
+	NextUploadIDMarker string        `xml:"NextUploadIdMarker,omitempty"`
+	MaxUploads         int           `xml:"MaxUploads"`
+	IsTruncated        bool          `xml:"IsTruncated"`
+	Uploads            []uploadEntry `xml:"Upload"`
+}
+
+type uploadEntry struct {
+	Key       string `xml:"Key"`
+	UploadID  string `xml:"UploadId"`
+	Initiated string `xml:"Initiated"`
+}
+
+// maxPartsLimit and maxUploadsLimit are S3's own page caps. A client asking for
+// more gets this many and pages.
+const (
+	maxPartsLimit   = 1000
+	maxUploadsLimit = 1000
+)
+
+// listParts answers a GET that carries an upload id.
+func (h *handler) listParts(w http.ResponseWriter, r *http.Request, key, id string) {
+	q := r.URL.Query()
+	max := boundedInt(q.Get("max-parts"), maxPartsLimit)
+	marker := boundedInt(q.Get("part-number-marker"), 0)
+
+	parts, err := h.cluster.Parts(r.Context(), id)
+	if err != nil {
+		fail(w, r, uploadError(err), err)
+		return
+	}
+	result := listPartsResult{
+		XMLNS:            s3XMLNS,
+		Bucket:           r.PathValue("bucket"),
+		Key:              key,
+		UploadID:         id,
+		PartNumberMarker: marker,
+		MaxParts:         max,
+	}
+	for _, p := range parts {
+		if p.Number <= marker {
+			continue
+		}
+		if len(result.Parts) == max {
+			result.IsTruncated = true
+			result.NextPartNumberMarker = result.Parts[len(result.Parts)-1].Number
+			break
+		}
+		result.Parts = append(result.Parts, partEntry{
+			Number:   p.Number,
+			Modified: p.Modified.UTC().Format(time.RFC3339),
+			ETag:     `"` + p.ETag + `"`,
+			Size:     p.Size,
+		})
+	}
+	writeXML(w, r, result)
+}
+
+// listUploads answers a GET on the bucket that asks for uploads rather than
+// objects. Without it that request was answered with an object listing, which a
+// client parses as "no uploads in flight" — the kind of hollow answer that is worse
+// than a refusal.
+func (h *handler) listUploads(w http.ResponseWriter, r *http.Request) {
+	bucket := r.PathValue("bucket")
+	q := r.URL.Query()
+	max := boundedInt(q.Get("max-uploads"), maxUploadsLimit)
+	// The key marker is accepted and echoed but not used to resume: kavo pages
+	// these in upload-id order, so the id marker is the one that continues a
+	// listing. See meta.Store.Uploads.
+	after := q.Get("upload-id-marker")
+
+	// Buckets are prefixes, so an upload's key is "bucket/key" and the prefix a
+	// client asked for goes after the bucket's.
+	prefix := path.Join(bucket, q.Get("prefix"))
+	if q.Get("prefix") == "" {
+		prefix = bucket + "/"
+	}
+	uploads, more, err := h.cluster.Uploads(r.Context(), prefix, after, max)
+	if err != nil {
+		fail(w, r, storeError(err), err)
+		return
+	}
+
+	result := listUploadsResult{
+		XMLNS:          s3XMLNS,
+		Bucket:         bucket,
+		Prefix:         q.Get("prefix"),
+		KeyMarker:      q.Get("key-marker"),
+		UploadIDMarker: after,
+		MaxUploads:     max,
+		IsTruncated:    more,
+	}
+	for _, u := range uploads {
+		result.Uploads = append(result.Uploads, uploadEntry{
+			Key:       strings.TrimPrefix(u.Upload.Key, bucket+"/"),
+			UploadID:  u.ID,
+			Initiated: u.Upload.Created.UTC().Format(time.RFC3339),
+		})
+	}
+	if more && len(result.Uploads) > 0 {
+		last := result.Uploads[len(result.Uploads)-1]
+		result.NextKeyMarker, result.NextUploadIDMarker = last.Key, last.UploadID
+	}
+	writeXML(w, r, result)
+}
+
+// boundedInt reads a page size or marker, falling back to fallback when it is
+// missing or not a number, and never exceeding it.
+func boundedInt(value string, fallback int) int {
+	n, err := strconv.Atoi(value)
+	if err != nil || n < 0 || (fallback > 0 && n > fallback) {
+		return fallback
+	}
+	return n
 }
 
 // uploadPart stores one part. It is a PUT to the object's path with a part number
