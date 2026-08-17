@@ -154,6 +154,20 @@ The gap between the two rows is the whole argument for the cap. Unthrottled, thi
 dead disk almost as fast as it can read one — and every byte of that is competing with client
 requests on the same disks and the same network.
 
+The same wipe, 4+2, rebuilds by decode. 16 objects of 32 MB, same six-node cluster, the victim's
+disk emptied, repair uncapped:
+
+| | replicated | coded 4+2 |
+| --- | --- | --- |
+| shards or copies on the lost node | 11 copies / 352 MB | 16 shards / 128 MB |
+| redundancy restored | 770 ms | 1.32 s |
+| effective rate | 456 MB/s | 97 MB/s |
+
+The lost node held fewer bytes under coding — 1.5x stored instead of 3x — and it still took longer
+to come back. A replica is fetched from one peer; a shard is reconstructed from k of them, so the
+heal pays a gather before it can write. That is the other half of the storage-ratio trade, and it is
+why the coded mode's chaos run waits longer at the barrier for the same amount of object data.
+
 ### What a join moves
 
 The claim consistent hashing exists to make is that adding a node moves that node's share and
@@ -288,6 +302,19 @@ The memory column is the honest cost. A replicated read streams a chunk through;
 hold a chunk's shards *and* the reconstructed chunk before any of it is valid. Sizing each shard
 read from the manifest instead of growing it took this from 315 MB to 168 MB per 64 MB object.
 Still flat in object size — the invariant — but ~2.6x a chunk rather than ~1x.
+
+At a size no buffer could hide, through the signed API, `ps` watching from outside:
+
+| object, 4+2 | PUT | GET | peak RSS over idle | of the object |
+| --- | --- | --- | --- | --- |
+| 64 MB | 390 ms / 164 MB/s | 200 ms / 319 MB/s | 114 MB | 213% |
+| 2 GB | 11.2 s / 184 MB/s | 11.4 s / 179 MB/s | 219 MB | 11.8% |
+
+The object grew 32x and the memory above idle grew 2x, which is the same shape as the replicated
+pair (33 MB → 67 MB). It is a taller chunk: roughly the shards of one chunk plus the reconstructed
+one, sitting in RSS rather than only in the allocator's count. Throughput is flat across the two
+sizes in both directions, so nothing is being paid for in the large case that the small case
+avoids.
 
 ## Listing, and why the shape of a manifest matters
 
