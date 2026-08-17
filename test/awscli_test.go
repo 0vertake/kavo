@@ -29,14 +29,15 @@ func (n *node) aws(t *testing.T, args ...string) (string, error) {
 func (n *node) awsTuned(t *testing.T, s3Config string, args ...string) (string, error) {
 	t.Helper()
 	// The developer's own config is bypassed: it can point at a real account.
-	// Request checksums are pinned to when_required. Recent CLIs default to
-	// when_supported and send CRC64NVME — or CRC32C on CreateMultipartUpload —
-	// which this server 501s rather than store unread. Empty `s3 =` crashes the
-	// CLI, so the section always has at least this setting.
+	// Request checksums are pinned to when_required at both the profile and the
+	// process: recent CLIs default to when_supported and send CRC64NVME, or
+	// CRC32C on CreateMultipartUpload, which this server 501s rather than store
+	// unread. The setting lives on the profile, not under `s3 =` — that is the
+	// shared AWS config key, and putting it in the s3 subsection was a no-op.
 	config := filepath.Join(t.TempDir(), "config")
-	settings := "[default]\ns3 =\n  request_checksum_calculation = when_required\n"
+	settings := "[default]\nrequest_checksum_calculation = when_required\n"
 	if s3Config != "" {
-		settings += s3Config + "\n"
+		settings += "s3 =\n" + s3Config + "\n"
 	}
 	if err := os.WriteFile(config, []byte(settings), 0o644); err != nil {
 		t.Fatal(err)
@@ -49,6 +50,8 @@ func (n *node) awsTuned(t *testing.T, s3Config string, args ...string) (string, 
 		"AWS_CONFIG_FILE="+config,
 		"AWS_SHARED_CREDENTIALS_FILE="+filepath.Join(t.TempDir(), "credentials"),
 		"AWS_EC2_METADATA_DISABLED=true",
+		"AWS_REQUEST_CHECKSUM_CALCULATION=WHEN_REQUIRED",
+		"AWS_RESPONSE_CHECKSUM_VALIDATION=WHEN_REQUIRED",
 	)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
