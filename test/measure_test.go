@@ -19,6 +19,9 @@ package test
 //   - memory stays flat regardless of object size — measured on the node's own
 //     RSS, at a size no buffer could hide (milestone 1, at 1000x the size its
 //     unit test uses)
+//
+// Two more, for the mode the microbenchmarks already compare: heal by decode
+// rather than replica fetch, and the same RSS pair against a 4+2 object.
 
 import (
 	"context"
@@ -29,6 +32,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -214,6 +218,18 @@ func copiesHeld(nodes []*node) (perNode map[string]int, total int) {
 	return perNode, total
 }
 
+func bytesHeld(n *node) int64 {
+	var sum int64
+	for _, f := range n.chunkFiles() {
+		st, err := os.Stat(f)
+		if err != nil {
+			continue
+		}
+		sum += st.Size()
+	}
+	return sum
+}
+
 // Milestone 6's number. A node loses its entire disk while the cluster keeps
 // running, and nobody asks for a repair: this reports how long redundancy takes
 // to come back, and how much had to move to get there.
@@ -279,6 +295,59 @@ func TestMeasureHealTime(t *testing.T) {
 				rateOf(lostBytes, elapsed))
 		})
 	}
+}
+
+// The same wipe, against a 4+2 cluster: repair rebuilds the missing shards by
+// decoding their siblings rather than fetching a replica. That is a different
+// cost — k sources per shard instead of one — and the number the replicated
+// measurement cannot speak for.
+func TestMeasureHealTimeCoded(t *testing.T) {
+	skipUnlessMeasuring(t)
+	defer withRepairRate("0")()
+
+	bin := buildKavod(t)
+	prefix := clusterPrefix()
+	nodes := startClusterCoded(t, bin, prefix, measureChunkSize, measureCluster, "4+2")
+	store, err := meta.Open([]string{meta.EndpointFromEnv()}, prefix)
+	if err != nil {
+		t.Fatalf("meta.Open: %v", err)
+	}
+	defer store.Close()
+
+	objects := writeObjects(t, nodes[0], *measureData, measureChunkSize)
+	before, totalShards := copiesHeld(nodes)
+
+	victim := nodes[len(nodes)-1]
+	lost := before[victim.id]
+	if lost == 0 {
+		t.Fatalf("%s holds no shards, so there is nothing to heal", victim.id)
+	}
+	lostBytes := bytesHeld(victim)
+
+	byID := make(map[string]*node, len(nodes))
+	for _, n := range nodes {
+		byID[n.id] = n
+	}
+
+	start := time.Now()
+	victim.loseChunks()
+	var elapsed time.Duration
+	for {
+		if holes, _, settled := missingCopies(t.Context(), byID, store, len(nodes)); settled && len(holes) == 0 {
+			elapsed = time.Since(start)
+			break
+		}
+		if time.Since(start) > 10*time.Minute {
+			t.Fatal("redundancy did not come back within 10 minutes")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	t.Logf("%d objects, %d shards over %d nodes; %s lost %d shards (%s)",
+		objects, totalShards, len(nodes), victim.id, lost, bytesOf(lostBytes))
+	t.Logf("redundancy restored in %v by decode (%s of shards rebuilt, %s effective)",
+		elapsed.Round(10*time.Millisecond), bytesOf(lostBytes),
+		rateOf(lostBytes, elapsed))
 }
 
 // Milestone 8's numbers. A seventh node joins a cluster that already holds data:
@@ -461,6 +530,42 @@ func TestMeasureStreamingALargeObject(t *testing.T) {
 
 			peak, which := watcher.close()
 			t.Logf("PUT %s in %v (%s), GET in %v (%s)",
+				bytesOf(size), put.Round(time.Millisecond), rateOf(size, put),
+				get.Round(time.Millisecond), rateOf(size, get))
+			t.Logf("peak RSS %s on %s, %s over idle, %.1f%% of the object",
+				bytesOf(peak), which, bytesOf(peak-idle), 100*float64(peak)/float64(size))
+		})
+	}
+}
+
+// The same pair of sizes, stored 4+2. A coded read holds a chunk's shards and the
+// reconstructed chunk before any of it is valid, which is why a 64 MB GET
+// allocates 168 MB in the microbenchmark. This is whether that shows up in the
+// process at gigabyte scale, or whether it still stays chunk-shaped.
+func TestMeasureStreamingACodedObject(t *testing.T) {
+	skipUnlessMeasuring(t)
+
+	bin := buildKavod(t)
+	nodes := startClusterCoded(t, bin, clusterPrefix(), measureChunkSize, measureCluster, "4+2")
+
+	idle, _ := watchRSS(nodes).close()
+	t.Logf("idle RSS, highest of %d nodes: %s", len(nodes), bytesOf(idle))
+
+	for _, size := range []int64{64 << 20, *measureObject} {
+		t.Run(bytesOf(size), func(t *testing.T) {
+			key := "measure/coded-" + bytesOf(size)
+			watcher := watchRSS(nodes)
+
+			start := time.Now()
+			putSigned(t, nodes[0], key, size)
+			put := time.Since(start)
+
+			start = time.Now()
+			getSigned(t, nodes[0], key, size)
+			get := time.Since(start)
+
+			peak, which := watcher.close()
+			t.Logf("PUT %s encoded 4+2 in %v (%s), GET in %v (%s)",
 				bytesOf(size), put.Round(time.Millisecond), rateOf(size, put),
 				get.Round(time.Millisecond), rateOf(size, get))
 			t.Logf("peak RSS %s on %s, %s over idle, %.1f%% of the object",
