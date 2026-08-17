@@ -28,14 +28,15 @@ func (n *node) aws(t *testing.T, args ...string) (string, error) {
 // only way to change how it splits a transfer.
 func (n *node) awsTuned(t *testing.T, s3Config string, args ...string) (string, error) {
 	t.Helper()
-	// The developer's own config is bypassed: it can point at a real account, or
-	// set a checksum mode this server does not implement.
+	// The developer's own config is bypassed: it can point at a real account.
+	// Request checksums are pinned to when_required. Recent CLIs default to
+	// when_supported and send CRC64NVME — or CRC32C on CreateMultipartUpload —
+	// which this server 501s rather than store unread. Empty `s3 =` crashes the
+	// CLI, so the section always has at least this setting.
 	config := filepath.Join(t.TempDir(), "config")
-	// "s3 =" with nothing under it is a string rather than a section, and the CLI
-	// crashes on it, so the section only appears when it has settings.
-	settings := "[default]\n"
+	settings := "[default]\ns3 =\n  request_checksum_calculation = when_required\n"
 	if s3Config != "" {
-		settings += "s3 =\n" + s3Config + "\n"
+		settings += s3Config + "\n"
 	}
 	if err := os.WriteFile(config, []byte(settings), 0o644); err != nil {
 		t.Fatal(err)
