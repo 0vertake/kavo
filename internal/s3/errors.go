@@ -38,6 +38,8 @@ var (
 		"The specified key does not exist."}
 	errInvalidRange = apiError{"InvalidRange", http.StatusRequestedRangeNotSatisfiable,
 		"The requested range is not satisfiable."}
+	errMalformedRange = apiError{"InvalidArgument", http.StatusBadRequest,
+		"The copy source range is not a byte range this server can read."}
 	errMissingLength = apiError{"MissingContentLength", http.StatusLengthRequired,
 		"An object write must declare its length."}
 	errSlowDown = apiError{"SlowDown", http.StatusServiceUnavailable,
@@ -70,6 +72,8 @@ var (
 		"This server does not implement that operation."}
 	errEncryptionNotImplemented = apiError{"NotImplemented", http.StatusNotImplemented,
 		"This server does not encrypt objects, and will not pretend to have encrypted one."}
+	errTaggingNotImplemented = apiError{"NotImplemented", http.StatusNotImplemented,
+		"This server does not store object tags, and will not accept tags it would drop."}
 	errBucketNotEmpty = apiError{"BucketNotEmpty", http.StatusConflict,
 		"The bucket still holds objects."}
 	errInvalidCopySource = apiError{"InvalidArgument", http.StatusBadRequest,

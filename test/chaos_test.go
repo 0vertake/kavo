@@ -74,7 +74,11 @@ type write struct {
 	multipart bool
 	// viaCopy records that this object was made by copying another rather than by
 	// uploading, which the checker does not care about and the run's log does.
-	viaCopy bool
+	// viaPartCopy narrows that to a copy assembled out of ranges of the source with
+	// UploadPartCopy, which is a write path of its own: the bytes are read from the
+	// source's owners while faults arrive and written to the destination's, so a
+	// source that stops reading mid-part must leave no part rather than a short one.
+	viaCopy, viaPartCopy bool
 	// acked is the promise. Only a 2xx sets it, and only after the whole request
 	// finished — a request whose outcome is unknown stays false, and an object
 	// that was never promised is allowed to be absent.
@@ -258,11 +262,13 @@ func TestChaos(t *testing.T) {
 					copied := entry
 					copied.key = fmt.Sprintf("w%d/copy%04d", w, i)
 					copied.viaCopy = true
-					_, err := clients[rng.IntN(len(clients))].CopyObject(ctx, &awss3.CopyObjectInput{
-						Bucket: aws.String(chaosBucket), Key: aws.String(copied.key),
-						CopySource: aws.String(chaosBucket + "/" + entry.key),
-					})
-					copied.acked = err == nil
+					// Half of them are assembled out of ranges of the source
+					// instead, which is what a client does above 8 MB and what
+					// the aws CLI does for every large copy. It needs two bytes
+					// to have two ranges, so the smallest objects stay whole
+					// copies.
+					copied.viaPartCopy = copied.size >= 8 && rng.IntN(2) == 0
+					copied.acked = chaosCopy(ctx, clients[rng.IntN(len(clients))], entry.key, copied)
 					if copied.acked {
 						mine = append(mine, copied)
 					}
@@ -290,7 +296,7 @@ func TestChaos(t *testing.T) {
 	stop()
 	faultsWG.Wait()
 
-	acked, deleted, copies := 0, 0, 0
+	acked, deleted, copies, partCopies := 0, 0, 0, 0
 	for _, w := range history {
 		if w.acked {
 			acked++
@@ -301,9 +307,21 @@ func TestChaos(t *testing.T) {
 		if w.viaCopy {
 			copies++
 		}
+		if w.viaPartCopy && w.acked {
+			partCopies++
+		}
 	}
-	t.Logf("history: %d writes, %d acknowledged, %d of them server-side copies, %d deleted again, %d reads during faults; %d faults injected:\n  %s",
-		len(history), acked, copies, deleted, reads.Load(), len(faults), strings.Join(faults, "\n  "))
+	t.Logf("history: %d writes, %d acknowledged, %d of them server-side copies (%d assembled from ranges of the source), %d deleted again, %d reads during faults; %d faults injected:\n  %s",
+		len(history), acked, copies, partCopies, deleted, reads.Load(), len(faults), strings.Join(faults, "\n  "))
+
+	// A copy assembled out of ranges is the newest write path here, and the only
+	// one whose bytes are read out of the store while they are written back into
+	// it. A run that acknowledged none of them proves nothing about it, and saying
+	// so is cheaper than believing a green run that never took the path.
+	if partCopies == 0 && *chaosDuration > time.Minute {
+		t.Errorf("no copy assembled from ranges was acknowledged in %v, so UploadPartCopy went untested",
+			*chaosDuration)
+	}
 
 	// A copy sharing its source's chunks only matters if something was trying to
 	// delete chunks at the time, and the only thing that deletes one is the sweep. So
@@ -434,6 +452,27 @@ const restartSettle = 45 * time.Second
 // is where a speed claim belongs; this barrier is about completeness.
 const healStall = 30 * time.Second
 
+// surveyPerCopy is what it costs repair to ask one question — does the node this
+// manifest names still hold this copy — measured at 163–256 µs in
+// `BenchmarkRepairSurvey`, rounded up.
+//
+// It is here because a repair pass walks every object in key order before it comes
+// back to any of them (`walk` in internal/cluster/repair.go), so repair cannot look
+// at a particular missing copy sooner than one full pass away. Below that, "no copy
+// was restored recently" measures where the cursor happens to be rather than whether
+// repair works, and healStall alone was reading the first as the second: a 60-minute
+// run reached 57,440 objects, which is a quarter of a million copies to survey and
+// ~50 s of pass at this rate, and tripped a 30 s window while repair was mid-walk
+// with six copies left (`-chaos.seed=1786654359933316000`, and the barrier at the end
+// of that same run — after the workload stopped — found the cluster whole).
+//
+// So the allowance is a constant plus a pass, and it is a scale correction rather
+// than a weakening: the run still fails if nothing is ever restored, the end-of-run
+// barrier is unchanged and strict, and at the five minutes CI runs this adds about
+// six seconds to thirty. The cost it is derived from is real, and
+// docs/benchmarks.md now says so under repair.
+const surveyPerCopy = 300 * time.Microsecond
+
 // waitWhole polls until the cluster is whole — every node a member, and every
 // chunk of every manifest present on every owner that manifest names — and returns
 // the copies still missing if repair stops making progress. Empty means whole.
@@ -450,7 +489,12 @@ func waitWhole(ctx context.Context, nodes []*node, store *meta.Store, stall time
 	fewest, since := -1, time.Now()
 	unsettled := time.Time{}
 	for {
-		holes, settled := missingCopies(ctx, byID, store, len(nodes))
+		holes, copies, settled := missingCopies(ctx, byID, store, len(nodes))
+		// A pass has to get through every copy in the cluster before it reaches
+		// this one again, so the window grows with what there is to walk. The
+		// barrier counts the same copies repair does, which is why it can say how
+		// long a pass is rather than guess.
+		allowed := stall + time.Duration(copies)*surveyPerCopy
 		switch {
 		case len(holes) == 0:
 			return holes
@@ -467,7 +511,7 @@ func waitWhole(ctx context.Context, nodes []*node, store *meta.Store, stall time
 			fewest, since = -1, time.Now()
 		case fewest < 0 || len(holes) < fewest:
 			fewest, since, unsettled = len(holes), time.Now(), time.Time{}
-		case time.Since(since) > stall:
+		case time.Since(since) > allowed:
 			return holes
 		default:
 			unsettled = time.Time{}
@@ -502,22 +546,22 @@ func wantOwners(m object.Manifest, nodes int) int {
 
 // missingCopies reports the copies a manifest names that are not on the node it
 // names, and whether the cluster was settled enough for that to mean anything.
-func missingCopies(ctx context.Context, byID map[string]*node, store *meta.Store, want int) (holes []string, settled bool) {
+func missingCopies(ctx context.Context, byID map[string]*node, store *meta.Store, want int) (holes []string, copies int, settled bool) {
 	// Membership first: a node that is not a member owns nothing, so placement is
 	// still moving and every answer below would be about a layout in flux.
 	for id, n := range byID {
 		members, err := n.members()
 		if err != nil {
-			return []string{fmt.Sprintf("%s is not answering: %v", id, err)}, false
+			return []string{fmt.Sprintf("%s is not answering: %v", id, err)}, 0, false
 		}
 		if len(members) != want {
-			return []string{fmt.Sprintf("%s sees %d members, want %d", id, len(members), want)}, false
+			return []string{fmt.Sprintf("%s sees %d members, want %d", id, len(members), want)}, 0, false
 		}
 	}
 
 	objects, err := store.ScanObjects(ctx, "", "", 0)
 	if err != nil {
-		return []string{fmt.Sprintf("scan manifests: %v", err)}, false
+		return []string{fmt.Sprintf("scan manifests: %v", err)}, 0, false
 	}
 
 	for _, o := range objects {
@@ -536,6 +580,7 @@ func missingCopies(ctx context.Context, byID map[string]*node, store *meta.Store
 		}
 		for _, ref := range o.Manifest.Chunks {
 			for i, id := range o.Manifest.Nodes {
+				copies++
 				owner, ok := byID[id]
 				if !ok {
 					holes = append(holes, fmt.Sprintf("%s names node %s, which is not in the cluster", o.Key, id))
@@ -556,7 +601,7 @@ func missingCopies(ctx context.Context, byID map[string]*node, store *meta.Store
 			}
 		}
 	}
-	return holes, true
+	return holes, copies, true
 }
 
 var (
@@ -613,6 +658,53 @@ func chaosPut(ctx context.Context, client *awss3.Client, w write) bool {
 	}
 	_, err = client.CompleteMultipartUpload(ctx, &awss3.CompleteMultipartUploadInput{
 		Bucket: aws.String(chaosBucket), Key: aws.String(w.key), UploadId: create.UploadId,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
+	})
+	return err == nil
+}
+
+// chaosCopy copies an object server-side, either as one manifest copy or by
+// assembling it out of two ranges of the source with UploadPartCopy. Either way the
+// destination must end up byte-for-byte the source, which is what the checker reads
+// it back as — a copy that lands short is a copy the client was told succeeded.
+func chaosCopy(ctx context.Context, client *awss3.Client, from string, to write) bool {
+	if !to.viaPartCopy {
+		_, err := client.CopyObject(ctx, &awss3.CopyObjectInput{
+			Bucket: aws.String(chaosBucket), Key: aws.String(to.key),
+			CopySource: aws.String(chaosBucket + "/" + from),
+		})
+		return err == nil
+	}
+
+	create, err := client.CreateMultipartUpload(ctx, &awss3.CreateMultipartUploadInput{
+		Bucket: aws.String(chaosBucket), Key: aws.String(to.key),
+	})
+	if err != nil {
+		return false
+	}
+	// Split off a chunk boundary, so the ranges have to be re-chunked rather than
+	// handed the source's own chunk references.
+	split := to.size/3 + 1
+	ranges := []string{
+		fmt.Sprintf("bytes=0-%d", split-1),
+		fmt.Sprintf("bytes=%d-%d", split, to.size-1),
+	}
+	var parts []types.CompletedPart
+	for i, spec := range ranges {
+		out, err := client.UploadPartCopy(ctx, &awss3.UploadPartCopyInput{
+			Bucket: aws.String(chaosBucket), Key: aws.String(to.key), UploadId: create.UploadId,
+			PartNumber: aws.Int32(int32(i + 1)),
+			CopySource: aws.String(chaosBucket + "/" + from), CopySourceRange: aws.String(spec),
+		})
+		if err != nil || out.CopyPartResult == nil {
+			return false
+		}
+		parts = append(parts, types.CompletedPart{
+			ETag: out.CopyPartResult.ETag, PartNumber: aws.Int32(int32(i + 1)),
+		})
+	}
+	_, err = client.CompleteMultipartUpload(ctx, &awss3.CompleteMultipartUploadInput{
+		Bucket: aws.String(chaosBucket), Key: aws.String(to.key), UploadId: create.UploadId,
 		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
 	})
 	return err == nil

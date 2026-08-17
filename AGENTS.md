@@ -27,7 +27,10 @@ not API surface. Full design and milestones: `docs/design.md`. Research notes wi
  history. `-chaos.duration` to run it longer, `-chaos.seed` to replay one, `-chaos.ec=4+2` to store
  the workload erasure-coded instead of replicated — CI runs both, because the two modes fail
  differently and running one proved the invariants for half the store. It runs at a short
- default as part of `make test`; run it long before believing a durability change.
+ default as part of `make test`; run it long before believing a durability change. `-chaos.duration`
+ buys workload only: the verification afterwards reads the whole history back and waits for
+ redundancy to settle, which cost 16 minutes after a 45-minute run. Give `-timeout` at least twice
+ the duration, or a run dies mid-verdict having proved nothing.
 - `make demo` — six real processes on this host, an object, `SIGKILL` to one of its owners, and
  redundancy returning on its own. Every step is checked (digests compared, each node asked whether
  it holds the chunk) rather than narrated, so it doubles as a smoke test of the deployment path.
@@ -135,7 +138,18 @@ Rules that make these structural:
   `Expires`, and `x-amz-metadata-directive` on a copy) are in too, being headers on calls that already
   exist rather than new surface. `ListParts` and `ListMultipartUploads` are in because they are part of
   multipart upload, and because both are a `GET` that was being answered by the object handler — a
-  client asking which parts had arrived was told `NoSuchKey`. Conditional *writes* are not: `If-None-Match: *` on a PUT needs the commit to become a
+  client asking which parts had arrived was told `NoSuchKey`. `UploadPartCopy` is in for the same
+  reason: above 8 MB the `aws` CLI performs every server-side copy that way, so without it
+  `CopyObject` was a copy only for small objects. It re-chunks through the ordinary write path rather
+  than handing the part the source's chunk references, because a client's part size does not land on
+  chunk boundaries — so a copied part costs a read and a write inside the cluster where `CopyObject`
+  costs neither. A copied range that runs past the end of the source is refused, not shortened: the
+  client sees only the etag of whatever was copied, so a short copy assembles an object nobody
+  described. **Reading** an object's tags is answered, with none, because the CLI reads the source's
+  tags before a multipart copy — and because "this object has no tags" is true. Setting them is
+  refused, `x-amz-tagging` included: both halves are needed for either to be honest, since a store
+  that dropped the header and then reported no tags would have said the tags were gone by way of two
+  successes. Conditional *writes* are not: `If-None-Match: *` on a PUT needs the commit to become a
   compare-and-set, which is a change to the commit point and has to be argued for.
   A request for something outside the subset is **refused, not ignored**: a request carrying
   `x-amz-server-side-encryption*` or a customer key is answered 501, because storing the object in

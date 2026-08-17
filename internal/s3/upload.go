@@ -3,6 +3,7 @@ package s3
 import (
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"path"
@@ -242,19 +243,17 @@ func boundedInt(value string, fallback int) int {
 // uploadPart stores one part. It is a PUT to the object's path with a part number
 // and an upload id, which is why the object PUT route has to check for them first.
 func (h *handler) uploadPart(w http.ResponseWriter, r *http.Request, id string) {
-	// A part whose bytes come from another object is UploadPartCopy, which this
-	// server does not implement. Ignoring the header reads the request as a part
-	// with an empty body, which is what it did: `aws s3 cp` of anything over 8 MB
-	// between two keys was answered 200 for every part and assembled an empty
-	// object out of them.
-	if r.Header.Get("X-Amz-Copy-Source") != "" {
-		fail(w, r, errNotImplemented, nil)
-		return
-	}
 	number, err := strconv.Atoi(r.URL.Query().Get("partNumber"))
 	if err != nil {
 		fail(w, r, apiError{"InvalidArgument", http.StatusBadRequest,
 			"partNumber must be an integer."}, err)
+		return
+	}
+	// A part whose bytes come from another object is UploadPartCopy. The header is
+	// the only thing that distinguishes the two requests, and reading past it once
+	// meant a copy was stored as a part with an empty body.
+	if source := r.Header.Get("X-Amz-Copy-Source"); source != "" {
+		h.copyPart(w, r, id, number, source)
 		return
 	}
 	if r.ContentLength < 0 {
@@ -272,6 +271,102 @@ func (h *handler) uploadPart(w http.ResponseWriter, r *http.Request, id string) 
 	w.Header().Set("ETag", `"`+etag+`"`)
 	w.WriteHeader(http.StatusOK)
 }
+
+// copyPartResult is the UploadPartCopy response. The etag arrives in the body
+// rather than the header the plain part upload uses, and a client that sends the
+// wrong one back cannot complete its upload — so an empty body here is a copy that
+// can never be finished, which is what an ignored copy source produced.
+type copyPartResult struct {
+	XMLName      xml.Name `xml:"CopyPartResult"`
+	XMLNS        string   `xml:"xmlns,attr"`
+	ETag         string   `xml:"ETag"`
+	LastModified string   `xml:"LastModified"`
+}
+
+// copyPart stores a part copied from a range of another object.
+func (h *handler) copyPart(w http.ResponseWriter, r *http.Request, id string, number int, source string) {
+	from, ok := copySource(source)
+	if !ok {
+		fail(w, r, errInvalidCopySource, nil)
+		return
+	}
+	// Resolved here rather than inside the coordinator because the range is
+	// declared against the source's size, so the size has to be known before the
+	// request can be judged valid at all.
+	src, err := h.cluster.Resolve(r.Context(), from)
+	if err != nil {
+		fail(w, r, storeError(err), err)
+		return
+	}
+	if conditions := copyConditions(r.Header); len(conditions) > 0 {
+		if _, ok := precondition(conditions, src); !ok {
+			fail(w, r, errPreconditionFailed, nil)
+			return
+		}
+	}
+	off, length, err := parseCopyRange(r.Header.Get("X-Amz-Copy-Source-Range"), src.Size)
+	if errors.Is(err, errRangeSyntax) {
+		fail(w, r, errMalformedRange, err)
+		return
+	} else if err != nil {
+		fail(w, r, errInvalidRange, err)
+		return
+	}
+
+	etag, err := h.cluster.CopyPart(r.Context(), id, number, src, off, length)
+	if err != nil {
+		fail(w, r, uploadError(err), err)
+		return
+	}
+	writeXML(w, r, copyPartResult{
+		XMLNS:        s3XMLNS,
+		ETag:         `"` + etag + `"`,
+		LastModified: time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// parseCopyRange reads x-amz-copy-source-range, which names the bytes of the source
+// that are to become this part, and defaults to all of them.
+//
+// Stricter than the Range header on a read, deliberately. A read asks for whatever
+// is there and is satisfied by less, so parseRange clamps a window that runs past
+// the end. A copy names the bytes it intends to appear in the destination, and
+// copying fewer than were asked for without saying so assembles an object the client
+// did not describe — and the client cannot tell, since it only ever sees the etag of
+// whatever did get copied. Both ends are required for the same reason: `bytes=8-` on
+// a source that grew means something different from what the client meant.
+func parseCopyRange(header string, size int64) (off, length int64, err error) {
+	if header == "" {
+		return 0, size, nil
+	}
+	spec, ok := strings.CutPrefix(header, "bytes=")
+	if !ok {
+		return 0, 0, fmt.Errorf("%w: %q does not begin with bytes=", errRangeSyntax, header)
+	}
+	first, last, found := strings.Cut(spec, "-")
+	if !found {
+		return 0, 0, fmt.Errorf("%w: %q has no dash", errRangeSyntax, header)
+	}
+	start, err1 := strconv.ParseInt(first, 10, 64)
+	end, err2 := strconv.ParseInt(last, 10, 64)
+	if err1 != nil || err2 != nil || start < 0 || end < start {
+		// Both ends must be numbers and in order. This covers the open-ended
+		// forms a read allows, and "bytes=0-2,3-5", whose second range lands in
+		// last and fails to parse.
+		return 0, 0, fmt.Errorf("%w: %q is not a byte range", errRangeSyntax, header)
+	}
+	if end >= size {
+		return 0, 0, fmt.Errorf("copy source range %q against %d bytes", header, size)
+	}
+	return start, end - start + 1, nil
+}
+
+// errRangeSyntax separates a copy range this server cannot read from one it read and
+// cannot satisfy. S3 answers the first 400 and the second 416, and the distinction is
+// worth keeping: one says the request is malformed, the other says something true
+// about the object, and a client retrying after growing the source only wants to
+// retry the second.
+var errRangeSyntax = errors.New("s3: copy source range is malformed")
 
 func (h *handler) completeUpload(w http.ResponseWriter, r *http.Request, key, id string) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxCompleteRequest))

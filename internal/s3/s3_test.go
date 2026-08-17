@@ -1164,12 +1164,6 @@ func TestAnObjectSubresourceCannotTouchTheObject(t *testing.T) {
 			})
 			return err
 		}},
-		{"get-object-tagging", func() error {
-			_, err := client.GetObjectTagging(t.Context(), &awss3.GetObjectTaggingInput{
-				Bucket: aws.String("bucket"), Key: aws.String("described.bin"),
-			})
-			return err
-		}},
 		{"put-object-acl", func() error {
 			_, err := client.PutObjectAcl(t.Context(), &awss3.PutObjectAclInput{
 				Bucket: aws.String("bucket"), Key: aws.String("described.bin"),
@@ -1221,49 +1215,6 @@ func TestAnObjectSubresourceCannotTouchTheObject(t *testing.T) {
 	}
 }
 
-// A part copied from another object is UploadPartCopy. Ignoring the header read the
-// request as a part with an empty body and answered 200, so `aws s3 cp` of anything
-// over 8 MB between two keys assembled an empty object and reported success.
-func TestCopyingIntoAPartIsRefusedRatherThanStoringNothing(t *testing.T) {
-	client := newGateway(t)
-	data := randBytes(2 * testChunkSize)
-	if _, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
-		Bucket: aws.String("bucket"), Key: aws.String("source.bin"),
-		Body: bytes.NewReader(data),
-	}); err != nil {
-		t.Fatalf("put: %v", err)
-	}
-	create, err := client.CreateMultipartUpload(t.Context(), &awss3.CreateMultipartUploadInput{
-		Bucket: aws.String("bucket"), Key: aws.String("assembled.bin"),
-	})
-	if err != nil {
-		t.Fatalf("create: %v", err)
-	}
-
-	_, err = client.UploadPartCopy(t.Context(), &awss3.UploadPartCopyInput{
-		Bucket: aws.String("bucket"), Key: aws.String("assembled.bin"),
-		UploadId: create.UploadId, PartNumber: aws.Int32(1),
-		CopySource: aws.String("bucket/source.bin"),
-	})
-	var api smithy.APIError
-	if !errors.As(err, &api) || api.ErrorCode() != "NotImplemented" {
-		t.Fatalf("upload-part-copy = %v, want NotImplemented", err)
-	}
-
-	// And nothing was stored under that part number, so a completion cannot
-	// assemble an object out of a copy that never happened.
-	parts, err := client.ListParts(t.Context(), &awss3.ListPartsInput{
-		Bucket: aws.String("bucket"), Key: aws.String("assembled.bin"),
-		UploadId: create.UploadId,
-	})
-	if err != nil {
-		t.Fatalf("list parts: %v", err)
-	}
-	if len(parts.Parts) != 0 {
-		t.Errorf("the refused copy left %d parts behind, want none", len(parts.Parts))
-	}
-}
-
 // A version id kavo never issued names something that does not exist. Answering it
 // with the current object means a client asking to delete one old version deletes
 // the live one instead — the same mistake as the subresources above, arriving
@@ -1292,5 +1243,66 @@ func TestAVersionIdThatWasNeverIssuedIsRefused(t *testing.T) {
 		Bucket: aws.String("bucket"), Key: aws.String("versioned.bin"),
 	}); err != nil {
 		t.Fatalf("the object is gone after a delete of a version that never existed: %v", err)
+	}
+}
+
+// Reading an object's tags is answered with none, and asking for tags to exist is
+// refused. Both halves are needed for either to be honest: a store that dropped
+// x-amz-tagging on a PUT and then reported the object had no tags would have told a
+// client its tags were gone by way of two successes.
+//
+// The read exists because the aws CLI reads the source's tags before copying
+// anything above 8 MB, so refusing it fails every large server-side copy on a call
+// about a feature neither side wants.
+func TestTagsAreReportedAsNoneAndRefusedWhenSet(t *testing.T) {
+	client := newGateway(t)
+	data := randBytes(128)
+	if _, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("tagged.bin"),
+		Body: bytes.NewReader(data),
+	}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	out, err := client.GetObjectTagging(t.Context(), &awss3.GetObjectTaggingInput{
+		Bucket: aws.String("bucket"), Key: aws.String("tagged.bin"),
+	})
+	if err != nil {
+		t.Fatalf("get tags: %v", err)
+	}
+	if len(out.TagSet) != 0 {
+		t.Errorf("an object with no tags reports %d of them", len(out.TagSet))
+	}
+
+	// Not an answer about objects that do not exist.
+	_, err = client.GetObjectTagging(t.Context(), &awss3.GetObjectTaggingInput{
+		Bucket: aws.String("bucket"), Key: aws.String("absent.bin"),
+	})
+	var api smithy.APIError
+	if !errors.As(err, &api) || api.ErrorCode() != "NoSuchKey" {
+		t.Errorf("tags of a missing object = %v, want NoSuchKey", err)
+	}
+
+	// And a request that asks for tags to exist is refused rather than dropped,
+	// which is what makes the answer above true.
+	_, err = client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("with-tags.bin"),
+		Body: bytes.NewReader(data), Tagging: aws.String("colour=octarine"),
+	})
+	if !errors.As(err, &api) || api.ErrorCode() != "NotImplemented" {
+		t.Errorf("put with tags = %v, want NotImplemented", err)
+	}
+	if _, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("with-tags.bin"),
+	}); err == nil {
+		t.Error("the refused write stored the object anyway, tags silently dropped")
+	}
+	// A multipart upload asks for tags on the call that creates it.
+	_, err = client.CreateMultipartUpload(t.Context(), &awss3.CreateMultipartUploadInput{
+		Bucket: aws.String("bucket"), Key: aws.String("with-tags.bin"),
+		Tagging: aws.String("colour=octarine"),
+	})
+	if !errors.As(err, &api) || api.ErrorCode() != "NotImplemented" {
+		t.Errorf("create upload with tags = %v, want NotImplemented", err)
 	}
 }

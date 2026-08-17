@@ -104,6 +104,34 @@ func (c *Coordinator) UploadPart(ctx context.Context, id string, number int, bod
 // that does not exist, or one whose ETag does not match, is refused with nothing
 // changed. Committing a manifest over a client's mistake would produce an object
 // that is readable, checksum-valid, and not what anybody uploaded.
+// CopyPart stores a part whose bytes come from a range of an existing object, which
+// is UploadPartCopy — how every client copies an object too large to copy in one
+// call. The aws CLI switches to it above 8 MB, so without it a server-side copy of a
+// large object is not possible at all.
+//
+// The bytes are read from the source's owners and written to the part's, so a copy
+// of this kind moves data inside the cluster where CopyObject moves none. That is
+// the reason it was deferred rather than a reason not to have it: the alternative is
+// to give the part the source's own chunk references, which holds only when the
+// range's boundaries fall exactly on chunk boundaries — and a client choosing an
+// 8 MB part size against a 32 MB chunk never lands there. Re-chunking through the
+// ordinary write path is honest about the cost and keeps a part indistinguishable
+// from an uploaded one, which is what lets completion stay a single manifest commit.
+//
+// Streaming, so the part's size does not decide the footprint: the pipe hands each
+// chunk to the writer as the reader produces it.
+func (c *Coordinator) CopyPart(ctx context.Context, id string, number int, src object.Manifest, off, length int64) (string, error) {
+	pr, pw := io.Pipe()
+	go func() {
+		// CloseWithError(nil) closes cleanly, so this reports the end of the range
+		// and a failed read the same way, and the writer sees which.
+		pw.CloseWithError(c.StreamRange(ctx, src, pw, off, length))
+	}()
+	// Unblocks the goroutine above if the write side gives up early.
+	defer pr.Close()
+	return c.UploadPart(ctx, id, number, pr, length)
+}
+
 func (c *Coordinator) CompleteUpload(ctx context.Context, id string, parts []CompletedPart) (object.Manifest, error) {
 	u, err := c.meta.Upload(ctx, id)
 	if errors.Is(err, meta.ErrNotFound) {
