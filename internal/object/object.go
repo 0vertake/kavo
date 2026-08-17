@@ -96,6 +96,10 @@ type Manifest struct {
 	// the node's configuration: an object written as 6+3 must still be readable
 	// after the cluster's default changes.
 	Coding ec.Scheme
+	// CRC32C is the Castagnoli checksum of the object's bytes, computed as they
+	// were written. A pointer because 0 is a real checksum (the empty object) and
+	// a missing value is an object written before this was stored.
+	CRC32C *uint32 `json:",omitempty"`
 }
 
 // Write splits r into chunks of at most chunkSize, hands each to commit, and
