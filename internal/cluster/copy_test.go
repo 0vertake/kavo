@@ -119,3 +119,50 @@ func chunkIDs(m object.Manifest) []string {
 	}
 	return ids
 }
+
+// A copied part is read from the source and written through the ordinary write path,
+// so the question a fault asks is what happens when the source stops being readable
+// halfway. The answer has to be that the part does not exist: the client's only
+// evidence a copy worked is the etag it gets back, and an etag for the first half of
+// a range is an etag the client will happily complete an upload with — assembling an
+// object that is not the copy it asked for and never learning otherwise.
+//
+// Made deterministic by taking the source's second chunk away from every node, which
+// is a source that reads for exactly one chunk and then cannot.
+func TestACopiedPartIsAllOrNothingWhenItsSourceStopsReading(t *testing.T) {
+	tc := newCluster(t, 5)
+	const source = "copy/source"
+	owners, outsider := tc.owners(t, source)
+	data := randBytes(3 * testChunkSize)
+	m := mustPut(t, outsider, source, data)
+	if len(m.Chunks) < 3 {
+		t.Fatalf("the source has %d chunks, want at least 3 for a mid-stream failure", len(m.Chunks))
+	}
+
+	id, err := outsider.c.CreateUpload(context.Background(), "copy/assembled", "", nil)
+	if err != nil {
+		t.Fatalf("create upload: %v", err)
+	}
+
+	// Every copy of the middle chunk goes, so the read cannot be served from
+	// anywhere. The first chunk stays, so the copy gets underway before it fails.
+	for _, n := range append([]*node{outsider}, owners...) {
+		if n.has(m.Chunks[1]) {
+			n.loseChunks(t, m.Chunks[1:2])
+		}
+	}
+
+	if _, err := outsider.c.CopyPart(context.Background(), id, 1, m, 0, m.Size); err == nil {
+		t.Fatal("copying a part from a source that stops reading succeeded, so a client holds an etag for half a range")
+	}
+
+	// And nothing was recorded under that part number, so a completion cannot
+	// assemble an object out of the half that was readable.
+	parts, err := outsider.c.Parts(context.Background(), id)
+	if err != nil {
+		t.Fatalf("parts: %v", err)
+	}
+	if len(parts) != 0 {
+		t.Errorf("the failed copy left part %d behind (%d bytes)", parts[0].Number, parts[0].Size)
+	}
+}

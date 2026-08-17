@@ -213,6 +213,54 @@ The upload is signed with `UNSIGNED-PAYLOAD`, which is the only honest way to st
 than memory to a signed API: a hex payload hash would require reading the object twice, and holding
 it in order to hash it is the exact thing this measures the absence of.
 
+## What a server-side copy costs
+
+A copy has two prices here, and they are not the same price. `CopyObject` commits a second manifest
+naming the first one's chunks, so it moves nothing. `UploadPartCopy` — what every client uses above
+8 MB, including the `aws` CLI — has to read the range and write it back, because a part whose
+boundaries do not fall on chunk boundaries cannot be handed the source's chunk references.
+
+| | 4 KB | 1 MB | 64 MB |
+| --- | --- | --- | --- |
+| `CopyObject` | 1.06 ms | 1.06 ms | 1.06 ms |
+| `UploadPartCopy`, one part | — | 33 ms / 32 MB/s | 233 ms / 288 MB/s |
+| PUT of the same object, for scale | 25 ms | 30 ms / 35 MB/s | 207 ms / 310 MB/s |
+
+The first row is the whole argument for copying a manifest: three sizes spanning four orders of
+magnitude, and the number does not move. That is why `aws s3 mv` of a large object returns instantly.
+
+The second row is the honest cost of the other path: 288 MB/s against 310 MB/s for a plain PUT of the
+same bytes, so reading the source adds ~13% rather than the ~50% a read-then-write would. The pipe
+hands each chunk to the writer as the reader produces it, so the fetch of chunk N+1 overlaps the
+replication of chunk N. At 1 MB the three multipart calls around it are the entire measurement.
+
+At a size where none of it can be an artifact — one 2 GB object, six nodes, `ps` watching from
+outside the processes:
+
+| | time | peak RSS over idle | bytes over the client's link |
+| --- | --- | --- | --- |
+| `CopyObject` | 2–3 ms | — | 0 |
+| `UploadPartCopy`, 8 parts of 256 MB | 12.5–16.5 s / 124–163 MB/s | 82–98 MB | 0 |
+| what a client without either would do: GET then PUT | 29–40 s | — | 4 GB |
+
+Ranges because these are three runs of the same measurement, and one run of something that writes
+6 GB through six processes on one disk is a story rather than a number. The spread is the disk's: the
+first run's GET half took 13 s and the next two took 2–3 s, because by then the source was in the
+page cache.
+
+Under 100 MB over idle to copy 2 GB in 256 MB parts is the streaming claim holding on the newest
+write path: a third of a *part*, under 5% of the object, and stable across the three runs. The
+footprint is chunk-shaped, as it is for a PUT, because a copied part goes through the same write
+path — the part size never appears in memory.
+
+One caveat, because a ~2x against the round trip is the kind of number that deserves it. The
+124–163 MB/s is below the 288 MB/s above it, and the reason is the cluster rather than the size: by
+then it holds the 2 GB source as three copies and is writing three more, and the round trip's own PUT
+half ran at 76–79 MB/s against 314 MB/s to an idle cluster for the same reason. So read the ratio as
+indicative of an ordering, not a factor. What is not indicative is the last column: the client path
+moves 4 GB across the client's link and the server-side path moves none, and that difference does not
+depend on how busy anything is.
+
 ## Replication against erasure coding
 
 4+2 rather than the 6+3 default, because a `k+m` code needs `k+m` nodes and the test cluster has
@@ -336,6 +384,18 @@ on purpose:
   copy, a pass over 10 M chunks is ~1.3 hours of pure survey. That is a real problem at that
   scale and no problem at all at this one; the fix is a protocol change and can wait for the
   scale that needs it.
+
+  A 60-minute chaos run found where "this one" stops being true, which is lower than it reads.
+  Repair walks every object in key order before it returns to any of them, so a full pass is the
+  floor on how long a missing copy can go unnoticed — and 57,440 objects is a quarter of a million
+  copies, or ~50 s of pure survey per pass. Nothing was lost and the cluster was whole once the
+  workload stopped, but the chaos barrier, which called repair stuck after 30 s without a restored
+  copy, was measuring where the cursor happened to be. The barrier now derives that window from the
+  copies it surveys itself (`surveyPerCopy` in `test/chaos_test.go`). The number to take from it is
+  the other one: **time-to-heal has a floor of one full pass**, so at a few hundred thousand copies
+  a single missing copy waits up to a minute for the walk to reach it, however fast the rebuild
+  itself is. That is the argument for batching, and it now has a measurement rather than an
+  extrapolation from 10 M.
 - **Coalescing directory fsyncs across concurrent commits** (group commit). The dir barrier is
   ~3.6 ms of an 8.2 ms chunk write, and concurrent writers on one node could share it. But it puts
   shared mutable state in the one function the durability invariants depend on, to win back a cost
@@ -362,6 +422,13 @@ on purpose:
   key and throws away all but the last, which is a thousand small allocations per page. Fixing it
   means restructuring the loop that does both paging and delimiter grouping — the one place a subtle
   bug loses or repeats keys — and the allocations do not show up in the time. Left alone.
+- **Buffering the pipe a copied part streams through.** `UploadPartCopy` reads the source into an
+  unbuffered `io.Pipe` that the write path drains, so the fetch of the next chunk only overlaps the
+  replication of the current one by as much as a 32 MB handoff allows. A buffer would overlap them
+  fully and the measurement says it is worth ~13% — the difference between 288 MB/s and a plain PUT's
+  310 MB/s. It would also give every concurrent copy a second chunk-sized buffer to hold, on the one
+  path whose reason for existing is that it does not hold the object. 13% is not worth widening the
+  memory claim.
 - **The payload hash of a signed request.** SigV4 with a hex payload hash requires hashing the body
   to verify the signature, and that is not an optimisation to find but a promise to keep. Clients
   that would rather not pay it already have two ways out that kavo implements: `UNSIGNED-PAYLOAD`

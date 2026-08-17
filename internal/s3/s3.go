@@ -74,6 +74,10 @@ func (h *handler) authed(next http.HandlerFunc) http.HandlerFunc {
 			fail(w, r, errEncryptionNotImplemented, nil)
 			return
 		}
+		if taggingRequested(r.Header) {
+			fail(w, r, errTaggingNotImplemented, nil)
+			return
+		}
 		if key := r.PathValue("key"); key != "" {
 			for name := range r.URL.Query() {
 				if !knownObjectQuery(r.Method, name, r.URL.Query().Get(name)) {
@@ -116,6 +120,13 @@ func knownObjectQuery(method, name, value string) bool {
 		return method == http.MethodPost
 	case "max-parts", "part-number-marker":
 		return method == http.MethodGet
+	case "tagging":
+		// Reading an object's tags is answered — with none, which is true, since
+		// nothing here stores any. Setting them is not: see taggingRequested.
+		// The asymmetry is the point. A client asking what the tags are gets a
+		// correct answer; a client asking for tags to exist is refused rather
+		// than told they do.
+		return method == http.MethodGet
 	case "versionId":
 		// Nothing here is versioned, and every object is reported by
 		// ListObjectVersions as the single version "null", so a request naming
@@ -146,6 +157,18 @@ func encryptionRequested(header http.Header) bool {
 		}
 	}
 	return false
+}
+
+// taggingRequested reports whether a request asks for tags to be attached, which is
+// x-amz-tagging on a PUT or a multipart creation.
+//
+// Refused rather than ignored, and refused for the same reason a read of tags is
+// *answered*: a store that drops the header and then reports the object has no tags
+// has told a client its tags are gone by way of two successful responses. Either
+// both are honest or neither is. An empty value asks for no tags, which is what the
+// object will have, so there is nothing there to drop.
+func taggingRequested(header http.Header) bool {
+	return header.Get("X-Amz-Tagging") != ""
 }
 
 // key is the etcd key for an object: the bucket and the key within it. Both parts
@@ -276,6 +299,30 @@ func (h *handler) copyObject(w http.ResponseWriter, r *http.Request, key, source
 	writeXML(w, r, copyResult{ETag: etag(m), LastModified: m.Modified.UTC().Format(time.RFC3339)})
 }
 
+// taggingResult is the GetObjectTagging response: an object with no tags, which is
+// every object here.
+type taggingResult struct {
+	XMLName xml.Name `xml:"Tagging"`
+	XMLNS   string   `xml:"xmlns,attr"`
+	TagSet  struct{} `xml:"TagSet"`
+}
+
+// objectTagging answers a read of an object's tags with none.
+//
+// The object is resolved first, so a read of a key that does not exist is NoSuchKey
+// rather than an empty tag set — otherwise this would answer for objects that are
+// not there, which is the mistake buckets-as-prefixes already makes and does not
+// need company. It exists at all because the aws CLI reads the source's tags before
+// copying anything larger than 8 MB, so refusing it makes every large server-side
+// copy fail on a call about a feature neither side wants.
+func (h *handler) objectTagging(w http.ResponseWriter, r *http.Request, key string) {
+	if _, err := h.cluster.Resolve(r.Context(), key); err != nil {
+		fail(w, r, storeError(err), err)
+		return
+	}
+	writeXML(w, r, taggingResult{XMLNS: s3XMLNS})
+}
+
 // copySource parses the header's "/bucket/key" or "bucket/key", either of which a
 // client may send, and either of which may be percent-encoded. A version id
 // suffix is refused rather than ignored: nothing here is versioned, so honouring a
@@ -311,6 +358,10 @@ func (h *handler) getObject(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.listObjects(w, r)
+		return
+	}
+	if r.URL.Query().Has("tagging") {
+		h.objectTagging(w, r, key)
 		return
 	}
 	// A GET carrying an upload id asks what parts have arrived, not for the object:

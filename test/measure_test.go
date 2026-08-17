@@ -24,6 +24,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/xml"
 	"flag"
 	"fmt"
 	"io"
@@ -261,7 +262,7 @@ func TestMeasureHealTime(t *testing.T) {
 			victim.loseChunks()
 			var elapsed time.Duration
 			for {
-				if holes, settled := missingCopies(t.Context(), byID, store, len(nodes)); settled && len(holes) == 0 {
+				if holes, _, settled := missingCopies(t.Context(), byID, store, len(nodes)); settled && len(holes) == 0 {
 					elapsed = time.Since(start)
 					break
 				}
@@ -337,7 +338,7 @@ func TestMeasureRebalanceOnJoin(t *testing.T) {
 	var moved int
 	stableSince := time.Time{}
 	for {
-		holes, settled := missingCopies(t.Context(), byID, store, len(grown))
+		holes, _, settled := missingCopies(t.Context(), byID, store, len(grown))
 		perNode, _ := copiesHeld(grown)
 		switch {
 		case !settled || len(holes) > 0 || perNode[joiner.id] != moved:
@@ -607,4 +608,166 @@ func misplaced(ctx context.Context, nodes []*node, store *meta.Store) (map[strin
 		}
 	}
 	return extra, nil
+}
+
+// copyPartSize is what a client picks for a large copy: big enough that a
+// multi-gigabyte object is a handful of calls, and far larger than the chunk size,
+// so a part is re-chunked rather than mapped one-to-one.
+const copyPartSize = 256 << 20
+
+// What a server-side copy costs, which is the question UploadPartCopy exists to
+// answer and the one the S3 surface cannot answer on its own.
+//
+// Three numbers, one object:
+//
+//   - CopyObject copies a manifest, so it moves no bytes and takes about as long as
+//     an etcd write. The point of measuring it at gigabyte scale is that the number
+//     does not change with the size.
+//   - a multipart copy does move the bytes, inside the cluster, through the
+//     ordinary write path. That is what a client above 8 MB gets, so its rate and
+//     its memory are the honest cost of the feature — and the memory is a claim:
+//     the part is streamed, so a 256 MB part must not appear in a node's RSS.
+//   - the round trip a client would make without it, out to the client and back.
+//     The saving is the difference, and it is the argument for the feature.
+func TestMeasureCopyingALargeObject(t *testing.T) {
+	skipUnlessMeasuring(t)
+
+	bin := buildKavod(t)
+	nodes := startCluster(t, bin, clusterPrefix(), measureChunkSize, measureCluster)
+
+	idle, _ := watchRSS(nodes).close()
+	t.Logf("idle RSS, highest of %d nodes: %s", len(nodes), bytesOf(idle))
+
+	size := *measureObject
+	const source = "copy/source"
+	putSigned(t, nodes[0], source, size)
+	t.Logf("source object: %s", bytesOf(size))
+
+	t.Run("CopyObject", func(t *testing.T) {
+		start := time.Now()
+		status, body := s3Do(t, nodes[0], http.MethodPut, "copy/whole", nil,
+			map[string]string{"X-Amz-Copy-Source": "measure/" + source})
+		took := time.Since(start)
+		if status != http.StatusOK {
+			t.Fatalf("CopyObject: status %d: %s", status, body)
+		}
+		// Read it back, or "instant" would only prove the request returned.
+		getSigned(t, nodes[1], "copy/whole", size)
+		t.Logf("copied %s in %v by copying the manifest, moving no bytes",
+			bytesOf(size), took.Round(time.Millisecond))
+	})
+
+	t.Run("UploadPartCopy", func(t *testing.T) {
+		watcher := watchRSS(nodes)
+		const dest = "copy/assembled"
+
+		start := time.Now()
+		id := createUpload(t, nodes[0], dest)
+		var parts []completedPart
+		for off, number := int64(0), 1; off < size; number++ {
+			end := min(off+copyPartSize, size) - 1
+			etag := copyPartRange(t, nodes[number%len(nodes)], dest, id, number,
+				"measure/"+source, fmt.Sprintf("bytes=%d-%d", off, end))
+			parts = append(parts, completedPart{PartNumber: number, ETag: etag})
+			off = end + 1
+		}
+		completeUpload(t, nodes[0], dest, id, parts)
+		took := time.Since(start)
+
+		getSigned(t, nodes[1], dest, size)
+		peak, which := watcher.close()
+		t.Logf("copied %s as %d parts of %s in %v (%s)",
+			bytesOf(size), len(parts), bytesOf(copyPartSize), took.Round(time.Millisecond), rateOf(size, took))
+		t.Logf("peak RSS %s on %s, %s over idle: %.1f%% of a part, %.1f%% of the object",
+			bytesOf(peak), which, bytesOf(peak-idle),
+			100*float64(peak-idle)/float64(copyPartSize), 100*float64(peak-idle)/float64(size))
+	})
+
+	t.Run("client round trip", func(t *testing.T) {
+		// What the same copy costs a client that has to fetch the object and send
+		// it back. Sequential, so this is an upper bound: a client piping one into
+		// the other overlaps them, at best halving it. Either way the bytes cross
+		// the client's link twice, which is the part a server-side copy removes.
+		start := time.Now()
+		getSigned(t, nodes[0], source, size)
+		down := time.Since(start)
+		start = time.Now()
+		putSigned(t, nodes[0], "copy/reuploaded", size)
+		up := time.Since(start)
+		t.Logf("out and back: %v down (%s) + %v up (%s) = %v of client traffic for the same copy",
+			down.Round(time.Millisecond), rateOf(size, down),
+			up.Round(time.Millisecond), rateOf(size, up),
+			(down + up).Round(time.Millisecond))
+	})
+}
+
+// s3Do signs and sends a request whose body is small enough to hash, which is every
+// call in a multipart copy: the bytes being copied never pass through here.
+func s3Do(t *testing.T, n *node, method, key string, body []byte, headers map[string]string) (int, []byte) {
+	t.Helper()
+	sum := sha256.Sum256(body)
+	req, err := http.NewRequestWithContext(t.Context(), method,
+		"http://"+n.s3Addr+"/measure/"+key, strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	sign(t, req, hex.EncodeToString(sum[:]))
+
+	resp, err := (&http.Client{Timeout: time.Hour}).Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, key, err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	return resp.StatusCode, out
+}
+
+type completedPart struct {
+	PartNumber int
+	ETag       string
+}
+
+func createUpload(t *testing.T, n *node, key string) string {
+	t.Helper()
+	status, body := s3Do(t, n, http.MethodPost, key+"?uploads", nil, nil)
+	if status != http.StatusOK {
+		t.Fatalf("CreateMultipartUpload: status %d: %s", status, body)
+	}
+	var out struct{ UploadId string }
+	if err := xml.Unmarshal(body, &out); err != nil {
+		t.Fatalf("CreateMultipartUpload body: %v: %s", err, body)
+	}
+	return out.UploadId
+}
+
+func copyPartRange(t *testing.T, n *node, key, id string, number int, source, byteRange string) string {
+	t.Helper()
+	status, body := s3Do(t, n, http.MethodPut,
+		fmt.Sprintf("%s?partNumber=%d&uploadId=%s", key, number, id), nil,
+		map[string]string{"X-Amz-Copy-Source": source, "X-Amz-Copy-Source-Range": byteRange})
+	if status != http.StatusOK {
+		t.Fatalf("UploadPartCopy %s: status %d: %s", byteRange, status, body)
+	}
+	var out struct{ ETag string }
+	if err := xml.Unmarshal(body, &out); err != nil {
+		t.Fatalf("UploadPartCopy body: %v: %s", err, body)
+	}
+	return out.ETag
+}
+
+func completeUpload(t *testing.T, n *node, key, id string, parts []completedPart) {
+	t.Helper()
+	var b strings.Builder
+	b.WriteString("<CompleteMultipartUpload>")
+	for _, p := range parts {
+		fmt.Fprintf(&b, "<Part><PartNumber>%d</PartNumber><ETag>%s</ETag></Part>", p.PartNumber, p.ETag)
+	}
+	b.WriteString("</CompleteMultipartUpload>")
+	status, body := s3Do(t, n, http.MethodPost, key+"?uploadId="+id, []byte(b.String()), nil)
+	if status != http.StatusOK {
+		t.Fatalf("CompleteMultipartUpload: status %d: %s", status, body)
+	}
 }

@@ -317,3 +317,73 @@ func BenchmarkList(b *testing.B) {
 		}
 	})
 }
+
+// The two costs of a server-side copy, which are not the same cost.
+//
+// CopyObject commits a second manifest naming the first one's chunks, so it moves no
+// bytes and its number should not move with the size — that flatness is the reason
+// `aws s3 mv` of a large object is instant, and a size sweep is how the claim is
+// checked rather than asserted. UploadPartCopy has to read the range and write it
+// back, so it costs a read and a write of every byte and is bounded by whichever is
+// slower. A client without it pays a GET plus a PUT for the same result, over its own
+// link, so the pair of numbers is what the feature is worth.
+func BenchmarkCopy(b *testing.B) {
+	for _, size := range benchSizes {
+		b.Run("object/"+sizeName(size), func(b *testing.B) {
+			client := benchGateway(b)
+			const key = "copy/source"
+			benchPut(b, client, key, randBytes(int(size)))
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; b.Loop(); i++ {
+				_, err := client.CopyObject(b.Context(), &awss3.CopyObjectInput{
+					Bucket: aws.String("bench"), Key: aws.String("copy/dest/" + strconv.Itoa(i)),
+					CopySource: aws.String("bench/" + key),
+				})
+				if err != nil {
+					b.Fatalf("copy: %v", err)
+				}
+			}
+		})
+	}
+
+	// Only at sizes where moving the bytes is the whole cost: a copied part below a
+	// chunk is a measurement of the multipart calls around it.
+	for _, size := range []int64{1 << 20, 64 << 20} {
+		b.Run("parts/"+sizeName(size), func(b *testing.B) {
+			client := benchGateway(b)
+			const key = "copypart/source"
+			benchPut(b, client, key, randBytes(int(size)))
+
+			b.SetBytes(size)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; b.Loop(); i++ {
+				dest := "copypart/dest/" + strconv.Itoa(i)
+				create, err := client.CreateMultipartUpload(b.Context(), &awss3.CreateMultipartUploadInput{
+					Bucket: aws.String("bench"), Key: aws.String(dest),
+				})
+				if err != nil {
+					b.Fatalf("create upload: %v", err)
+				}
+				out, err := client.UploadPartCopy(b.Context(), &awss3.UploadPartCopyInput{
+					Bucket: aws.String("bench"), Key: aws.String(dest), UploadId: create.UploadId,
+					PartNumber: aws.Int32(1), CopySource: aws.String("bench/" + key),
+					CopySourceRange: aws.String(fmt.Sprintf("bytes=0-%d", size-1)),
+				})
+				if err != nil {
+					b.Fatalf("copy part: %v", err)
+				}
+				if _, err := client.CompleteMultipartUpload(b.Context(), &awss3.CompleteMultipartUploadInput{
+					Bucket: aws.String("bench"), Key: aws.String(dest), UploadId: create.UploadId,
+					MultipartUpload: &types.CompletedMultipartUpload{Parts: []types.CompletedPart{
+						{ETag: out.CopyPartResult.ETag, PartNumber: aws.Int32(1)},
+					}},
+				}); err != nil {
+					b.Fatalf("complete: %v", err)
+				}
+			}
+		})
+	}
+}

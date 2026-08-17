@@ -4,13 +4,13 @@ Ceph's [`s3-tests`](https://github.com/ceph/s3-tests) is the suite S3 implementa
 against. It is an independent oracle in the strongest sense available: nobody involved in kavo chose
 what it asserts, and it encodes S3's behaviour as observed by people who had to match it.
 
-**169 of 886 pass. 623 fail, 94 the suite skips itself, and nothing errors** — every test reaches a
+**176 of 886 pass. 616 fail, 94 the suite skips itself, and nothing errors** — every test reaches a
 verdict rather than dying in setup. The pass count is not the interesting number on its own, because
 most of what the suite covers is deliberately absent here (see the locked subset in
 `docs/design.md`). What is interesting is the classification below: what fails because of an
 anti-goal, and what fails because of a gap.
 
-The count has moved six times, and three of those moves were downward on purpose:
+The count has moved seven times, and three of those moves were downward on purpose:
 
 | count | what changed |
 | --- | --- |
@@ -21,6 +21,7 @@ The count has moved six times, and three of those moves were downward on purpose
 | 196 | user metadata, header passthrough, and the multipart calls the API was missing |
 | 177 | refusing requests for encryption instead of ignoring them |
 | 169 | refusing an object's subresources, which had been answered by overwriting the object |
+| 176 | `UploadPartCopy`, and answering a read of an object's tags with none |
 
 The last line is the one that matters, and it is covered in "What the suite did not find" below:
 `PUT /key?tagging` was reaching the handler that writes an object and replacing the object with the
@@ -28,7 +29,15 @@ tagging XML. Eight of the passes given back were tests doing exactly that — `t
 `test_put_modify_tags` and `test_put_max_kvsize_tags` set tags and check the call succeeded, and
 kavo succeeded by destroying the object each of them names.
 
-The line above it is the second-worst. kavo does not encrypt objects, and it used to *ignore* the
+The row after it is the repair. `UploadPartCopy` exists now, so a server-side copy of an object too
+large for the CLI to copy in one call works rather than being refused. Six of the seven are the
+`multipart_copy` family; the seventh is `test_multipart_copy_improper_range`, which wanted a
+malformed range answered 400 where a range that merely does not fit the source is 416 — the first
+says the request cannot be read, the second says something true about the object, and only the
+second is worth retrying. The copy family is down to two failures, a versioned copy and a
+cross-account one, both anti-goals.
+
+The line above the subresource row is the second-worst. kavo does not encrypt objects, and it used to *ignore* the
 headers asking it to: a client that sent a customer key was answered `200`, its object stored in
 plaintext that anyone could read back without the key, and the suite scored that arrangement as
 twenty-two passes. Three of them arrived in this very round, as a side effect of unrelated multipart
@@ -126,8 +135,18 @@ and invented a status for them. Two questions later the store was overwriting ob
 The same run turned up the multipart half of it. A part whose bytes come from another object is
 `UploadPartCopy`, and the header naming the source was ignored, so the request was read as a part
 with an empty body and answered 200 with an etag. A large `aws s3 cp` between two keys would have
-assembled an empty object out of those parts and called it a copy. It is refused now, which makes
-the copy fail loudly instead: the gap is unchanged, the lie is gone.
+assembled an empty object out of those parts and called it a copy. It was refused first, so that the
+copy failed loudly, and then implemented, so that it does not fail at all: the source's range is
+streamed through the ordinary read and write paths, one chunk in flight, and the part is
+indistinguishable from an uploaded one.
+
+Implementing it needed one more thing, which is the only concession tagging gets here. The CLI reads
+the source's tags before a multipart copy, so refusing that read failed every large copy on a call
+about a feature nobody wants. A **read** of an object's tags is now answered with none, which is
+true, and **asking for tags to exist is refused** — `x-amz-tagging` on a PUT or an upload creation
+included, since that header had been silently dropped. Both halves are load-bearing: a store that
+drops the header and then reports the object has no tags has told a client its tags are gone by way
+of two successes, which is the encryption mistake wearing a different hat.
 
 The lesson is narrower than "test more". kavo's own suite has driven the real `aws` CLI through
 `cp`, `sync` and `mv` since early on — with objects small enough to copy in a single call. The
@@ -146,14 +165,14 @@ other id, since answering an invented version with the live object deletes the w
 ## Why the 615 fail
 
 `docs/classify.py` produces this table from the suite's own failure list. Each test lands in exactly
-one family — the first that matches its name, in the order shown — so the counts sum to 623 rather
+one family — the first that matches its name, in the order shown — so the counts sum to 616 rather
 than counting an SSE copy twice. A test is filed under what it is about, which is not always what it
 died on: many of these never reach their assertion because a `ListObjects` v1 call or a
 `GetBucketVersioning` in their setup is refused first.
 
 | count | family | verdict |
 | --- | --- | --- |
-| 138 | server-side encryption (SSE-C, SSE-KMS) | anti-goal, and refused rather than ignored |
+| 137 | server-side encryption (SSE-C, SSE-KMS) | anti-goal, and refused rather than ignored |
 | 77 | ACLs, grants, and the public/private access matrix | anti-goal |
 | 47 | versioning: version ids, delete markers, suspend | anti-goal |
 | 45 | `ListObjects` v1 and its paging parameters | deliberate: v2 only |
@@ -167,7 +186,7 @@ died on: many of these never reach their assertion because a `ListObjects` v1 ca
 | 21 | SigV2 signing | anti-goal: SigV4 only |
 | 12 | CORS | anti-goal |
 | 14 | tagging | anti-goal |
-| 8 | `UploadPartCopy` and cross-account copy | gap and anti-goal, see below |
+| 2 | versioned and cross-account copy | anti-goal |
 | 9 | multipart upload edge cases | mixed, see below |
 | 9 | non-MD5 checksum algorithms (CRC32, CRC32C, SHA-1) | gap |
 | 8 | anonymous and unsigned access | anti-goal: one key pair, everything signed |
@@ -186,12 +205,12 @@ that catches encryption tests was found to match `enc_` and not `enc[`, so the p
 requests it had been ignoring, which moved tests that had been passing into this row. A classifier is
 only worth the numbers it produces, so both are filed here rather than quietly fixed.
 
-By verdict: **487 anti-goals, 47 v1 `ListObjects`, 28 consequences of buckets being prefixes, 24
-conditional writes, 35 named gaps, and 2 artifacts of the suite's own environment.** The gap column
-is the one to read — it is the list of things a client might reasonably expect and not get. It is led
-by `UploadPartCopy` (5) and by `?partNumber` reads (3), with the rest in checksums and error codes.
-The nine that moved into the anti-goal rows this round moved there from the pass column, when the
-subresource writes they were making stopped being answered with the object.
+By verdict: **488 anti-goals, 47 v1 `ListObjects`, 28 consequences of buckets being prefixes, 24
+conditional writes, 27 named gaps, and 2 artifacts of the suite's own environment.** The gap column
+is the one to read — it is the list of things a client might reasonably expect and not get. With
+`UploadPartCopy` implemented it is led by non-MD5 checksums (9) and the multipart edge cases (9, of
+which 3 are `?partNumber` reads), then the error codes for malformed authorization headers (6) and
+`100-continue` (3). Nothing in the copy family is a gap any more.
 
 Not one conditional *read* fails. The 24 in the row above are all `If-Match` on a `PUT` or a
 `DELETE`, and they are an exclusion rather than an oversight: a conditional write makes the commit a
@@ -204,16 +223,6 @@ Anti-goals are listed in `docs/design.md` and are not defects: kavo is an object
 S3 subset, not an S3 clone. The rows marked **gap** are things a client might reasonably expect that
 kavo does not do yet, and they are worth naming honestly:
 
-- **`UploadPartCopy`**, which is refused rather than missing: until this round the header naming the
-  source was ignored and the request stored an empty part. `CopyObject` works — a manifest written
-  under a second key, no chunk movement, which is what makes `aws s3 mv` server-side. Assembling a
-  new object out of *ranges* of existing ones does not, and that is 5 of the 8 in the copy row. The
-  practical cost is that `aws s3 cp` between two keys is server-side only below the CLI's 8 MB
-  threshold; above it the copy is refused, and refused twice, since the CLI reads the source's tags
-  first. A part is already a manifest of
-  chunk references, so copying a whole object into a part would be easy; a range of one is not,
-  because it would have to re-chunk at the range boundaries, and re-chunking is the one thing a copy
-  never does. The other 3 are cross-account, which needs a second key pair to exist.
 - **`?partNumber` on a read**, which returns one part of a multipart object and the `PartsCount` of
   the whole, and the 3 tests that ask for it. The manifest records the object's chunks but not where
   its parts ended, so answering this means recording part boundaries at completion — a change to what
@@ -284,6 +293,7 @@ kavo claims:
 | family | passing |
 | --- | --- |
 | `ListObjectsV2`, all shapes | 37 of 40 |
+| server-side copy of a multipart-sized object | 6 of 7 |
 | multipart upload, end to end | 14 of 25 |
 | single-object `CopyObject` | 15 of 23 |
 | conditional reads: 8 on `GET`, 4 on a copy source | 12 of 12 |

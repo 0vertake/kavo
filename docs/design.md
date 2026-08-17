@@ -548,7 +548,7 @@ is encrypted while anyone can read it back without the key. That is the one fail
 cannot detect for itself, and it is worth being explicit that this rule *cost* pass count rather than
 earning it.
 
-External validation: Ceph `s3-tests`. **169 of 886 pass, nothing errors**, and every failure is
+External validation: Ceph `s3-tests`. **176 of 886 pass, nothing errors**, and every failure is
 classified in `docs/s3-compatibility.md` — as an anti-goal, a consequence of buckets being prefixes,
 or a named gap. The suite found four real defects, three of which kavo's own tests could not see;
 they are listed there too. It also found two sets of passes that were not real. Eighteen came from a
@@ -557,10 +557,10 @@ claiming to have configured lifecycle rules, policies and encryption it has no c
 more came from ignoring the encryption headers above. Refusing the first set took the count from 169
 to 151; `CopyObject`, conditional reads, `Content-MD5`, metadata and the missing multipart calls took
 it to 196; refusing the second set brought it back to 177, and refusing an object's subresources —
-which had been answered by overwriting the object — brought it to 169, which is the honest figure.
-That it is the number the measurement opened with is a coincidence: the same count now covers
-`CopyObject`, conditional reads, `Content-MD5`, user metadata and three multipart calls that did
-not exist then.
+which had been answered by overwriting the object — brought it to 169. That this is the number the
+measurement opened with is a coincidence: the same count covered `CopyObject`, conditional reads,
+`Content-MD5`, user metadata and three multipart calls that did not exist at the outset.
+`UploadPartCopy` then took it to **176**, which is the honest figure.
 
 The third set was the serious one, and the suite did not find it — it was found by copying a 20 MB
 object with the `aws` CLI, which above 8 MB copies by multipart and begins by reading the source's
@@ -692,6 +692,34 @@ every upload exactly once; only the order differs. The scan is bounded in the sa
 parts share its prefix, so a listing reads a fixed number of etcd keys and reports itself truncated
 rather than reading however many there are.
 
+**A part can come from another object** (`UploadPartCopy`), which is not an extra: above 8 MB the aws
+CLI performs *every* server-side copy that way, so without it `CopyObject` was a copy for small
+objects and an error for large ones — and before it was refused, a lie for large ones, since the
+header naming the source was ignored and each request stored a part with an empty body.
+
+It is implemented as a stream: the source's range is read through the ordinary read path and written
+through the ordinary write path, one chunk in flight, so a copy of a 5 GB object holds no more memory
+than a copy of a small one. That costs a read and a write inside the cluster where `CopyObject` costs
+neither, and the cheap alternative was rejected rather than missed. Handing the part the source's own
+chunk references only works when the copied range begins and ends exactly on chunk boundaries, and a
+client choosing 8 MB parts against 32 MB chunks never lands there — so the fast path would apply to
+almost nothing while making a part different in kind from an uploaded one, which is what would
+complicate the commit. Re-chunking keeps completion a single manifest commit over parts that are all
+the same thing.
+
+A copied range that runs past the end of the source is refused rather than satisfied by what exists,
+which is the opposite of what a `Range` header on a read does. The difference is who can tell: a
+reader sees the bytes it got, while a copying client sees only an etag for whatever was copied, so a
+silently shortened range assembles an object nobody described. Both ends of the range are required
+for the same reason.
+
+The CLI reads the source's tags before a multipart copy, so **a read of an object's tags is answered
+with none** — true here, since nothing stores any — while **asking for tags to exist is refused**,
+`x-amz-tagging` on a PUT or an upload creation included. Both halves are load-bearing: dropping the
+header and then reporting no tags would tell a client its tags had vanished by way of two successful
+responses, which is the same failure as ignoring an encryption header. Tagging as a feature remains
+an anti-goal; what is answered is a question about an object, not a place to put tags.
+
 **A completion is idempotent for as long as a retry could take.** Every SDK retries a request whose
 connection died, and a completion whose response was lost used to be answered `NoSuchUpload` — telling
 the client its upload failed while the object was sitting there committed. The upload id is now
@@ -766,8 +794,9 @@ implementation disagreeing is the only thing that catches a misreading.
 
 - **Chaos** (milestone 10): `go test ./test -run TestChaos`, tunable with `-chaos.duration` and
   replayable with `-chaos.seed`. Eight workers drive a signed S3 workload — single PUTs and
-  multipart uploads, reads through a different node than the write went to, server-side copies, and
-  deletes — against four real `kavod` processes while faults arrive on a seeded schedule: SIGKILL and
+  multipart uploads, reads through a different node than the write went to, server-side copies both
+  as a manifest copy and assembled out of ranges of the source, and deletes — against four real
+  `kavod` processes while faults arrive on a seeded schedule: SIGKILL and
   restart, SIGSTOP (a frozen process: ports open, nothing answered, no lease renewed), a wiped disk,
   and a flipped bit under a running node. Then it asserts the four invariants (see `AGENTS.md`) from
   the recorded history.
@@ -778,6 +807,43 @@ implementation disagreeing is the only thing that catches a misreading.
   ten-second grace, still seven times the longest stall a fault here imposes — and counts what it
   reclaimed. A long run that reclaimed nothing fails: it would mean the copies had been tested
   against an idle collector, which is the version of this test that proves nothing.
+
+  Half of those copies are assembled out of two ranges of the source with `UploadPartCopy` instead,
+  and a run that acknowledged none of them fails for the same reason. It is the only write path whose
+  bytes are read out of the store while they are written back into it, so it is the only one a fault
+  can interrupt from the *read* side: the source's owners can be killed, frozen or wiped while the
+  copy is streaming. What has to hold is that a part is all or nothing, because a client's only
+  evidence is the etag it gets back and an etag for the first half of a range is one it will complete
+  an upload with — assembling an object that is not the copy it asked for, and being told it is.
+  `object.Write` fails on a read error rather than committing what it got, and
+  `TestACopiedPartIsAllOrNothingWhenItsSourceStopsReading` pins that by taking the source's second
+  chunk away from every node: closing the pipe cleanly instead of with the error is a one-word change
+  that stores the short part and passes everything else.
+
+  A 45-minute replicated run acknowledged 51,623 writes — 10,344 of them server-side copies, 5,146 of
+  those assembled from ranges — deleted 8,295 again, served 82,560 reads during fault windows, and
+  took 40 faults, the last two of which wiped 20,121 and then 40,274 chunks off a node. It verified
+  43,329 objects byte-identical and 8,301 absent, none lost and none torn, having reclaimed on 3,373
+  occasions along the way. A 45-minute coded run of the same workload (`-chaos.ec=4+2`, seed
+  `1786659083719981000`) acknowledged 26,836 writes — 5,309 of them copies, 2,620 assembled from
+  ranges — took 61 faults of which one wiped 40,306 shards, and verified 22,585 objects byte-identical
+  with none lost and none torn.
+
+  Note the shape of the cost: the workload is what `-chaos.duration` names, but the verification
+  afterwards reads the whole history back and waits for redundancy to settle, so a long run needs
+  `-timeout` well above its duration — that 45-minute replicated run took 61 minutes and would have
+  been killed mid-verdict by the 70-minute timeout that looked generous.
+
+  A 60-minute replicated run reached the scale where the heal barrier's 30 s window was no longer a
+  bound on progress. It acknowledged 57,418 writes, 5,783 of them assembled from ranges, took 50
+  faults, and verified every survivor byte-identical with none lost and none torn — including after
+  the final barrier, which found the cluster whole. The barrier *during* the workload declared
+  repair stuck after a kill of n1 left six copies unrestored for 30 s
+  (`-chaos.seed=1786654359933316000`). Repair walks every object in key order before returning to
+  any of them, so at a quarter of a million copies a single pass is ~50 s of survey and a 30 s
+  window measures where the cursor happens to be. The window now grows with the copies the barrier
+  itself surveys (`surveyPerCopy` in `test/chaos_test.go`); the same seed then ran for 60 minutes
+  without the barrier firing, verified 52,770 objects byte-identical, and lost none.
 
   It runs once per storage mode. `-chaos.ec=4+2` stores the same workload erasure-coded instead of
   replicated, on a cluster one node wider than the code, and CI runs both. That gap was open for a
