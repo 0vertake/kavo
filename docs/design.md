@@ -10,10 +10,15 @@ node is healed automatically — with published numbers behind each claim.
 
 - **`kavod`** — the node daemon. Symmetric (MinIO-style): every node runs the S3 gateway,
   the local chunk store, and the repair participant. Any node can coordinate any request.
-- **`kavoctl`** — admin CLI: cluster status, layout changes, heal/scrub triggers.
-- **`kavo-chaos`** — chaos runner + invariant checker (milestone 10).
 - **etcd** — object manifests, membership (leases), partition layout. Single instance in dev.
 
+That is the whole of it, and two things planned here were deliberately not built. The chaos runner
+became a test (`test/chaos_test.go`) rather than a binary, because it has to start and kill real
+`kavod` processes and assert against a recorded history, which is what a test harness already does.
+And `kavoctl` has nothing left to do: cluster status is one HTTP GET on the internal port, and repair,
+scrub, rebalancing and collection are background passes with no button to press — a CLI that could
+trigger them would be a remote-control surface on an unauthenticated port, which is the one surface
+this design is otherwise careful to keep small.
 ## Data path
 
 ### Write (replicated mode)
@@ -32,8 +37,9 @@ node is healed automatically — with published numbers behind each claim.
 3. After W=2 acks per chunk, and all chunks done, the gateway commits the object manifest
    (chunk list, locations, checksums, size, version) to etcd in one atomic `Put`. That is
    enough: etcd serializes it, so a concurrent overwrite of the same key resolves to one
-   manifest or the other and never a mix of both. Compare-and-swap is only needed to reclaim
-   the chunks of the manifest being replaced, so it lands with garbage collection.
+   manifest or the other and never a mix of both. It stayed a plain `Put` after garbage
+   collection landed too — reclaiming an overwritten version's chunks turned out not to need
+   the superseded revision, and the reason is under *Collecting unreferenced chunks* below.
 4. Only then is the client acked. **The etcd commit is the commit point** — the same model as
    S3's `CompleteMultipartUpload`: parts are invisible until atomically assembled.
 
@@ -94,9 +100,9 @@ down:
   the library cannot tell a swapped or corrupted shard from a valid one — it solves whatever
   equations it is handed, and returns garbage with no error. `ec.TestSwappedShardsAreNotDetected`
   exists to demonstrate exactly that.
-- A `k+m` code needs `k+m` nodes. Replication can narrow to a smaller cluster and let repair catch
-  up; erasure coding cannot, so a write that has nowhere to put shard `k+1` is refused instead of
-  storing something unrebuildable.
+- A `k+m` code needs `k+m` nodes, so a write that has nowhere to put shard `k+1` is refused instead
+  of storing something unrebuildable. Replication refuses too, below W nodes, for the reason in the
+  next section.
 
 **Acknowledged at `k+1` shards, not `k`.** Acking at `k` would mean one later loss makes the
 chunk unreadable — an acknowledged write lost to a single failure. One spare, mirroring how W=2 of
@@ -141,6 +147,51 @@ perfect (every node owns every partition), so that case cannot judge the ring.
 kavo is **not** Dynamo. Chunks are immutable and etcd serializes metadata, so there are no
 vector clocks, no sloppy quorums, and no read repair needed for correctness. Quorums answer
 exactly one question: are enough copies durably on disk before the manifest commits?
+
+**A placement narrower than N is widened, not lived with.** The other half of the same mistake, and
+a longer-lived one. A write acknowledged at W while some nodes were unreachable names fewer nodes
+than the configuration asks for — correctly, at the time — and the pass that fixes placement was
+asking the ring for as many owners as the manifest already had, so it moved such an object sideways
+forever and never added the owner it was missing. Repair could not help: it refuses to put a copy
+anywhere the manifest does not already name, because that is rewriting placement, which is
+rebalancing's job. So the object stayed one copy short of its configuration for life.
+
+Nothing could see it, either, which is the part worth keeping in mind. Every check in the codebase
+and in the chaos suite asked whether the copies a manifest names are present, and an object
+promising two copies and holding two is a full house by that measure. So the barrier now checks the
+promise as well: the cluster is whole when every manifest names its own code's full width. With
+that check and the fix reverted, `-chaos.seed=1786500476032706000` fails on
+`chaos/w0/obj0446: placed on n1,n4, want 3 owners` — a real narrow write from a freeze storm, which
+is what invariant 4 was quietly missing.
+
+Rebalancing now targets the redundancy the object was *written* with, read from the object's own
+recorded code rather than from this node's configuration, since a cluster can hold replicated and
+erasure-coded objects at once. It still never commits fewer copies than a write was acknowledged
+with, so a shrinking cluster waits rather than narrowing anything.
+
+**W copies on distinct nodes or none at all, even when the cluster looks smaller than W.** The
+code used to require "every owner there is", so a coordinator that could see fewer than W nodes
+would place on the nodes it had and acknowledge that. It reads like graceful degradation and it
+behaves like data loss, which the chaos suite proved by doing it: with three of four nodes frozen,
+the survivor's view collapsed to itself — a node keeps itself in its own ring, because a node is
+alive by definition — so it placed a two-chunk object on its own disk, acknowledged it, and the
+disk wipe that arrived next destroyed it. Repair had nothing to rebuild from, the read returned
+`unexpected EOF`, and the object's server-side copy went with it, since a copy shares its source's
+chunks. Replay it with `-chaos.seed=1786500476032706000`; the four missing copies for two
+two-chunk objects are the tell, because a manifest naming three nodes would have left twelve.
+
+A narrow ring and a small cluster are indistinguishable from inside, so a write that cannot reach
+W distinct nodes is refused with `SlowDown` before a byte is stored. The cost is availability, in
+the only case where availability and durability actually conflict: a node cut off from its peers
+becomes read-only rather than accepting writes it cannot keep. That is the trade a store whose
+first invariant is "no acknowledged write is ever lost" has already made.
+
+Which makes W something an operator declares (`-w`, default 2) rather than something the code
+infers from the moment. One node running kavo can only be asking for one copy, and it says so with
+`-w 1`; what it must not do is have that decision made for it by a lapsed lease. The crash-safety
+harness is exactly that deployment — its claim is about what one disk holds after SIGKILL, and a
+second node would answer its reads from a copy and prove nothing — so it passes `-w 1` and gives up
+replication explicitly.
 
 ## Membership and repair
 
@@ -219,6 +270,16 @@ whose copy still verifies, staged and renamed so the bad copy is never half-over
 every copy reports `ErrRotUnrecovered`: the last good copy of that data is gone, and that must be
 said out loud.
 
+"A peer" means any node the manifest names that the cluster has ever known, not only a current
+member — the same rule the read path uses, and for the same reason: a chunk is immutable and
+verified against the manifest's checksum at both ends, so a node whose lease has lapsed either
+hands over the bytes the manifest names or fails to answer. Asking only current members, which is
+what this did, made rot unrecoverable in the case where recovery matters most: the copies that
+verify sitting on nodes the cluster has dropped while the broken one is here. Reads kept working
+through those very addresses, so nothing reported a problem, and the rot waited for the good copies
+to go too. It divides every peer call in the cluster package: whatever wants bytes accepts a
+last-known address, whatever hands bytes over or counts them as present requires a member.
+
 Passes are paced by the same byte rate as repair and default to once a day, because a pass reads
 every byte the node stores. Rot is rare and disks are large, so scrubbing is a slow sweep rather
 than a reaction.
@@ -265,6 +326,145 @@ committed by then, so a copy that could not be deleted is wasted disk, not a dur
 A node that has already left is never asked — its disk is gone or will be reclaimed when it
 rejoins and finds no manifest pointing at what it holds.
 
+### Collecting unreferenced chunks
+
+Every write leaves chunks nothing points at. An overwrite supersedes the chunks of the manifest
+it replaces. A write that fails after storing data leaves what it stored. A delete and an aborted
+upload leave everything they named. A rebalance leaves behind the copies it moved away from. None of
+it is reachable — readers resolve objects only through committed manifests — so none of it threatens
+correctness. It is storage that is paid for and not counted, and it only ever grows.
+
+The obvious design is to record what each write superseded: commit the new manifest and a list
+of the old one's chunks in one transaction, then have a worker delete them. That needs the
+revision the commit replaced, which is the compare-and-swap the write path was always going to
+grow. **It is the wrong design, and the reason is `CopyObject`.** Chunk ids are a random prefix
+per write plus an index, so no two *writes* ever name the same chunk — but copying an object
+server-side means copying its manifest and not its data, which makes two keys name one set of
+chunks. Under sharing, deleting the chunks of the manifest an overwrite replaced would delete
+chunks a copy still references, which is an acknowledged write lost from the collection path. A
+per-write record cannot express sharing without reference counts in the commit path.
+
+So the pass is mark-and-sweep instead. A node reads every manifest in the cluster, builds the
+set of chunk ids some manifest says *this node* should hold, and deletes the local chunks that
+set does not contain. A chunk is live if any manifest names it, so sharing costs nothing, and
+the write path is untouched: the commit point keeps the proof it already had. It also reclaims
+garbage no record would ever have been written for, which is every category above except the
+first.
+
+**And it is the only thing that deletes a chunk.** That is the same argument reaching every other
+pass, once sharing exists. A delete used to drop its object's chunks, an abort its parts', a
+rebalance the copies it had just moved away from — each on the strength of the one manifest in front
+of it, which is exactly the judgement sharing invalidates. Deleting a copied object would have taken
+its source's data; and the worse one, because nobody asked for it: a copy keeps its source's
+placement, so the ring makes it misplaced from the moment it exists, and the rebalance that tidied
+it up would drop the source's copies on the way past. `TestMovingACopyLeavesTheSourceReadable`
+covers that. So none of them delete anything now, and there is no longer any code that can delete a
+chunk on another node — the peer API's delete route is gone, which also takes a capability off the
+unauthenticated internal port. The cost is paid at the disk: space returns within a collection cycle
+rather than at once, which is why the interval defaults to a minute and a full cycle to about half
+an hour.
+
+Three things make it safe:
+
+- **A partial read of the manifests deletes nothing.** A scan that failed halfway is
+  indistinguishable from a cluster where the objects it did not reach do not exist. Any error
+  ends the pass before it touches the disk.
+- **The cutoff is when the scan started, not now.** An object written during the scan, under a
+  key the scan had already passed, is invisible to it. Nothing written after the scan began may
+  be deleted on the strength of it, however long the scan took.
+- **A write in flight says so, and the sweep reads it.** A chunk is durable before the manifest
+  naming it is committed, so for that window good data is referenced by nothing at all. A write
+  that can have more than one chunk therefore records itself in etcd before it stores any of
+  them, and the sweep treats every chunk of a recorded write as live. One key covers a whole
+  upload, because every chunk of one write shares an id prefix. In-flight multipart uploads are
+  covered the same way and additionally by their part manifests — S3 lets a client take days —
+  and the pass reads the in-flight records first, then the parts, then the objects, which is
+  what makes each handover safe whichever side of the scan it falls on.
+- **A grace period covers the rest, which is now a tail rather than a window.** A write with a
+  single chunk commits a moment after storing it and never bothers with a record; age is what
+  covers that moment, and the default is a minute.
+
+All of these are checked against real processes rather than argued, at a grace of zero so that age
+protects nothing and the records are all that is holding the objects up: six clients writing
+continuously against a sweep every 10ms, every acknowledged write read back byte for byte
+(`TestWritesArrivingDuringSweepsAreAllReadable`); one client handing over eight chunks with a pause
+between each, so the pass sweeps the object's slice several times while the upload is in flight
+(`TestASlowUploadIsNotSweptWhileItArrives`); and an upload left as nothing but parts through fifteen
+full cycles of the id space before it completes (`TestAnUploadOutlivingManySweepsStillCompletes`).
+Ignoring the in-flight records, or recording a write after its first chunk is stored instead of
+before, or reading part manifests not at all: every one of those mutations turns a read into
+`unexpected EOF`.
+
+What the manifest says, not what exists: a copy on a node the manifest does not name is
+unreachable, because a reader tries the nodes it names and stops. That is what lets this pass
+reclaim the copies a move leaves behind — which is now every move, since nothing but this pass
+deletes a chunk.
+
+**And what the ring says, which is the seam where this pass first lost data.** A rebalance
+copies every chunk to the new owners before committing the manifest that names them — it has to,
+because until that commit a reader must still find the object where the old manifest says it is
+— and the copying is rate-limited. So for the length of a move, the object's size over the
+repair rate, the destination holds chunks no manifest mentions. Judged by the manifests alone
+they are garbage, and a sweep deletes them as fast as the move makes them; then the move commits,
+promising copies that are no longer there. At the time the move also dropped the old copies on the
+strength of that promise, which is what turned a missing copy into a missing object. Both passes
+were doing exactly what they were written to do.
+
+Measured, in a three-node cluster grown to six with the sweep set to a short grace: for keys the
+join reassigns to an entirely new set of owners, one chunk ended up on no node at all, the object
+returned `unexpected EOF`, and the cluster sat at 21 of the 24 copies its manifests promised.
+Smaller membership changes hid it — a move that replaces one owner of three leaves two good
+copies, so repair restores the third and nothing is lost. That is the failure mode worth naming:
+not a wrong line of code, but two correct passes whose windows overlap, showing up as a race
+repair usually wins.
+
+The fix is to make a chunk live if the manifest names this node **or the ring makes this node an
+owner of the object it belongs to**. The ring is what says a move here is in flight or coming, so
+the destination's copies are referenced for the whole move. It spares nothing this pass was
+written for: a copy a move left behind sits on a node that lost the partition, so neither the
+manifest nor the ring names it, and it is still collected. `TestAMoveThatReplacesEveryOwnerKeepsItsData`
+holds the cluster in that state on purpose: it doubles a three-node cluster and picks keys whose
+owners all change, so no copy of them stays put. It asserts that the objects read *and* that repair
+never restored anything — because before the fix the objects sometimes still read, and only because
+repair replaced what the sweep had taken. A guarantee that depends on one background pass outrunning
+another is not a guarantee. With the ring clause there is nothing to restore: before the commit every
+copy is where the manifest says, and after it every copy is where the move put it.
+
+Each pass sweeps one thirty-second of the id space, chosen by cursor, because the alternative is
+holding a set of every chunk id on the node — tens of megabytes at a million chunks, and a
+background pass whose memory grows with the disk is one that eventually cannot run. A chunk id
+starts with a random base32 character and a shard id starts with its chunk's id, so one slice
+covers a chunk and all of its shards. At the default one-minute interval a full cycle is about half
+an hour, and nothing is reclaimed before the grace period either, so a delete shows up as free
+space within a grace period plus a cycle — about half an hour at the shipped defaults.
+
+**The grace period used to be an hour, and shrinking it was a correctness change rather than a
+tuning one.** Age was the only thing protecting a write in flight, so the default had to exceed
+the longest a write could take — and S3 allows a single PUT of 5 GB, which over a 10 Mbit link
+is more than an hour. An hour of grace was therefore not generosity but an estimate of the
+outside world, and a client slower than about 1.2 MB/s beat it: the sweep took the upload's first
+chunks, the manifest committed naming them, and the client was told its object was stored. That
+is invariant 1 broken by a slow link, and `TestASweepInsideAWriteLeavesItAlone` reproduces it
+deterministically by running a whole collection cycle, at zero grace, between two chunks of a
+write. Before the fix the PUT succeeds and the read fails with `unexpected EOF`.
+
+So a write that can have another chunk now writes one small key naming itself before it stores
+any of them, and clears it after its manifest is committed — in that order, because a chunk
+protected by neither the record nor a manifest, even for an instant, is a chunk a sweep may take.
+Only a write that *can* have another chunk: a chunk shorter than the chunk size is the last one,
+so its manifest follows a moment later, and the ordinary small object pays nothing at all. That
+is what keeps this off the hot path, and the 1 KB PUT numbers with it.
+
+**Two things then have to agree about a writer that vanishes.** The record's value is the node
+coordinating the write, and the sweep drops records belonging to nodes that are no longer members
+— otherwise a crash mid-upload would protect its garbage forever, since nothing else would ever
+remove the record. But a node can lose etcd for longer than its lease and come back: it would
+find its record gone and its early chunks collected, and committing then would acknowledge an
+object with a hole. So the commit of a recorded write is conditional on the record, in one etcd
+transaction (`meta.CommitWhileWriting`). Such a write fails instead, which is the outcome that
+keeps the invariant: nothing was acknowledged. The membership lease, already the cluster's answer
+to who is still working, decides which of the two happens.
+
 ## Crash safety
 
 fsync errors are data loss: fail the write or quarantine the disk, never retry-and-trust
@@ -282,19 +482,96 @@ being asked to: `CreateBucket`, `ListBuckets`, `DeleteBucket`, `DeleteObjects`,
 `ListObjectVersions` and `GetBucketLocation`. Nothing else (no IAM/ACLs/versioning/lifecycle;
 anti-goal).
 
+Three things clients send as *headers* on those calls rather than as calls of their own, and all were
+added for the same reason the six were:
+
+- **Conditional reads.** `If-Match`, `If-None-Match`, `If-Modified-Since` and `If-Unmodified-Since`
+  on GET and HEAD, answered from the committed manifest — so a client that already holds the object
+  pays one etcd read instead of the object's bytes, which is what `aws s3 sync` asks of every file it
+  considers. The precedence is HTTP's, which S3 follows: an entity tag is a better answer than a
+  date, so `If-Match` outranks `If-Unmodified-Since` and `If-None-Match` outranks
+  `If-Modified-Since`. A failed `If-Match` is 412 because the client's belief about what it is
+  reading is wrong; a matched `If-None-Match` is 304 because its copy is current, and carries the
+  same validators a 200 would.
+
+  The same four arrive on a copy as `x-amz-copy-source-if-*`, where they are conditions on the
+  *source* — still a question about a manifest, still nothing to do with the commit. They are
+  answered by translating them into the plain headers and running the rules above, rather than by a
+  second implementation that drifts from the first, with one difference in the answer: a copy has no
+  "you already have it" outcome to report, so an unmet condition is 412 whichever kind it was, where
+  a read would have said 304. Ceph's suite disagreed with the first version of this, which had
+  returned 304 for a copy nobody asked to be told about.
+- **`Content-MD5`.** A client declaring what it sent is asking to be contradicted, and the only
+  useful answer is a refusal — an object stored under a digest it does not have is corruption the
+  client has been told is fine. Checked before the manifest commits, so the write is refused
+  *entirely*: the digest covers the whole body, so the chunks are already on disk when the answer is
+  known, and they are left unreferenced for collection rather than committed and left for the client
+  to delete. A malformed digest is `InvalidDigest` and a mismatch is `BadDigest`, because one is the
+  client's bug and the other may be the network's. An *empty* `Content-MD5` is malformed rather than
+  absent: the client said it was declaring a digest and then declared none, and reading that as "no
+  digest was sent" would store the object under a promise nobody made.
+
+- **User metadata and the headers that describe the bytes.** `x-amz-meta-*`, plus `Cache-Control`,
+  `Content-Disposition`, `Content-Encoding`, `Content-Language` and `Expires`: stored with the
+  manifest and replayed on every read, never interpreted. The line between these and the headers kavo
+  drops is whether they describe the *object* or the *exchange that delivered it* — `Content-Length`
+  and `Content-MD5` are facts about one HTTP request, and answering a later reader with them would be
+  describing a conversation that is over. `aws-chunked` is dropped from `Content-Encoding` for the
+  same reason: it is the framing of the body that arrived, which kavo decoded, so keeping it would
+  tell every future reader the stored bytes are chunk-framed when they are not.
+
+  A multipart object takes its metadata from the call that began the upload, because that is the only
+  call a client can attach it to, so the upload record carries it until the completion commits. On a
+  copy, `x-amz-metadata-directive` selects `COPY` (the source's, which is the default) or `REPLACE`
+  (the request's, and *only* the request's — replacing with nothing is how a client strips metadata).
+  `REPLACE` is also what makes a copy onto itself meaningful, and so what makes it legal: without it
+  a copy onto itself is a request to overwrite an object with itself.
+
+  Metadata is capped at 2 KB per object, as S3 caps it. Unbounded metadata is unbounded manifests, and
+  a manifest is read by every request for the object and by every background pass over it.
+
+Conditional *writes* are deliberately not here. `If-None-Match: *` on a PUT means "create only if
+absent", which needs the manifest commit to be a compare-and-set rather than a `Put`, and that is a
+change to the commit point — the one place in this store where an extra condition has to be argued
+for rather than added. Nothing kavo is tested against asks for it.
+
 Those six are not a widening of the subset so much as the cost of being reachable. An SDK creates
 the bucket before its first upload, `aws s3 ls` with no argument lists buckets, and every client
 empties a bucket by listing versions and bulk-deleting what it finds. None of them store anything
 new: a bucket is still a prefix, and the version listing reports every object once with the id
 `null`, which is S3's own answer for a bucket that was never versioned.
 
-External validation: Ceph `s3-tests`. **151 of 886 pass, nothing errors**, and every failure is
+A request for something kavo does not do is refused, not ignored. Server-side encryption is the case
+that matters: any request carrying `x-amz-server-side-encryption*` or a customer key is answered 501,
+because the alternative — storing the object in plaintext and answering 200 — tells a client its data
+is encrypted while anyone can read it back without the key. That is the one failure mode a client
+cannot detect for itself, and it is worth being explicit that this rule *cost* pass count rather than
+earning it.
+
+External validation: Ceph `s3-tests`. **176 of 886 pass, nothing errors**, and every failure is
 classified in `docs/s3-compatibility.md` — as an anti-goal, a consequence of buckets being prefixes,
 or a named gap. The suite found four real defects, three of which kavo's own tests could not see;
-they are listed there too. It also found eighteen passes that were not real: a `PUT` to any bucket
-subresource reached the create-bucket handler and answered 200, so kavo was claiming to have
-configured lifecycle rules, policies and encryption it has no code for. Refusing them is what took
-the count from 169 to 151.
+they are listed there too. It also found two sets of passes that were not real. Eighteen came from a
+`PUT` to any bucket subresource reaching the create-bucket handler and answering 200, so kavo was
+claiming to have configured lifecycle rules, policies and encryption it has no code for. Twenty-two
+more came from ignoring the encryption headers above. Refusing the first set took the count from 169
+to 151; `CopyObject`, conditional reads, `Content-MD5`, metadata and the missing multipart calls took
+it to 196; refusing the second set brought it back to 177, and refusing an object's subresources —
+which had been answered by overwriting the object — brought it to 169. That this is the number the
+measurement opened with is a coincidence: the same count covered `CopyObject`, conditional reads,
+`Content-MD5`, user metadata and three multipart calls that did not exist at the outset.
+`UploadPartCopy` then took it to **176**, which is the honest figure.
+
+The third set was the serious one, and the suite did not find it — it was found by copying a 20 MB
+object with the `aws` CLI, which above 8 MB copies by multipart and begins by reading the source's
+tags. Because S3 addresses an object's subresources as a query on the object's own path, ignoring
+the query does not drop the request, it performs a different one: `PUT /key?tagging` wrote the
+tagging XML *as the object*, `PUT /key?acl` truncated the object to nothing, `DELETE /key?tagging`
+deleted it, and `UploadPartCopy` — whose source is named in a header rather than the query — stored
+an empty part. Every one answered success. An object request now carries an allowlist of the
+queries it can mean (`knownObjectQuery`), matching the one buckets have had since the same shape of
+bug was found there, and the tests that cover it assert that the object is unchanged afterwards
+rather than that the call was refused.
 
 ### Object API
 
@@ -325,10 +602,20 @@ sent cannot be withdrawn. A read that fails **after** the body started is report
 short of the promised `Content-Length` — a truncated transfer every client treats as an error,
 which is the only remaining way to say "do not trust these bytes".
 
-**Delete removes the manifest first**, which is the instant the object stops existing, and only
-then reclaims chunks. The reverse order would drop chunks a live manifest still names. Deleting a
-key that is not there succeeds, because S3 promises an idempotent delete and clients build
-cleanup loops on it.
+**Delete removes the manifest and nothing else**, which is the instant the object stops existing,
+since a reader can only reach chunks through one. The chunks stay until the collection pass has read
+every manifest in the cluster and found no name for them — a copy shares its source's chunks, so this
+manifest alone does not speak for them. Deleting a key that is not there succeeds, because S3
+promises an idempotent delete and clients build cleanup loops on it.
+
+**`CopyObject` copies the manifest, not the data.** A server-side copy of a terabyte is one etcd
+write, which is the only reason to have the operation at all: `aws s3 mv` is a copy and a delete, and
+a copy that made the client download and re-upload would be slower than the client doing it itself.
+The copy keeps the source's placement rather than its own key's, so the ring considers it misplaced
+from the moment it exists and rebalancing moves it in the background; until then it is readable
+exactly where the source is. `UploadPartCopy` is not implemented — a range of a source object would
+have to be re-chunked at the range boundaries, and re-chunking is the one thing this copy never
+does.
 
 ### Listing
 
@@ -388,8 +675,65 @@ any single manifest, and the completion is refused rather than committed against
 held the chunks. Tested by changing membership mid-upload.
 
 The ETag is the MD5 of the parts' MD5s with the part count after a dash, because that is the value
-clients recompute to check the upload. `ListParts` and `ListMultipartUploads` are not implemented:
-nothing in the locked subset needs them, and no client kavo is tested against asks.
+clients recompute to check the upload.
+
+**The API answers all of its own calls.** `ListParts` and `ListMultipartUploads` used to be missing,
+which is worse than it sounds: both are a `GET`, so a client asking which parts had arrived was
+answered by the object read handler with `NoSuchKey` — telling a client whose parts are all safely
+stored that there is nothing there — and a client asking what uploads were in flight got an object
+listing, which parses cleanly as "none". A listing that is empty for the wrong reason is the failure
+mode this subset is meant to avoid, and it is the reason both exist now.
+
+`ListMultipartUploads` pages in upload-id order rather than S3's key order, and says so here because
+a client cannot tell from the response. Ordering by key means either reading every in-flight upload in
+the store into memory to sort it, which is the one thing no request here is allowed to do, or keeping
+a second index by key that can disagree with the first. The markers work, so a client that pages sees
+every upload exactly once; only the order differs. The scan is bounded in the same breath: an upload's
+parts share its prefix, so a listing reads a fixed number of etcd keys and reports itself truncated
+rather than reading however many there are.
+
+**A part can come from another object** (`UploadPartCopy`), which is not an extra: above 8 MB the aws
+CLI performs *every* server-side copy that way, so without it `CopyObject` was a copy for small
+objects and an error for large ones — and before it was refused, a lie for large ones, since the
+header naming the source was ignored and each request stored a part with an empty body.
+
+It is implemented as a stream: the source's range is read through the ordinary read path and written
+through the ordinary write path, one chunk in flight, so a copy of a 5 GB object holds no more memory
+than a copy of a small one. That costs a read and a write inside the cluster where `CopyObject` costs
+neither, and the cheap alternative was rejected rather than missed. Handing the part the source's own
+chunk references only works when the copied range begins and ends exactly on chunk boundaries, and a
+client choosing 8 MB parts against 32 MB chunks never lands there — so the fast path would apply to
+almost nothing while making a part different in kind from an uploaded one, which is what would
+complicate the commit. Re-chunking keeps completion a single manifest commit over parts that are all
+the same thing.
+
+A copied range that runs past the end of the source is refused rather than satisfied by what exists,
+which is the opposite of what a `Range` header on a read does. The difference is who can tell: a
+reader sees the bytes it got, while a copying client sees only an etag for whatever was copied, so a
+silently shortened range assembles an object nobody described. Both ends of the range are required
+for the same reason.
+
+The CLI reads the source's tags before a multipart copy, so **a read of an object's tags is answered
+with none** — true here, since nothing stores any — while **asking for tags to exist is refused**,
+`x-amz-tagging` on a PUT or an upload creation included. Both halves are load-bearing: dropping the
+header and then reporting no tags would tell a client its tags had vanished by way of two successful
+responses, which is the same failure as ignoring an encryption header. Tagging as a feature remains
+an anti-goal; what is answered is a question about an object, not a place to put tags.
+
+**A completion is idempotent for as long as a retry could take.** Every SDK retries a request whose
+connection died, and a completion whose response was lost used to be answered `NoSuchUpload` — telling
+the client its upload failed while the object was sitting there committed. The upload id is now
+remembered with what it produced for an hour (`meta.CompletionMemory`), written *before* the upload
+record is deleted so there is no instant in which the id is neither in flight nor remembered. It is an
+etcd lease rather than a background pass, so the record expires even if every node is down. What a
+retry gets back is what *that upload* produced, which is not necessarily what is at the key now: the
+question a retry is asking is about its own request.
+
+**Aborting an upload that does not exist is an error**, which reverses an earlier decision here. It
+had been idempotent on the grounds that a cleanup loop aborts what it has already aborted, but S3
+answers `NoSuchUpload` and Ceph's suite checks it: a client told it successfully aborted an id that
+never existed cannot distinguish that from having aborted the wrong one, so a cleanup loop with a
+typo in it reports success.
 
 Error bodies are S3's XML with S3's codes, because the code is the part clients act on: an SDK
 retries `SlowDown`, refuses to retry `SignatureDoesNotMatch`, and turns `NoSuchKey` into a typed
@@ -450,11 +794,70 @@ implementation disagreeing is the only thing that catches a misreading.
 
 - **Chaos** (milestone 10): `go test ./test -run TestChaos`, tunable with `-chaos.duration` and
   replayable with `-chaos.seed`. Eight workers drive a signed S3 workload — single PUTs and
-  multipart uploads, reads through a different node than the write went to, and deletes — against
-  four real `kavod` processes while faults arrive on a seeded schedule: SIGKILL and restart,
-  SIGSTOP (a frozen process: ports open, nothing answered, no lease renewed), a wiped disk, and a
-  flipped bit under a running node. Then it asserts the four invariants (see `AGENTS.md`) from the
-  recorded history.
+  multipart uploads, reads through a different node than the write went to, server-side copies both
+  as a manifest copy and assembled out of ranges of the source, and deletes — against four real
+  `kavod` processes while faults arrive on a seeded schedule: SIGKILL and
+  restart, SIGSTOP (a frozen process: ports open, nothing answered, no lease renewed), a wiped disk,
+  and a flipped bit under a running node. Then it asserts the four invariants (see `AGENTS.md`) from
+  the recorded history.
+
+  The copies are there because they are what makes two keys name one set of chunks, and roughly one
+  in five of their sources is then deleted. That combination is the reason nothing but the collection
+  pass may delete a chunk, so the run turns the collector up — a one-second interval and a
+  ten-second grace, still seven times the longest stall a fault here imposes — and counts what it
+  reclaimed. A long run that reclaimed nothing fails: it would mean the copies had been tested
+  against an idle collector, which is the version of this test that proves nothing.
+
+  Half of those copies are assembled out of two ranges of the source with `UploadPartCopy` instead,
+  and a run that acknowledged none of them fails for the same reason. It is the only write path whose
+  bytes are read out of the store while they are written back into it, so it is the only one a fault
+  can interrupt from the *read* side: the source's owners can be killed, frozen or wiped while the
+  copy is streaming. What has to hold is that a part is all or nothing, because a client's only
+  evidence is the etag it gets back and an etag for the first half of a range is one it will complete
+  an upload with — assembling an object that is not the copy it asked for, and being told it is.
+  `object.Write` fails on a read error rather than committing what it got, and
+  `TestACopiedPartIsAllOrNothingWhenItsSourceStopsReading` pins that by taking the source's second
+  chunk away from every node: closing the pipe cleanly instead of with the error is a one-word change
+  that stores the short part and passes everything else.
+
+  A 45-minute replicated run acknowledged 51,623 writes — 10,344 of them server-side copies, 5,146 of
+  those assembled from ranges — deleted 8,295 again, served 82,560 reads during fault windows, and
+  took 40 faults, the last two of which wiped 20,121 and then 40,274 chunks off a node. It verified
+  43,329 objects byte-identical and 8,301 absent, none lost and none torn, having reclaimed on 3,373
+  occasions along the way. A 45-minute coded run of the same workload (`-chaos.ec=4+2`, seed
+  `1786659083719981000`) acknowledged 26,836 writes — 5,309 of them copies, 2,620 assembled from
+  ranges — took 61 faults of which one wiped 40,306 shards, and verified 22,585 objects byte-identical
+  with none lost and none torn.
+
+  Note the shape of the cost: the workload is what `-chaos.duration` names, but the verification
+  afterwards reads the whole history back and waits for redundancy to settle, so a long run needs
+  `-timeout` well above its duration — that 45-minute replicated run took 61 minutes and would have
+  been killed mid-verdict by the 70-minute timeout that looked generous.
+
+  A 60-minute replicated run reached the scale where the heal barrier's 30 s window was no longer a
+  bound on progress. It acknowledged 57,418 writes, 5,783 of them assembled from ranges, took 50
+  faults, and verified every survivor byte-identical with none lost and none torn — including after
+  the final barrier, which found the cluster whole. The barrier *during* the workload declared
+  repair stuck after a kill of n1 left six copies unrestored for 30 s
+  (`-chaos.seed=1786654359933316000`). Repair walks every object in key order before returning to
+  any of them, so at a quarter of a million copies a single pass is ~50 s of survey and a 30 s
+  window measures where the cursor happens to be. The window now grows with the copies the barrier
+  itself surveys (`surveyPerCopy` in `test/chaos_test.go`); the same seed then ran for 60 minutes
+  without the barrier firing, verified 52,770 objects byte-identical, and lost none.
+
+  It runs once per storage mode. `-chaos.ec=4+2` stores the same workload erasure-coded instead of
+  replicated, on a cluster one node wider than the code, and CI runs both. That gap was open for a
+  while and it was the wrong one to leave: the two modes fail differently — k+m shards at fixed
+  positions against N interchangeable copies, acknowledgement at k+1 shards against W copies, a lost
+  shard rebuilt from arithmetic over its siblings against a copy fetched from a peer — so a suite
+  that only ever ran replication was proving the four invariants for half the store. Every durability
+  bug found here has lived in a seam of exactly that shape. The coded run survives the same schedule,
+  including six wiped disks (up to 3,751 shards from one node in a five-minute run) and six flipped
+  bits, which means shards rebuilt by decode rather than copies fetched.
+
+  A run also checks that it stored what it was asked to store: if `-chaos.ec` is set and no manifest
+  came out coded, it fails rather than passing. Otherwise a mistyped flag would leave a green job
+  asserting nothing about the mode in its own name.
 
   Three things make it more than a smoke test.
 
@@ -509,7 +912,9 @@ implementation disagreeing is the only thing that catches a misreading.
 - **Redundancy returns at two different speeds**: repair rebuilds a missing copy on an owner the
   manifest already names, so a crash or a lost disk heals on the repair interval. A node that is
   gone for good needs its copy's place moved, which is a rebalance pass — five times less frequent
-  by default, and it moves data rather than restoring it.
+  by default, and it moves data rather than restoring it. The same is true of an object written
+  while part of the cluster was unreachable: it is acknowledged at W and names fewer nodes than N,
+  and the rebalance pass is what widens it, so it is a copy short until that pass reaches it.
 - **Repair sees presence, not integrity**: a chunk that has rotted still answers repair's survey
   as present. The scrubber is what finds it, on a much slower cycle, so rot can sit undetected for
   up to one scrub interval.
@@ -532,20 +937,34 @@ implementation disagreeing is the only thing that catches a misreading.
 - **Killing a process is not killing a machine**: SIGKILL proves commit ordering and rename
   atomicity, but the page cache survives it, so the harness cannot prove fsync actually
   reached the platter. That needs power-loss or filesystem fault injection (milestone 10).
-- **Interrupted uploads, overwrites and abandoned moves leak chunks**: chunks committed before a
-  crash, before a write was refused for missing quorum, replaced by an overwrite, or copied by a
-  rebalance whose commit lost to a client are unreachable and never reclaimed. A `DELETE` and an
-  aborted multipart upload do reclaim their own chunks; nothing collects the rest. Harmless but
-  unbounded until a GC pass exists (manifests are the only roots, so a mark-and-sweep is
-  straightforward).
+- **Deleted space comes back in about half an hour, not at once**: nothing deletes a chunk
+  except the collection pass, so a delete, an overwrite, an aborted upload, a write refused for
+  missing quorum and a rebalance all leave chunks for it, and it frees them a slice of the id space
+  at a time — no sooner than the one-minute grace period, and within a further half-hour cycle after
+  that. Measured on a join: a seventh node's arrival left 32 copies of 192 that no manifest named,
+  and with the collector turned up to a 1-second interval and a 10-second grace they were gone 37
+  seconds after the move. Bounded rather than unbounded, but a store that has just deleted a
+  terabyte does not see the space back immediately. Sharing chunks between keys is what costs this:
+  a delete cannot know whether a copy it never heard of still needs what it is about to free, and
+  the pass that reads every manifest can.
+- **A node cut off from its peers cannot accept writes**: placement needs W distinct nodes, and a
+  coordinator that can see fewer refuses with `SlowDown` rather than acknowledging copies one disk
+  could take with it. A minority partition therefore serves reads and refuses writes — availability
+  traded for the first invariant, in the one case where the two genuinely conflict. A deliberately
+  small cluster says so with `-w`, which is the difference between choosing one copy and being left
+  with one.
+- **A recorded write that loses etcd for longer than its lease fails, rather than finishing**: the
+  cost of the record being what protects a slow upload is that its absence has to be fatal. A node
+  partitioned from etcd for longer than the five-second membership lease has its record dropped and
+  its chunks made collectable, so its commit is refused and the client retries a 5 GB upload it had
+  nearly finished. Wasteful, and the alternative is acknowledging an object with a hole in it.
 - **A multipart upload nobody finishes is never cleaned up**: an upload whose client walks away
-  without aborting keeps its parts' chunks and its etcd records forever. S3 solves this with a
-  lifecycle rule, which is an anti-goal here; the same GC pass is the fix, and an upload's record
-  carries its creation time so the pass has something to age against. Parts uploaded twice, or
-  uploaded and left out of the completion, leak the same way.
-- **A delete can leave copies behind**: the manifest goes first, so the object is gone the moment
-  it returns, but an owner that is down when the chunks are dropped keeps its copy forever — the
-  delete does not come back for it. Same GC pass fixes it.
+  without aborting keeps its parts' chunks and its etcd records forever, and collection does not
+  help — it is precisely the pass that keeps an in-flight upload's parts alive, and it cannot
+  tell a client that will come back from one that will not. The fix is ageing out the upload
+  record itself, which carries its creation time for that reason; S3 solves it with a lifecycle
+  rule, which is an anti-goal here. Parts uploaded twice, or uploaded and left out of the
+  completion, are reclaimed once the upload is completed or aborted.
 - **Multi-range requests are answered with the whole object**: `bytes=0-9,20-29` returns everything
   rather than a `multipart/byteranges` body. Allowed by HTTP, matches S3, and no S3 client asks.
 - **`ListObjects` v1 is refused**: only v2 is served. Every current client uses v2; a v1 client gets

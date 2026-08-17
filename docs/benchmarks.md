@@ -154,6 +154,20 @@ The gap between the two rows is the whole argument for the cap. Unthrottled, thi
 dead disk almost as fast as it can read one — and every byte of that is competing with client
 requests on the same disks and the same network.
 
+The same wipe, 4+2, rebuilds by decode. 16 objects of 32 MB, same six-node cluster, the victim's
+disk emptied, repair uncapped:
+
+| | replicated | coded 4+2 |
+| --- | --- | --- |
+| shards or copies on the lost node | 11 copies / 352 MB | 16 shards / 128 MB |
+| redundancy restored | 770 ms | 1.32 s |
+| effective rate | 456 MB/s | 97 MB/s |
+
+The lost node held fewer bytes under coding — 1.5x stored instead of 3x — and it still took longer
+to come back. A replica is fetched from one peer; a shard is reconstructed from k of them, so the
+heal pays a gather before it can write. That is the other half of the storage-ratio trade, and it is
+why the coded mode's chaos run waits longer at the barrier for the same amount of object data.
+
 ### What a join moves
 
 The claim consistent hashing exists to make is that adding a node moves that node's share and
@@ -163,22 +177,34 @@ joining a six-node cluster holding 2 GB in 64 objects:
 | | |
 | --- | --- |
 | seen by every node | 40 ms |
-| converged | 4.6 s |
+| converged | 4.4 s |
 | copies moved onto it | 34 of 192 (17.7%) |
 | copies the seven-node ring owes it | 34 |
-| copies held that no manifest names | 0 |
+| copies once the move had committed | 224 |
+| of those, copies no manifest names | 32 |
+| until collection had reclaimed every one | 37 s |
 
-The last two rows are the measurement. 34 moved and 34 owed is not a statistical agreement with a
+Rows three and four are the measurement. 34 moved and 34 owed is not a statistical agreement with a
 prediction — it is the exact count the ring assigns to that node for the keys that exist, so
-placement after the join is the placement the ring specifies, key for key. And the copy count is
-192 before and after: the nodes that gave data up let go of it, so the cluster is not quietly
-paying for a fourth replica of everything that moved.
+placement after the join is the placement the ring specifies, key for key.
 
-One caveat, from watching it run rather than from theory: in one run of three, three copies of 192
-outlived the move by minutes. Nothing is lost or unreadable when that happens and redundancy is
-above target rather than below it — it is the chunk garbage collection `docs/design.md` defers,
-showing up as storage that is paid for and not counted. The measurement reports the number rather
-than failing on it, because a rare race in a background loop is not something to fail a build on.
+The rows below them are what a move costs while it is settling, and they used to read differently.
+A move used to copy, commit, and then delete what it had copied away from, so the count came back to
+192 on its own. It cannot any more: a server-side copy shares its source's chunks, so no pass may
+delete a chunk on the strength of the one manifest in front of it, and the move now stops at the
+commit. For a while the cluster holds two placements of everything that moved — 224 copies of what
+needs 192 — and the collection pass is what brings it back down, after reading every manifest in the
+cluster and finding no name for them.
+
+So the residue is a measured duration rather than a caveat now. With the collector turned up to a
+1-second interval and a 10-second grace it reclaimed all 32 in 37 seconds, which is one full cycle of
+the id space plus the grace. At the shipped defaults — a minute of interval and a minute of grace —
+the same residue lives about half an hour. That is the price of the copy operation, paid in disk
+rather than in durability, and it is why the interval is a minute rather than the ten it was.
+
+Thirty-two, not the thirty-four that moved: a sweep had already taken two by the time the count was
+made. The measurement waits for the number to reach zero rather than asserting what it starts at,
+because a background pass that has already done some of its work is not a failure.
 
 ## A multi-gigabyte object
 
@@ -200,6 +226,54 @@ nothing is being paid for in the large case that the small case avoids.
 The upload is signed with `UNSIGNED-PAYLOAD`, which is the only honest way to stream something larger
 than memory to a signed API: a hex payload hash would require reading the object twice, and holding
 it in order to hash it is the exact thing this measures the absence of.
+
+## What a server-side copy costs
+
+A copy has two prices here, and they are not the same price. `CopyObject` commits a second manifest
+naming the first one's chunks, so it moves nothing. `UploadPartCopy` — what every client uses above
+8 MB, including the `aws` CLI — has to read the range and write it back, because a part whose
+boundaries do not fall on chunk boundaries cannot be handed the source's chunk references.
+
+| | 4 KB | 1 MB | 64 MB |
+| --- | --- | --- | --- |
+| `CopyObject` | 1.06 ms | 1.06 ms | 1.06 ms |
+| `UploadPartCopy`, one part | — | 33 ms / 32 MB/s | 233 ms / 288 MB/s |
+| PUT of the same object, for scale | 25 ms | 30 ms / 35 MB/s | 207 ms / 310 MB/s |
+
+The first row is the whole argument for copying a manifest: three sizes spanning four orders of
+magnitude, and the number does not move. That is why `aws s3 mv` of a large object returns instantly.
+
+The second row is the honest cost of the other path: 288 MB/s against 310 MB/s for a plain PUT of the
+same bytes, so reading the source adds ~13% rather than the ~50% a read-then-write would. The pipe
+hands each chunk to the writer as the reader produces it, so the fetch of chunk N+1 overlaps the
+replication of chunk N. At 1 MB the three multipart calls around it are the entire measurement.
+
+At a size where none of it can be an artifact — one 2 GB object, six nodes, `ps` watching from
+outside the processes:
+
+| | time | peak RSS over idle | bytes over the client's link |
+| --- | --- | --- | --- |
+| `CopyObject` | 2–3 ms | — | 0 |
+| `UploadPartCopy`, 8 parts of 256 MB | 12.5–16.5 s / 124–163 MB/s | 82–98 MB | 0 |
+| what a client without either would do: GET then PUT | 29–40 s | — | 4 GB |
+
+Ranges because these are three runs of the same measurement, and one run of something that writes
+6 GB through six processes on one disk is a story rather than a number. The spread is the disk's: the
+first run's GET half took 13 s and the next two took 2–3 s, because by then the source was in the
+page cache.
+
+Under 100 MB over idle to copy 2 GB in 256 MB parts is the streaming claim holding on the newest
+write path: a third of a *part*, under 5% of the object, and stable across the three runs. The
+footprint is chunk-shaped, as it is for a PUT, because a copied part goes through the same write
+path — the part size never appears in memory.
+
+One caveat, because a ~2x against the round trip is the kind of number that deserves it. The
+124–163 MB/s is below the 288 MB/s above it, and the reason is the cluster rather than the size: by
+then it holds the 2 GB source as three copies and is writing three more, and the round trip's own PUT
+half ran at 76–79 MB/s against 314 MB/s to an idle cluster for the same reason. So read the ratio as
+indicative of an ordering, not a factor. What is not indicative is the last column: the client path
+moves 4 GB across the client's link and the server-side path moves none, and that difference does not
+depend on how busy anything is.
 
 ## Replication against erasure coding
 
@@ -228,6 +302,19 @@ The memory column is the honest cost. A replicated read streams a chunk through;
 hold a chunk's shards *and* the reconstructed chunk before any of it is valid. Sizing each shard
 read from the manifest instead of growing it took this from 315 MB to 168 MB per 64 MB object.
 Still flat in object size — the invariant — but ~2.6x a chunk rather than ~1x.
+
+At a size no buffer could hide, through the signed API, `ps` watching from outside:
+
+| object, 4+2 | PUT | GET | peak RSS over idle | of the object |
+| --- | --- | --- | --- | --- |
+| 64 MB | 390 ms / 164 MB/s | 200 ms / 319 MB/s | 114 MB | 213% |
+| 2 GB | 11.2 s / 184 MB/s | 11.4 s / 179 MB/s | 219 MB | 11.8% |
+
+The object grew 32x and the memory above idle grew 2x, which is the same shape as the replicated
+pair (33 MB → 67 MB). It is a taller chunk: roughly the shards of one chunk plus the reconstructed
+one, sitting in RSS rather than only in the allocator's count. Throughput is flat across the two
+sizes in both directions, so nothing is being paid for in the large case that the small case
+avoids.
 
 ## Listing, and why the shape of a manifest matters
 
@@ -324,6 +411,18 @@ on purpose:
   copy, a pass over 10 M chunks is ~1.3 hours of pure survey. That is a real problem at that
   scale and no problem at all at this one; the fix is a protocol change and can wait for the
   scale that needs it.
+
+  A 60-minute chaos run found where "this one" stops being true, which is lower than it reads.
+  Repair walks every object in key order before it returns to any of them, so a full pass is the
+  floor on how long a missing copy can go unnoticed — and 57,440 objects is a quarter of a million
+  copies, or ~50 s of pure survey per pass. Nothing was lost and the cluster was whole once the
+  workload stopped, but the chaos barrier, which called repair stuck after 30 s without a restored
+  copy, was measuring where the cursor happened to be. The barrier now derives that window from the
+  copies it surveys itself (`surveyPerCopy` in `test/chaos_test.go`). The number to take from it is
+  the other one: **time-to-heal has a floor of one full pass**, so at a few hundred thousand copies
+  a single missing copy waits up to a minute for the walk to reach it, however fast the rebuild
+  itself is. That is the argument for batching, and it now has a measurement rather than an
+  extrapolation from 10 M.
 - **Coalescing directory fsyncs across concurrent commits** (group commit). The dir barrier is
   ~3.6 ms of an 8.2 ms chunk write, and concurrent writers on one node could share it. But it puts
   shared mutable state in the one function the durability invariants depend on, to win back a cost
@@ -350,6 +449,13 @@ on purpose:
   key and throws away all but the last, which is a thousand small allocations per page. Fixing it
   means restructuring the loop that does both paging and delimiter grouping — the one place a subtle
   bug loses or repeats keys — and the allocations do not show up in the time. Left alone.
+- **Buffering the pipe a copied part streams through.** `UploadPartCopy` reads the source into an
+  unbuffered `io.Pipe` that the write path drains, so the fetch of the next chunk only overlaps the
+  replication of the current one by as much as a 32 MB handoff allows. A buffer would overlap them
+  fully and the measurement says it is worth ~13% — the difference between 288 MB/s and a plain PUT's
+  310 MB/s. It would also give every concurrent copy a second chunk-sized buffer to hold, on the one
+  path whose reason for existing is that it does not hold the object. 13% is not worth widening the
+  memory claim.
 - **The payload hash of a signed request.** SigV4 with a hex payload hash requires hashing the body
   to verify the signature, and that is not an optimisation to find but a promise to keep. Clients
   that would rather not pay it already have two ways out that kavo implements: `UNSIGNED-PAYLOAD`
@@ -395,6 +501,49 @@ those 730 objects a second are 730 chained per-chunk signature verifications a s
 that implements the scheme independently. Getting it to run at all also turned up a bulk delete
 posted to `/{bucket}/` with a trailing slash, which had been answered with a redirect.
 
-The honest gap that remains: this is one host, so the network is loopback. Numbers from separate
-machines over a real network would be a different measurement, and nothing here should be read as
-one.
+## The network these numbers are not crossing
+
+Every figure above was measured with six nodes on one host, so a chunk reaches its second owner
+across a memory copy. The per-chunk round trip that dominates small writes on real hardware is
+missing from all of them, and nothing here should be read as a network measurement.
+
+What running it elsewhere needs is an address rather than a new harness. The S3 benchmarks drive
+whatever cluster `KAVO_BENCH_ENDPOINT` names:
+
+```sh
+# On each host: same etcd, same cluster prefix, its own reachable address.
+kavod -id n1 -addr 0.0.0.0:8080 -advertise 10.0.0.11:8080 -s3 0.0.0.0:9000       -data /var/lib/kavo -etcd 10.0.0.10:2379 -cluster /kavo
+
+# From anywhere that can reach them:
+KAVO_BENCH_ENDPOINT=http://10.0.0.11:9000 go test ./internal/s3 -run XXX -bench . -timeout 1800s
+```
+
+Only the gateway benchmarks can go remote; the internal-API ones drive a coordinator in the test
+process, which is what makes them a measurement of the code rather than of a deployment. `warp` takes
+`--host` and needs nothing new either.
+
+What to predict when someone runs it: a write pushes to its W owners in parallel, so a PUT should
+gain roughly one round trip per chunk rather than per copy — at 0.25 ms RTT that is noise against a
+25 ms small write, which is fsync, and it stays noise until the disks are fast enough for the network
+to be the slower of the two. Large writes should be bandwidth-bound: 469 MB/s of client throughput is
+1.4 GB/s of chunk traffic leaving the coordinator, which is more than a 10 GbE link carries, so a
+single-NIC node caps a large PUT near 400 MB/s before anything in kavo does. Heal rate has the same
+ceiling and is already rate-limited well below it.
+
+**A containerised cluster on one host is not a substitute, and measuring it is how that became
+clear.** Pointing the same benchmarks at the six-node `make up` cluster on macOS moves every number,
+in both directions:
+
+| operation | six nodes in process | six containers, same host |
+| --- | --- | --- |
+| PUT 4 KB | 25 ms | 5.0 ms |
+| PUT 1 MB | 28 ms / 37 MB/s | 18 ms / 58 MB/s |
+| PUT 64 MB | 143 ms / 469 MB/s | 743 ms / 90 MB/s |
+| GET 4 KB | 0.74 ms | 0.76 ms |
+
+The small write got **five times faster** by being containerised, which is not a speedup: it is
+Docker Desktop's virtual machine absorbing `F_FULLFSYNC` into a page cache the host has not
+promised anything about. The large write got five times *slower*, because the same virtualised
+filesystem and network cap bandwidth. Distortion in both directions, from the same layer — so these
+numbers are recorded here as a caution and are not the ones published above. An object store
+benchmarked in Docker Desktop is measuring Docker Desktop.

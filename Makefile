@@ -1,4 +1,4 @@
-.PHONY: build test bench measure lint up down etcd clean
+.PHONY: build test bench measure demo lint up down etcd clean
 
 build:
 	go build ./...
@@ -21,6 +21,13 @@ bench: etcd
 # and this runs them. Writes several GB and takes a few minutes.
 measure: etcd
 	go test ./test -run TestMeasure -measure -v -timeout 3600s
+
+# Six nodes on this host, an object, one of its owners killed with SIGKILL, and
+# redundancy coming back on its own — every step checked rather than narrated. Real
+# processes rather than containers, because a demo about fsync should not run on top
+# of a virtual machine that absorbs it (docs/benchmarks.md). Needs the aws CLI.
+demo: etcd
+	@./scripts/demo.sh
 
 etcd:
 	@docker compose -f deploy/compose.yaml up -d --wait etcd

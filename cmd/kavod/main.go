@@ -32,6 +32,7 @@ func main() {
 	advertise := flag.String("advertise", "", "host:port other nodes should dial (default: -addr)")
 	dataDir := flag.String("data", "./data", "directory for chunks")
 	chunkSize := flag.Int64("chunk-size", object.DefaultChunkSize, "chunk size in bytes")
+	quorum := flag.Int("w", cluster.DefaultWriteQuorum, "distinct nodes that must have fsynced a chunk before the write is acknowledged; a write that cannot reach this many is refused")
 	etcd := flag.String("etcd", meta.EndpointFromEnv(), "comma-separated etcd endpoints for manifests")
 	prefix := flag.String("cluster", "/kavo", "etcd key prefix identifying this cluster")
 	leaseTTL := flag.Duration("lease-ttl", meta.DefaultLeaseTTL, "how long this node may go unheard before the cluster declares it dead")
@@ -39,6 +40,8 @@ func main() {
 	repairInterval := flag.Duration("repair-interval", cluster.DefaultRepairInterval, "pause between repair passes")
 	rebalanceInterval := flag.Duration("rebalance-interval", cluster.DefaultRebalanceInterval, "pause between rebalance passes, which move objects onto the nodes that now own them")
 	scrubInterval := flag.Duration("scrub-interval", cluster.DefaultScrubInterval, "pause between scrub passes, which re-read this node's chunks to find rot")
+	collectInterval := flag.Duration("collect-interval", cluster.DefaultCollectInterval, "pause between collection passes, which reclaim chunks no manifest references")
+	collectGrace := flag.Duration("collect-grace", cluster.DefaultCollectGrace, "how long an unreferenced chunk is left alone before it is treated as garbage")
 	erasure := flag.String("ec", "", `erasure-code new objects as "data+parity" (for example 6+3) instead of replicating them`)
 	flag.Parse()
 
@@ -76,6 +79,9 @@ func main() {
 	if err := c.EncodeWith(scheme); err != nil {
 		log.Fatal(err)
 	}
+	if err := c.AcknowledgeAt(*quorum); err != nil {
+		log.Fatal(err)
+	}
 	if err := m.Join(ctx, *id, self, *leaseTTL); err != nil {
 		log.Fatalf("join cluster: %v", err)
 	}
@@ -111,6 +117,11 @@ func main() {
 	// anywhere else, so a node that leaves for good takes its copy's place with
 	// it. This is what moves the place.
 	go c.RebalanceLoop(ctx, *repairRate, *rebalanceInterval)
+
+	// An overwrite supersedes the chunks it replaces and a failed write leaves the
+	// ones it stored. Neither is reachable and neither frees itself, so without
+	// this a store's disk usage only ever goes up.
+	go c.CollectLoop(ctx, *collectGrace, *collectInterval)
 
 	redundancy := "replicated"
 	if scheme != (ec.Scheme{}) {

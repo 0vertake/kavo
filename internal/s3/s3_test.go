@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"crypto/md5"
 	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -319,6 +321,100 @@ func TestDeleteRemovesTheObjectAndIsIdempotent(t *testing.T) {
 	}
 }
 
+// A server-side copy is what `aws s3 mv` and `aws s3 cp` between two keys do, and
+// the SDK sends it as a PUT with a header naming the source. No byte of the object
+// crosses the network in either direction.
+func TestCopyingAnObjectServerSide(t *testing.T) {
+	client := newGateway(t)
+	body := randBytes(2 * testChunkSize)
+	put, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("source.bin"), Body: bytes.NewReader(body),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Across buckets as well as keys, since a bucket here is a prefix and a copy
+	// that only worked within one would be a surprise.
+	copied, err := client.CopyObject(t.Context(), &awss3.CopyObjectInput{
+		Bucket: aws.String("archive"), Key: aws.String("kept.bin"),
+		CopySource: aws.String("bucket/source.bin"),
+	})
+	if err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	if copied.CopyObjectResult == nil || aws.ToString(copied.CopyObjectResult.ETag) != aws.ToString(put.ETag) {
+		t.Errorf("the copy result carries etag %v, want the source's %v", copied.CopyObjectResult, aws.ToString(put.ETag))
+	}
+
+	out, err := client.GetObject(t.Context(), &awss3.GetObjectInput{
+		Bucket: aws.String("archive"), Key: aws.String("kept.bin"),
+	})
+	if err != nil {
+		t.Fatalf("get the copy: %v", err)
+	}
+	defer out.Body.Close()
+	got, err := io.ReadAll(out.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Errorf("the copy is %d bytes of something else, want the %d written", len(got), len(body))
+	}
+
+	// And the source is still there, which is the difference between a copy and a
+	// move: the client issues the delete itself, or not at all.
+	if _, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("source.bin"),
+	}); err != nil {
+		t.Errorf("the source is gone after being copied: %v", err)
+	}
+}
+
+// What a copy has to refuse. A source that does not exist is NoSuchKey, because a
+// client that mistyped a key must not be told the copy worked; a copy onto itself is
+// InvalidRequest, since the only thing it could mean is a metadata rewrite and there
+// is no metadata here to rewrite.
+func TestCopiesThatMustBeRefused(t *testing.T) {
+	client := newGateway(t)
+	if _, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("real.bin"),
+		Body: bytes.NewReader(randBytes(testChunkSize)),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name   string
+		source string
+		bucket string
+		key    string
+		want   string
+	}{
+		{name: "source does not exist", source: "bucket/imaginary.bin",
+			bucket: "bucket", key: "copy.bin", want: "NoSuchKey"},
+		{name: "onto itself", source: "bucket/real.bin",
+			bucket: "bucket", key: "real.bin", want: "InvalidRequest"},
+		{name: "source names no key", source: "bucket",
+			bucket: "bucket", key: "copy.bin", want: "InvalidArgument"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := client.CopyObject(t.Context(), &awss3.CopyObjectInput{
+				Bucket: aws.String(tt.bucket), Key: aws.String(tt.key),
+				CopySource: aws.String(tt.source),
+			})
+			var api smithy.APIError
+			if !errors.As(err, &api) {
+				t.Fatalf("copy = %v, want an S3 error code", err)
+			}
+			if api.ErrorCode() != tt.want {
+				t.Errorf("copy = %s, want %s", api.ErrorCode(), tt.want)
+			}
+		})
+	}
+}
+
 // A missing object must come back as NoSuchKey, not as a generic failure: the SDK
 // turns that code into a typed error applications branch on, and anything else
 // looks like an outage.
@@ -484,4 +580,729 @@ func md5sum(b []byte) []byte {
 	h := md5.New()
 	h.Write(b)
 	return h.Sum(nil)
+}
+
+// Conditional reads are how a client avoids paying for bytes it already has, and
+// `aws s3 sync` asks one of every file it considers. Answered from the committed
+// manifest, so the cost is an etcd read rather than the object.
+func TestConditionalReads(t *testing.T) {
+	client := newGateway(t)
+	data := randBytes(3 * testChunkSize)
+	put, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("conditional.bin"),
+		Body: bytes.NewReader(data),
+	})
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	tag := aws.ToString(put.ETag)
+
+	head, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("conditional.bin"),
+	})
+	if err != nil {
+		t.Fatalf("head: %v", err)
+	}
+	stored := aws.ToTime(head.LastModified)
+
+	tests := []struct {
+		name  string
+		in    awss3.GetObjectInput
+		want  int
+		bytes bool
+	}{
+		{name: "the tag the client holds is current", want: http.StatusNotModified,
+			in: awss3.GetObjectInput{IfNoneMatch: aws.String(tag)}},
+		{name: "the tag the client holds is stale", want: http.StatusOK, bytes: true,
+			in: awss3.GetObjectInput{IfNoneMatch: aws.String(`"0000"`)}},
+		{name: "the object is the one the client expects", want: http.StatusOK, bytes: true,
+			in: awss3.GetObjectInput{IfMatch: aws.String(tag)}},
+		{name: "the object is not the one the client expects", want: http.StatusPreconditionFailed,
+			in: awss3.GetObjectInput{IfMatch: aws.String(`"0000"`)}},
+		{name: "unchanged since the client last saw it", want: http.StatusNotModified,
+			in: awss3.GetObjectInput{IfModifiedSince: aws.Time(stored)}},
+		{name: "changed since the client last saw it", want: http.StatusOK, bytes: true,
+			in: awss3.GetObjectInput{IfModifiedSince: aws.Time(stored.Add(-time.Hour))}},
+		{name: "unmodified since a moment after it was stored", want: http.StatusOK, bytes: true,
+			in: awss3.GetObjectInput{IfUnmodifiedSince: aws.Time(stored.Add(time.Hour))}},
+		{name: "modified since the time the client demands", want: http.StatusPreconditionFailed,
+			in: awss3.GetObjectInput{IfUnmodifiedSince: aws.Time(stored.Add(-time.Hour))}},
+		// An entity tag is a better answer than a date, so it decides even when
+		// the date alone would have said otherwise. Both directions, because
+		// getting the precedence backwards passes one of them by luck.
+		{name: "a current tag outranks a date that says changed", want: http.StatusNotModified,
+			in: awss3.GetObjectInput{IfNoneMatch: aws.String(tag), IfModifiedSince: aws.Time(stored.Add(-time.Hour))}},
+		{name: "a matching tag outranks a date that says modified", want: http.StatusOK, bytes: true,
+			in: awss3.GetObjectInput{IfMatch: aws.String(tag), IfUnmodifiedSince: aws.Time(stored.Add(-time.Hour))}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := tt.in
+			in.Bucket, in.Key = aws.String("bucket"), aws.String("conditional.bin")
+			out, err := client.GetObject(t.Context(), &in)
+			if tt.want != http.StatusOK {
+				if got := httpStatus(err); got != tt.want {
+					t.Fatalf("get = %v (status %d), want status %d", err, got, tt.want)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			defer out.Body.Close()
+			got, err := io.ReadAll(out.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, data) {
+				t.Errorf("read %d bytes, want the %d written", len(got), len(data))
+			}
+		})
+	}
+}
+
+// A client that declares what it is sending is asking to be contradicted, and the
+// only useful answer is a refusal: an object stored under a digest it does not have
+// is corruption the client has been told is fine.
+//
+// The refusal has to be complete, which is the assertion below that matters. The
+// digest covers the whole body, so nothing can be compared until the last byte has
+// arrived and the chunks are already on disk — and if the manifest were committed
+// anyway, the client would be left deleting an object it was told had failed.
+func TestAWriteWhoseDigestDoesNotMatchIsRefusedEntirely(t *testing.T) {
+	client := newGateway(t)
+	data := randBytes(2 * testChunkSize)
+
+	_, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("misdeclared.bin"),
+		Body:       bytes.NewReader(data),
+		ContentMD5: aws.String(base64.StdEncoding.EncodeToString(md5sum(randBytes(16)))),
+	})
+	var api smithy.APIError
+	if !errors.As(err, &api) || api.ErrorCode() != "BadDigest" {
+		t.Fatalf("put = %v, want BadDigest", err)
+	}
+	if _, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("misdeclared.bin"),
+	}); httpStatus(err) != http.StatusNotFound {
+		t.Errorf("the refused write left an object behind: %v", err)
+	}
+
+	// And a digest that is not a digest is a different mistake: one the client
+	// should fix rather than retry.
+	_, err = client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("malformed.bin"),
+		Body:       bytes.NewReader(data),
+		ContentMD5: aws.String("not base64 at all"),
+	})
+	if !errors.As(err, &api) || api.ErrorCode() != "InvalidDigest" {
+		t.Fatalf("put with a malformed digest = %v, want InvalidDigest", err)
+	}
+}
+
+// The other half of the same promise: a client that declares the right digest is
+// not made to care that it did.
+func TestAWriteWhoseDigestMatchesIsStored(t *testing.T) {
+	client := newGateway(t)
+	data := randBytes(2 * testChunkSize)
+	if _, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("declared.bin"),
+		Body:       bytes.NewReader(data),
+		ContentMD5: aws.String(base64.StdEncoding.EncodeToString(md5sum(data))),
+	}); err != nil {
+		t.Fatalf("put with a matching digest: %v", err)
+	}
+	out, err := client.GetObject(t.Context(), &awss3.GetObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("declared.bin"),
+	})
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer out.Body.Close()
+	got, _ := io.ReadAll(out.Body)
+	if !bytes.Equal(got, data) {
+		t.Errorf("read %d bytes, want the %d written", len(got), len(data))
+	}
+}
+
+// A copy takes its conditions on the source, not on the destination, which keeps
+// them read-side: they are a question about the manifest being copied and need
+// nothing from the commit. `aws s3 sync` between two buckets sends them.
+//
+// The answer differs from a read's in one way, and it is the whole reason this is
+// tested separately: a copy has no "you already have it" outcome, so a condition
+// that does not hold is 412 even where the same condition on a GET would have been
+// answered 304.
+func TestConditionalCopies(t *testing.T) {
+	client := newGateway(t)
+	data := randBytes(2 * testChunkSize)
+	put, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("source.bin"),
+		Body: bytes.NewReader(data),
+	})
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	tag := aws.ToString(put.ETag)
+
+	tests := []struct {
+		name string
+		in   awss3.CopyObjectInput
+		want int
+	}{
+		{name: "the source is the one the client expects", want: http.StatusOK,
+			in: awss3.CopyObjectInput{CopySourceIfMatch: aws.String(tag)}},
+		{name: "the source is not the one the client expects", want: http.StatusPreconditionFailed,
+			in: awss3.CopyObjectInput{CopySourceIfMatch: aws.String(`"0000"`)}},
+		{name: "the client's copy of the source is stale", want: http.StatusOK,
+			in: awss3.CopyObjectInput{CopySourceIfNoneMatch: aws.String(`"0000"`)}},
+		{name: "the client already has this source", want: http.StatusPreconditionFailed,
+			in: awss3.CopyObjectInput{CopySourceIfNoneMatch: aws.String(tag)}},
+		{name: "the source is older than the client demands", want: http.StatusPreconditionFailed,
+			in: awss3.CopyObjectInput{CopySourceIfModifiedSince: aws.Time(time.Now().Add(time.Hour))}},
+		{name: "the source is older than the client requires", want: http.StatusOK,
+			in: awss3.CopyObjectInput{CopySourceIfUnmodifiedSince: aws.Time(time.Now().Add(time.Hour))}},
+	}
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := tt.in
+			in.Bucket, in.Key = aws.String("bucket"), aws.String(fmt.Sprintf("copy%d.bin", i))
+			in.CopySource = aws.String("bucket/source.bin")
+			_, err := client.CopyObject(t.Context(), &in)
+			if tt.want != http.StatusOK {
+				if got := httpStatus(err); got != tt.want {
+					t.Fatalf("copy = %v (status %d), want status %d", err, got, tt.want)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("copy: %v", err)
+			}
+			out, err := client.GetObject(t.Context(), &awss3.GetObjectInput{
+				Bucket: in.Bucket, Key: in.Key,
+			})
+			if err != nil {
+				t.Fatalf("get the copy: %v", err)
+			}
+			defer out.Body.Close()
+			got, _ := io.ReadAll(out.Body)
+			if !bytes.Equal(got, data) {
+				t.Errorf("the copy is %d bytes of something else, want the %d copied", len(got), len(data))
+			}
+		})
+	}
+}
+
+// An empty Content-MD5 is not a missing one: the client said it was declaring a
+// digest and then declared nothing. S3 calls that InvalidDigest, and treating it as
+// "no digest was sent" would store an object under a promise nobody made.
+func TestAnEmptyDeclaredDigestIsRefused(t *testing.T) {
+	client := newGateway(t)
+	_, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("empty-digest.bin"),
+		Body:       bytes.NewReader(randBytes(64)),
+		ContentMD5: aws.String(""),
+	})
+	var api smithy.APIError
+	if !errors.As(err, &api) || api.ErrorCode() != "InvalidDigest" {
+		t.Fatalf("put with an empty digest = %v, want InvalidDigest", err)
+	}
+}
+
+// Metadata is stored and replayed rather than interpreted. The x-amz-meta-* are the
+// client's own, and the five standard headers here describe the bytes rather than
+// the exchange that delivered them — which is what makes them the object's to keep.
+func TestMetadataIsStoredAndReplayed(t *testing.T) {
+	client := newGateway(t)
+	in := &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("described.bin"),
+		Body:               bytes.NewReader(randBytes(64)),
+		Metadata:           map[string]string{"colour": "octarine", "unicode": "Hello Wörld"},
+		CacheControl:       aws.String("max-age=31536000, immutable"),
+		ContentDisposition: aws.String(`attachment; filename="report.pdf"`),
+		ContentLanguage:    aws.String("en-GB"),
+		ContentType:        aws.String("application/pdf"),
+	}
+	if _, err := client.PutObject(t.Context(), in); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	// On the read and on the HEAD, because a client that asks only for the
+	// headers is the one that cares most about them.
+	out, err := client.GetObject(t.Context(), &awss3.GetObjectInput{
+		Bucket: in.Bucket, Key: in.Key,
+	})
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	out.Body.Close()
+	head, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: in.Bucket, Key: in.Key,
+	})
+	if err != nil {
+		t.Fatalf("head: %v", err)
+	}
+	for _, got := range []struct {
+		what               string
+		meta               map[string]string
+		cache, disposition *string
+		language, kind     *string
+	}{
+		{"get", out.Metadata, out.CacheControl, out.ContentDisposition, out.ContentLanguage, out.ContentType},
+		{"head", head.Metadata, head.CacheControl, head.ContentDisposition, head.ContentLanguage, head.ContentType},
+	} {
+		if got.meta["colour"] != "octarine" || got.meta["unicode"] != "Hello Wörld" {
+			t.Errorf("%s metadata = %v, want the two that were sent", got.what, got.meta)
+		}
+		if aws.ToString(got.cache) != aws.ToString(in.CacheControl) {
+			t.Errorf("%s cache-control = %q, want %q", got.what, aws.ToString(got.cache), aws.ToString(in.CacheControl))
+		}
+		if aws.ToString(got.disposition) != aws.ToString(in.ContentDisposition) {
+			t.Errorf("%s content-disposition = %q, want %q", got.what, aws.ToString(got.disposition), aws.ToString(in.ContentDisposition))
+		}
+		if aws.ToString(got.language) != "en-GB" || aws.ToString(got.kind) != "application/pdf" {
+			t.Errorf("%s content-language/type = %q/%q, want en-GB/application/pdf",
+				got.what, aws.ToString(got.language), aws.ToString(got.kind))
+		}
+	}
+}
+
+// aws-chunked describes the framing of the body that arrived, and kavo decoded it.
+// Storing it would tell every later reader that the object's bytes are chunk-framed,
+// which they are not — so it is dropped, and an encoding that was nothing else is
+// not stored at all.
+func TestAWSChunkedIsNotStoredAsTheObjectsEncoding(t *testing.T) {
+	client := newGateway(t)
+	tests := []struct{ sent, want string }{
+		{"gzip", "gzip"},
+		{"deflate, gzip", "deflate, gzip"},
+		{"gzip, aws-chunked", "gzip"},
+		{"aws-chunked, gzip", "gzip"},
+		{"aws-chunked", ""},
+		{"aws-chunked, aws-chunked", ""},
+	}
+	for i, tt := range tests {
+		key := fmt.Sprintf("encoded%d.bin", i)
+		_, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+			Bucket: aws.String("bucket"), Key: aws.String(key),
+			Body:            bytes.NewReader(randBytes(32)),
+			ContentEncoding: aws.String(tt.sent),
+		})
+		if err != nil {
+			t.Fatalf("put with %q: %v", tt.sent, err)
+		}
+		head, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+			Bucket: aws.String("bucket"), Key: aws.String(key),
+		})
+		if err != nil {
+			t.Fatalf("head: %v", err)
+		}
+		if got := aws.ToString(head.ContentEncoding); got != tt.want {
+			t.Errorf("stored %q as content-encoding %q, want %q", tt.sent, got, tt.want)
+		}
+	}
+}
+
+// A copy keeps the source's metadata unless the client says REPLACE, and REPLACE
+// with no metadata headers means the copy has none — the only way a client can strip
+// metadata from an object, since there is nothing else it could edit in place.
+func TestACopyKeepsOrReplacesMetadata(t *testing.T) {
+	client := newGateway(t)
+	source := &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("source.bin"),
+		Body:        bytes.NewReader(randBytes(64)),
+		Metadata:    map[string]string{"colour": "octarine"},
+		ContentType: aws.String("application/pdf"),
+	}
+	if _, err := client.PutObject(t.Context(), source); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	tests := []struct {
+		name     string
+		in       awss3.CopyObjectInput
+		want     map[string]string
+		wantKind string
+	}{
+		{name: "no directive keeps the source's", want: map[string]string{"colour": "octarine"},
+			wantKind: "application/pdf"},
+		{name: "COPY keeps the source's", want: map[string]string{"colour": "octarine"},
+			wantKind: "application/pdf",
+			in:       awss3.CopyObjectInput{MetadataDirective: "COPY"}},
+		{name: "REPLACE takes the request's", want: map[string]string{"colour": "chartreuse"},
+			wantKind: "text/plain",
+			in: awss3.CopyObjectInput{MetadataDirective: "REPLACE",
+				Metadata: map[string]string{"colour": "chartreuse"}, ContentType: aws.String("text/plain")}},
+		{name: "REPLACE with nothing strips it", want: map[string]string{},
+			in: awss3.CopyObjectInput{MetadataDirective: "REPLACE"}},
+	}
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := tt.in
+			in.Bucket, in.Key = aws.String("bucket"), aws.String(fmt.Sprintf("copy%d.bin", i))
+			in.CopySource = aws.String("bucket/source.bin")
+			if _, err := client.CopyObject(t.Context(), &in); err != nil {
+				t.Fatalf("copy: %v", err)
+			}
+			head, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+				Bucket: in.Bucket, Key: in.Key,
+			})
+			if err != nil {
+				t.Fatalf("head the copy: %v", err)
+			}
+			if len(head.Metadata) != len(tt.want) {
+				t.Fatalf("copy metadata = %v, want %v", head.Metadata, tt.want)
+			}
+			for k, v := range tt.want {
+				if head.Metadata[k] != v {
+					t.Errorf("copy metadata[%s] = %q, want %q", k, head.Metadata[k], v)
+				}
+			}
+			if got := aws.ToString(head.ContentType); got != tt.wantKind {
+				t.Errorf("copy content-type = %q, want %q", got, tt.wantKind)
+			}
+		})
+	}
+}
+
+// A copy onto itself is a metadata rewrite or it is nothing, so it is allowed
+// exactly when the request replaces the metadata.
+func TestACopyOntoItselfNeedsREPLACE(t *testing.T) {
+	client := newGateway(t)
+	if _, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("self.bin"),
+		Body:     bytes.NewReader(randBytes(64)),
+		Metadata: map[string]string{"colour": "octarine"},
+	}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	_, err := client.CopyObject(t.Context(), &awss3.CopyObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("self.bin"),
+		CopySource: aws.String("bucket/self.bin"),
+	})
+	if httpStatus(err) != http.StatusBadRequest {
+		t.Errorf("copy onto itself without a directive = %v, want 400", err)
+	}
+
+	if _, err := client.CopyObject(t.Context(), &awss3.CopyObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("self.bin"),
+		CopySource: aws.String("bucket/self.bin"), MetadataDirective: "REPLACE",
+		Metadata: map[string]string{"colour": "chartreuse"},
+	}); err != nil {
+		t.Fatalf("copy onto itself with REPLACE: %v", err)
+	}
+	head, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("self.bin"),
+	})
+	if err != nil {
+		t.Fatalf("head: %v", err)
+	}
+	if head.Metadata["colour"] != "chartreuse" {
+		t.Errorf("metadata after rewriting it = %v, want chartreuse", head.Metadata)
+	}
+}
+
+// Unbounded metadata is unbounded manifests, and a manifest is read by every
+// request for the object and by every background pass over it.
+func TestMetadataBeyondTheLimitIsRefused(t *testing.T) {
+	client := newGateway(t)
+	_, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("verbose.bin"),
+		Body:     bytes.NewReader(randBytes(32)),
+		Metadata: map[string]string{"essay": strings.Repeat("a", s3.MaxMeta+1)},
+	})
+	var api smithy.APIError
+	if !errors.As(err, &api) || api.ErrorCode() != "MetadataTooLarge" {
+		t.Fatalf("put with %d bytes of metadata = %v, want MetadataTooLarge", s3.MaxMeta+1, err)
+	}
+}
+
+// A multipart object takes its metadata from the call that began the upload: there
+// is nowhere else for a client to put it, since the parts carry bytes and the
+// completion carries only their etags.
+func TestAMultipartUploadCarriesTheMetadataItBeganWith(t *testing.T) {
+	client := newGateway(t)
+	create, err := client.CreateMultipartUpload(t.Context(), &awss3.CreateMultipartUploadInput{
+		Bucket: aws.String("bucket"), Key: aws.String("assembled.bin"),
+		Metadata:     map[string]string{"colour": "octarine"},
+		ContentType:  aws.String("application/pdf"),
+		CacheControl: aws.String("no-store"),
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	part, err := client.UploadPart(t.Context(), &awss3.UploadPartInput{
+		Bucket: aws.String("bucket"), Key: aws.String("assembled.bin"),
+		UploadId: create.UploadId, PartNumber: aws.Int32(1),
+		Body: bytes.NewReader(randBytes(testChunkSize)),
+	})
+	if err != nil {
+		t.Fatalf("upload part: %v", err)
+	}
+	if _, err := client.CompleteMultipartUpload(t.Context(), &awss3.CompleteMultipartUploadInput{
+		Bucket: aws.String("bucket"), Key: aws.String("assembled.bin"),
+		UploadId: create.UploadId,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: []types.CompletedPart{
+			{ETag: part.ETag, PartNumber: aws.Int32(1)},
+		}},
+	}); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	head, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("assembled.bin"),
+	})
+	if err != nil {
+		t.Fatalf("head: %v", err)
+	}
+	if head.Metadata["colour"] != "octarine" || aws.ToString(head.CacheControl) != "no-store" ||
+		aws.ToString(head.ContentType) != "application/pdf" {
+		t.Errorf("the assembled object carries %v, %q, %q; want octarine, no-store, application/pdf",
+			head.Metadata, aws.ToString(head.CacheControl), aws.ToString(head.ContentType))
+	}
+}
+
+// A request for encryption is refused, not ignored. Ignoring it meant a client that
+// sent a customer key was told its object was stored — which it was, in plaintext,
+// readable by anyone who asked without the key. The client cannot detect that, which
+// is what makes silence the worst answer available.
+func TestARequestForEncryptionIsRefused(t *testing.T) {
+	client := newGateway(t)
+	if _, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("plain.bin"),
+		Body: bytes.NewReader(randBytes(64)),
+	}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		in   awss3.PutObjectInput
+	}{
+		{name: "SSE-S3", in: awss3.PutObjectInput{ServerSideEncryption: types.ServerSideEncryptionAes256}},
+		{name: "SSE-KMS", in: awss3.PutObjectInput{
+			ServerSideEncryption: types.ServerSideEncryptionAwsKms,
+			SSEKMSKeyId:          aws.String("kavo-key"),
+		}},
+		{name: "a customer key", in: awss3.PutObjectInput{
+			SSECustomerAlgorithm: aws.String("AES256"),
+			SSECustomerKey:       aws.String("pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs="),
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := tt.in
+			in.Bucket, in.Key = aws.String("bucket"), aws.String("encrypted.bin")
+			in.Body = bytes.NewReader(randBytes(64))
+			_, err := client.PutObject(t.Context(), &in)
+			var api smithy.APIError
+			if !errors.As(err, &api) || api.ErrorCode() != "NotImplemented" {
+				t.Fatalf("put asking for encryption = %v, want NotImplemented", err)
+			}
+		})
+	}
+
+	// And on the read, where ignoring the key means answering a request to decrypt
+	// with plaintext the client never agreed to have stored.
+	_, err := client.GetObject(t.Context(), &awss3.GetObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("plain.bin"),
+		SSECustomerAlgorithm: aws.String("AES256"),
+		SSECustomerKey:       aws.String("pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs="),
+	})
+	var api smithy.APIError
+	if !errors.As(err, &api) || api.ErrorCode() != "NotImplemented" {
+		t.Fatalf("get with a customer key = %v, want NotImplemented", err)
+	}
+}
+
+// S3 addresses an object's subresources as a query on the object's own path, so a
+// server that ignores the query answers them with the object operation instead.
+// That is how this store came to destroy objects: `put-object-tagging` reached the
+// object PUT and replaced the object with the tagging XML, `put-object-acl`
+// truncated it to nothing because its request carries no body, and
+// `delete-object-tagging` deleted it — each answered 200, so a client tagging an
+// object destroyed it and was told the tag was set.
+//
+// The assertion that matters is the last one in each case: not that the call is
+// refused, but that the object is still there afterwards.
+func TestAnObjectSubresourceCannotTouchTheObject(t *testing.T) {
+	client := newGateway(t)
+	data := randBytes(2 * testChunkSize)
+	intact := func(t *testing.T, what string) {
+		t.Helper()
+		out, err := client.GetObject(t.Context(), &awss3.GetObjectInput{
+			Bucket: aws.String("bucket"), Key: aws.String("described.bin"),
+		})
+		if err != nil {
+			t.Fatalf("the object is gone after %s: %v", what, err)
+		}
+		defer out.Body.Close()
+		got, _ := io.ReadAll(out.Body)
+		if !bytes.Equal(got, data) {
+			t.Fatalf("after %s the object is %d bytes of something else, want the %d written",
+				what, len(got), len(data))
+		}
+	}
+
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{"put-object-tagging", func() error {
+			_, err := client.PutObjectTagging(t.Context(), &awss3.PutObjectTaggingInput{
+				Bucket: aws.String("bucket"), Key: aws.String("described.bin"),
+				Tagging: &types.Tagging{TagSet: []types.Tag{
+					{Key: aws.String("colour"), Value: aws.String("octarine")},
+				}},
+			})
+			return err
+		}},
+		{"delete-object-tagging", func() error {
+			_, err := client.DeleteObjectTagging(t.Context(), &awss3.DeleteObjectTaggingInput{
+				Bucket: aws.String("bucket"), Key: aws.String("described.bin"),
+			})
+			return err
+		}},
+		{"put-object-acl", func() error {
+			_, err := client.PutObjectAcl(t.Context(), &awss3.PutObjectAclInput{
+				Bucket: aws.String("bucket"), Key: aws.String("described.bin"),
+				ACL: types.ObjectCannedACLPrivate,
+			})
+			return err
+		}},
+		{"put-object-legal-hold", func() error {
+			_, err := client.PutObjectLegalHold(t.Context(), &awss3.PutObjectLegalHoldInput{
+				Bucket: aws.String("bucket"), Key: aws.String("described.bin"),
+				LegalHold: &types.ObjectLockLegalHold{Status: types.ObjectLockLegalHoldStatusOn},
+			})
+			return err
+		}},
+		{"put-object-retention", func() error {
+			_, err := client.PutObjectRetention(t.Context(), &awss3.PutObjectRetentionInput{
+				Bucket: aws.String("bucket"), Key: aws.String("described.bin"),
+				Retention: &types.ObjectLockRetention{
+					Mode:            types.ObjectLockRetentionModeGovernance,
+					RetainUntilDate: aws.Time(time.Now().Add(time.Hour)),
+				},
+			})
+			return err
+		}},
+		{"get-object-attributes", func() error {
+			_, err := client.GetObjectAttributes(t.Context(), &awss3.GetObjectAttributesInput{
+				Bucket: aws.String("bucket"), Key: aws.String("described.bin"),
+				ObjectAttributes: []types.ObjectAttributes{types.ObjectAttributesEtag},
+			})
+			return err
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Rewritten for each, so that one call destroying the object cannot
+			// be hidden by an earlier one having already replaced it.
+			if _, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+				Bucket: aws.String("bucket"), Key: aws.String("described.bin"),
+				Body: bytes.NewReader(data),
+			}); err != nil {
+				t.Fatalf("put: %v", err)
+			}
+			var api smithy.APIError
+			if err := tt.call(); !errors.As(err, &api) || api.ErrorCode() != "NotImplemented" {
+				t.Errorf("%s = %v, want NotImplemented", tt.name, err)
+			}
+			intact(t, tt.name)
+		})
+	}
+}
+
+// A version id kavo never issued names something that does not exist. Answering it
+// with the current object means a client asking to delete one old version deletes
+// the live one instead — the same mistake as the subresources above, arriving
+// through a query whose value is the part that matters. "null" is the exception,
+// because that is the id ListObjectVersions reports for every object, and it is how
+// a client empties a bucket.
+func TestAVersionIdThatWasNeverIssuedIsRefused(t *testing.T) {
+	client := newGateway(t)
+	data := randBytes(64)
+	if _, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("versioned.bin"),
+		Body: bytes.NewReader(data),
+	}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	_, err := client.DeleteObject(t.Context(), &awss3.DeleteObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("versioned.bin"),
+		VersionId: aws.String("deadbeef"),
+	})
+	var api smithy.APIError
+	if !errors.As(err, &api) || api.ErrorCode() != "NotImplemented" {
+		t.Fatalf("delete of an invented version = %v, want NotImplemented", err)
+	}
+	if _, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("versioned.bin"),
+	}); err != nil {
+		t.Fatalf("the object is gone after a delete of a version that never existed: %v", err)
+	}
+}
+
+// Reading an object's tags is answered with none, and asking for tags to exist is
+// refused. Both halves are needed for either to be honest: a store that dropped
+// x-amz-tagging on a PUT and then reported the object had no tags would have told a
+// client its tags were gone by way of two successes.
+//
+// The read exists because the aws CLI reads the source's tags before copying
+// anything above 8 MB, so refusing it fails every large server-side copy on a call
+// about a feature neither side wants.
+func TestTagsAreReportedAsNoneAndRefusedWhenSet(t *testing.T) {
+	client := newGateway(t)
+	data := randBytes(128)
+	if _, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("tagged.bin"),
+		Body: bytes.NewReader(data),
+	}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	out, err := client.GetObjectTagging(t.Context(), &awss3.GetObjectTaggingInput{
+		Bucket: aws.String("bucket"), Key: aws.String("tagged.bin"),
+	})
+	if err != nil {
+		t.Fatalf("get tags: %v", err)
+	}
+	if len(out.TagSet) != 0 {
+		t.Errorf("an object with no tags reports %d of them", len(out.TagSet))
+	}
+
+	// Not an answer about objects that do not exist.
+	_, err = client.GetObjectTagging(t.Context(), &awss3.GetObjectTaggingInput{
+		Bucket: aws.String("bucket"), Key: aws.String("absent.bin"),
+	})
+	var api smithy.APIError
+	if !errors.As(err, &api) || api.ErrorCode() != "NoSuchKey" {
+		t.Errorf("tags of a missing object = %v, want NoSuchKey", err)
+	}
+
+	// And a request that asks for tags to exist is refused rather than dropped,
+	// which is what makes the answer above true.
+	_, err = client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("with-tags.bin"),
+		Body: bytes.NewReader(data), Tagging: aws.String("colour=octarine"),
+	})
+	if !errors.As(err, &api) || api.ErrorCode() != "NotImplemented" {
+		t.Errorf("put with tags = %v, want NotImplemented", err)
+	}
+	if _, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("with-tags.bin"),
+	}); err == nil {
+		t.Error("the refused write stored the object anyway, tags silently dropped")
+	}
+	// A multipart upload asks for tags on the call that creates it.
+	_, err = client.CreateMultipartUpload(t.Context(), &awss3.CreateMultipartUploadInput{
+		Bucket: aws.String("bucket"), Key: aws.String("with-tags.bin"),
+		Tagging: aws.String("colour=octarine"),
+	})
+	if !errors.As(err, &api) || api.ErrorCode() != "NotImplemented" {
+		t.Errorf("create upload with tags = %v, want NotImplemented", err)
+	}
 }

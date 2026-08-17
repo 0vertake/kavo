@@ -75,9 +75,11 @@ func (s *Store) Close() error { return s.client.Close() }
 // A single etcd Put is enough. It is atomic and serialized, so a concurrent
 // overwrite of the same key yields one manifest or the other and never a mix.
 //
-// ponytail: no compare-and-swap yet. It is needed to reclaim the chunks of a
-// manifest this one replaces, since that requires knowing which revision was
-// superseded; add it with garbage collection.
+// It stayed a plain Put once garbage collection existed. Reclaiming the chunks an
+// overwrite superseded looked like it needed the revision this commit replaced, and
+// it does if the reclaiming is done from a record of what each write superseded.
+// Collection is mark-and-sweep instead, which needs nothing from here — and which
+// is what allows two keys to name the same chunks.
 func (s *Store) Commit(ctx context.Context, key string, m object.Manifest) error {
 	data, err := json.Marshal(m)
 	if err != nil {

@@ -18,7 +18,10 @@ import sys
 RULES = [
     ("SigV2 signing", r"aws2$"),
     ("browser POST form uploads", r"^test_post_"),
-    ("server-side encryption (SSE-C, SSE-KMS)", r"sse_|_encryption|enc_|kms"),
+    # enc\[ catches the parametrised copy_enc/copy_part_enc ids, which are SSE tests
+    # wearing a copy's name: they pass a customer key or ask for SSE-S3, so no amount
+    # of copy support reaches them.
+    ("server-side encryption (SSE-C, SSE-KMS)", r"sse_|_encryption|encrypted|enc_|enc\[|kms"),
     ("ACLs, grants, and the public/private access matrix", r"acl|grant|^test_access_|anon"),
     ("object lock, retention, legal hold, governance", r"object_lock|legal_hold|retention|governance"),
     ("versioning (version ids, delete markers, suspend)", r"version"),
@@ -26,7 +29,16 @@ RULES = [
     ("lifecycle and expiration", r"lifecycle|expiration"),
     ("bucket and request logging", r"logging"),
     ("CopyObject and multipart copy", r"copy"),
-    ("conditional requests (If-Match, If-None-Match, If-Modified-Since)", r"ifmatch|ifnonematch|ifnonmatch|ifmodifiedsince|ifunmodifiedsince|if_match|if_none_match|conditional"),
+    # Split on the operation rather than on the header, because the two families have
+    # opposite verdicts — conditional reads are implemented, conditional writes are an
+    # explicit exclusion — and the suite spells the header both ways in each. A single
+    # row covering both would report an excluded feature and a regression identically.
+    ("conditional writes and deletes (If-Match on PUT, DELETE)",
+     # ifnonmatch, without the middle e, is how the suite spells it on the PUT tests
+     # and only there.
+     r"(put|delete|atomic).*(if_match|ifmatch|if_none_match|ifnone?match|conditional)"),
+    ("conditional reads (If-Match, If-None-Match, If-Modified-Since)",
+     r"ifmatch|ifnonematch|ifnonmatch|ifmodifiedsince|ifunmodifiedsince|if_match|if_none_match|conditional"),
     ("ListObjects v1 and its paging parameters", r"list(?!v2)|_list_|delimiter|prefix|marker|maxkeys"),
     ("bulk delete (DeleteObjects)", r"multi_object_delete|delete_objects"),
     ("anonymous and raw unsigned access", r"object_raw|unreadable"),

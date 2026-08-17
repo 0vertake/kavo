@@ -271,8 +271,8 @@ func TestWriteSurvivesOneOwnerDown(t *testing.T) {
 				live++
 			}
 		}
-		if live != cluster.WriteQuorum {
-			t.Errorf("chunk %s is on %d live owners, want %d", ref.ID, live, cluster.WriteQuorum)
+		if live != cluster.DefaultWriteQuorum {
+			t.Errorf("chunk %s is on %d live owners, want %d", ref.ID, live, cluster.DefaultWriteQuorum)
 		}
 		if down.has(ref) {
 			t.Errorf("chunk %s reached the node that was down", ref.ID)
@@ -433,4 +433,32 @@ func sortedIDs(nodes []*node) []string {
 	}
 	slices.Sort(ids)
 	return ids
+}
+
+// The chaos suite found this one, and it cost an acknowledged object: with three of
+// four nodes frozen, the survivor's view of the cluster collapsed to itself, it
+// placed a write on its own disk alone, acknowledged it, and the disk wipe that
+// arrived next destroyed it. Repair had nothing to rebuild from and the read
+// returned unexpected EOF — invariant 1, broken by a write that was never redundant
+// in the first place. Replay with -chaos.seed=1786500476032706000.
+//
+// A narrow ring is not a smaller cluster, it is a node that cannot see the cluster,
+// and the two are indistinguishable from inside. So the write is refused: W copies
+// on distinct nodes is what acknowledgement means, and a node that cannot reach W
+// nodes has nothing to acknowledge.
+func TestAWriteThatCannotReachWNodesIsRefused(t *testing.T) {
+	tc := newCluster(t, 3)
+	n := tc.nodes["n1"]
+
+	// Nil rather than a peer or two: SetMembers always keeps self, so this is the
+	// narrowest view a node can hold and the one the freeze storm produced.
+	n.c.SetMembers(nil)
+
+	_, err := n.c.Put(context.Background(), "narrow.bin", bytes.NewReader(randBytes(64)), cluster.PutOptions{})
+	if !errors.Is(err, cluster.ErrQuorum) {
+		t.Fatalf("a write with only one node in view: %v, want ErrQuorum", err)
+	}
+	if _, err := n.c.Resolve(context.Background(), "narrow.bin"); !errors.Is(err, meta.ErrNotFound) {
+		t.Errorf("the refused write left an object behind: %v", err)
+	}
 }

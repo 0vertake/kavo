@@ -19,7 +19,9 @@ package test
 //
 // The workload speaks S3 with a real signature, because that is the surface a user
 // has, and because multipart upload only exists there: an upload spanning a crash
-// is a case no single-request test reaches.
+// is a case no single-request test reaches. It also copies objects server-side and
+// deletes some of the sources, which is how two keys come to name one set of chunks
+// while a sweep, a repair and a rebalance are all running under faults.
 
 import (
 	"bytes"
@@ -29,6 +31,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,7 +43,9 @@ import (
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
+	"github.com/0vertake/kavo/internal/cluster"
 	"github.com/0vertake/kavo/internal/meta"
+	"github.com/0vertake/kavo/internal/object"
 )
 
 var (
@@ -48,6 +53,8 @@ var (
 		"how long the chaos workload runs before the invariants are checked")
 	chaosSeed = flag.Int64("chaos.seed", 0,
 		"seed for the fault schedule and workload; 0 picks one and logs it so a failure can be replayed")
+	chaosEC = flag.String("chaos.ec", "",
+		`store the workload's objects erasure-coded as "data+parity" (for example 4+2) instead of replicated`)
 )
 
 const (
@@ -65,6 +72,13 @@ type write struct {
 	size      int
 	fill      byte
 	multipart bool
+	// viaCopy records that this object was made by copying another rather than by
+	// uploading, which the checker does not care about and the run's log does.
+	// viaPartCopy narrows that to a copy assembled out of ranges of the source with
+	// UploadPartCopy, which is a write path of its own: the bytes are read from the
+	// source's owners while faults arrive and written to the destination's, so a
+	// source that stops reading mid-part must leave no part rather than a short one.
+	viaCopy, viaPartCopy bool
 	// acked is the promise. Only a 2xx sets it, and only after the whole request
 	// finished — a request whose outcome is unknown stays false, and an object
 	// that was never promised is allowed to be absent.
@@ -94,7 +108,20 @@ func TestChaos(t *testing.T) {
 	if seed == 0 {
 		seed = time.Now().UnixNano()
 	}
-	t.Logf("chaos seed %d, duration %v (replay with -chaos.seed=%d)", seed, *chaosDuration, seed)
+	redundancy := fmt.Sprintf("%d replicas", cluster.Replicas)
+	if *chaosEC != "" {
+		redundancy = "erasure coded " + *chaosEC
+	}
+	t.Logf("chaos seed %d, duration %v, %s (replay with -chaos.seed=%d -chaos.ec=%q)",
+		seed, *chaosDuration, redundancy, seed, *chaosEC)
+
+	// Collection reclaims on a cycle, and at the shipped interval a whole run would
+	// finish inside one grace period — the sweep would never delete anything and the
+	// copies below would prove nothing. Ten seconds is still seven times the longest
+	// stall a fault here imposes (a freeze lasts at most 1.4s), which is the property
+	// grace exists for: no chunk is swept while the write that made it is still in
+	// flight. Whether the sweep really ran is checked below rather than assumed.
+	defer withCollect("1s", "10s")()
 
 	bin := buildKavod(t)
 	prefix := clusterPrefix()
@@ -103,7 +130,23 @@ func TestChaos(t *testing.T) {
 	// progress. Faults are applied to one node at a time for the same reason:
 	// refusing writes when quorum is genuinely unreachable is correct but proves
 	// nothing that TestWritesAreRefusedUntilMembershipCatchesUp does not.
-	nodes := startCluster(t, bin, prefix, chaosChunkSize, clusterSize)
+	// Replicated by default, because that is what a default deployment stores.
+	// -chaos.ec puts the same workload and the same four invariants against the
+	// other mode, and they are not the same failure modes: a chunk becomes k+m
+	// shards at fixed positions rather than N interchangeable copies, a write is
+	// acknowledged at k+1 shards rather than W of them, and a shard that is lost is
+	// rebuilt from arithmetic over its siblings rather than copied from a peer.
+	// Every durability bug this suite has found lived in a seam of exactly that
+	// shape, and until now it had only ever looked at one of the two.
+	size := clusterSize
+	if *chaosEC != "" {
+		// One node beyond what an object needs, for the reason replication runs
+		// with one beyond N: a single node down still leaves enough of the object
+		// to acknowledge a write, so the run measures a store under faults rather
+		// than a store refusing writes.
+		size = shardsIn(t, *chaosEC) + 1
+	}
+	nodes := startClusterCoded(t, bin, prefix, chaosChunkSize, size, *chaosEC)
 	clients := make([]*awss3.Client, len(nodes))
 	for i, n := range nodes {
 		clients[i] = s3Client(n.s3Addr)
@@ -208,6 +251,32 @@ func TestChaos(t *testing.T) {
 						t.Errorf("%s: %v", w.key, err)
 					}
 				}
+				// A fraction are copied server-side. This is the operation that
+				// makes two keys name one set of chunks, so it is the operation
+				// that decides whether anything may delete a chunk on the strength
+				// of a single manifest — and the source is a candidate for the
+				// delete below, which is the pairing that has to survive. The copy
+				// carries its source's size and fill, so the checker verifies its
+				// bytes with no extra machinery.
+				if entry.acked && rng.IntN(4) == 0 {
+					copied := entry
+					copied.key = fmt.Sprintf("w%d/copy%04d", w, i)
+					copied.viaCopy = true
+					// Half of them are assembled out of ranges of the source
+					// instead, which is what a client does above 8 MB and what
+					// the aws CLI does for every large copy. It needs two bytes
+					// to have two ranges, so the smallest objects stay whole
+					// copies.
+					copied.viaPartCopy = copied.size >= 8 && rng.IntN(2) == 0
+					copied.acked = chaosCopy(ctx, clients[rng.IntN(len(clients))], entry.key, copied)
+					if copied.acked {
+						mine = append(mine, copied)
+					}
+					mu.Lock()
+					history = append(history, copied)
+					mu.Unlock()
+				}
+
 				// A fraction are deleted again, so the history also covers keys
 				// that must be gone at the end rather than present.
 				if entry.acked && rng.IntN(5) == 0 {
@@ -227,7 +296,7 @@ func TestChaos(t *testing.T) {
 	stop()
 	faultsWG.Wait()
 
-	acked, deleted := 0, 0
+	acked, deleted, copies, partCopies := 0, 0, 0, 0
 	for _, w := range history {
 		if w.acked {
 			acked++
@@ -235,14 +304,61 @@ func TestChaos(t *testing.T) {
 		if w.deleted {
 			deleted++
 		}
+		if w.viaCopy {
+			copies++
+		}
+		if w.viaPartCopy && w.acked {
+			partCopies++
+		}
 	}
-	t.Logf("history: %d writes, %d acknowledged, %d deleted again, %d reads during faults; %d faults injected:\n  %s",
-		len(history), acked, deleted, reads.Load(), len(faults), strings.Join(faults, "\n  "))
+	t.Logf("history: %d writes, %d acknowledged, %d of them server-side copies (%d assembled from ranges of the source), %d deleted again, %d reads during faults; %d faults injected:\n  %s",
+		len(history), acked, copies, partCopies, deleted, reads.Load(), len(faults), strings.Join(faults, "\n  "))
+
+	// A copy assembled out of ranges is the newest write path here, and the only
+	// one whose bytes are read out of the store while they are written back into
+	// it. A run that acknowledged none of them proves nothing about it, and saying
+	// so is cheaper than believing a green run that never took the path.
+	if partCopies == 0 && *chaosDuration > time.Minute {
+		t.Errorf("no copy assembled from ranges was acknowledged in %v, so UploadPartCopy went untested",
+			*chaosDuration)
+	}
+
+	// A copy sharing its source's chunks only matters if something was trying to
+	// delete chunks at the time, and the only thing that deletes one is the sweep. So
+	// count what it took: nothing reclaimed means this run exercised the copies
+	// against an idle collector and the assertions below are weaker than they read.
+	// Only a run long enough to have swept is held to it — the default is 20s, which
+	// is two grace periods, and CI runs five minutes.
+	sweeps := 0
+	for _, n := range nodes {
+		sweeps += strings.Count(n.logs.String(), "collect: reclaimed")
+	}
+	t.Logf("the collector reclaimed on %d occasions during the run", sweeps)
+	if *chaosDuration >= time.Minute && sweeps == 0 {
+		t.Errorf("nothing was reclaimed in %v, so no copy here was tested against a sweep", *chaosDuration)
+	}
 	if acked == 0 {
 		t.Fatal("nothing was ever acknowledged: the workload never worked, so the invariants are vacuous")
 	}
 	if len(faults) < 3 {
 		t.Fatalf("only %d faults were injected; the run is too short to have tested anything", len(faults))
+	}
+	// The run stored what it was asked to store. A mistyped flag, or a daemon that
+	// ignored it, would otherwise give a green erasure-coding job that replicated
+	// everything — a whole CI job asserting nothing about the mode it names.
+	// Outliving ctx, which expired with the workload — like the heal barrier below.
+	stored, err := store.ScanObjects(context.WithoutCancel(ctx), "", "", 0)
+	if err != nil {
+		t.Fatalf("scan manifests: %v", err)
+	}
+	coded := 0
+	for _, o := range stored {
+		if o.Manifest.Coding.Valid() {
+			coded++
+		}
+	}
+	if want := *chaosEC != ""; want != (coded > 0) {
+		t.Fatalf("%d of %d objects are erasure coded, with -chaos.ec=%q", coded, len(stored), *chaosEC)
 	}
 
 	// Faults stop here. Every node comes back, because invariant 4 is about the
@@ -336,6 +452,27 @@ const restartSettle = 45 * time.Second
 // is where a speed claim belongs; this barrier is about completeness.
 const healStall = 30 * time.Second
 
+// surveyPerCopy is what it costs repair to ask one question — does the node this
+// manifest names still hold this copy — measured at 163–256 µs in
+// `BenchmarkRepairSurvey`, rounded up.
+//
+// It is here because a repair pass walks every object in key order before it comes
+// back to any of them (`walk` in internal/cluster/repair.go), so repair cannot look
+// at a particular missing copy sooner than one full pass away. Below that, "no copy
+// was restored recently" measures where the cursor happens to be rather than whether
+// repair works, and healStall alone was reading the first as the second: a 60-minute
+// run reached 57,440 objects, which is a quarter of a million copies to survey and
+// ~50 s of pass at this rate, and tripped a 30 s window while repair was mid-walk
+// with six copies left (`-chaos.seed=1786654359933316000`, and the barrier at the end
+// of that same run — after the workload stopped — found the cluster whole).
+//
+// So the allowance is a constant plus a pass, and it is a scale correction rather
+// than a weakening: the run still fails if nothing is ever restored, the end-of-run
+// barrier is unchanged and strict, and at the five minutes CI runs this adds about
+// six seconds to thirty. The cost it is derived from is real, and
+// docs/benchmarks.md now says so under repair.
+const surveyPerCopy = 300 * time.Microsecond
+
 // waitWhole polls until the cluster is whole — every node a member, and every
 // chunk of every manifest present on every owner that manifest names — and returns
 // the copies still missing if repair stops making progress. Empty means whole.
@@ -352,7 +489,12 @@ func waitWhole(ctx context.Context, nodes []*node, store *meta.Store, stall time
 	fewest, since := -1, time.Now()
 	unsettled := time.Time{}
 	for {
-		holes, settled := missingCopies(ctx, byID, store, len(nodes))
+		holes, copies, settled := missingCopies(ctx, byID, store, len(nodes))
+		// A pass has to get through every copy in the cluster before it reaches
+		// this one again, so the window grows with what there is to walk. The
+		// barrier counts the same copies repair does, which is why it can say how
+		// long a pass is rather than guess.
+		allowed := stall + time.Duration(copies)*surveyPerCopy
 		switch {
 		case len(holes) == 0:
 			return holes
@@ -369,7 +511,7 @@ func waitWhole(ctx context.Context, nodes []*node, store *meta.Store, stall time
 			fewest, since = -1, time.Now()
 		case fewest < 0 || len(holes) < fewest:
 			fewest, since, unsettled = len(holes), time.Now(), time.Time{}
-		case time.Since(since) > stall:
+		case time.Since(since) > allowed:
 			return holes
 		default:
 			unsettled = time.Time{}
@@ -378,29 +520,67 @@ func waitWhole(ctx context.Context, nodes []*node, store *meta.Store, stall time
 	}
 }
 
+// shardsIn is how many nodes an object needs under a "data+parity" code. Parsed
+// here rather than shared with the daemon, because the daemon's parser is the thing
+// under test: a flag this suite accepted and kavod rejected would be a run that
+// never started, which is a failure either way.
+func shardsIn(t *testing.T, code string) int {
+	t.Helper()
+	data, parity, ok := strings.Cut(code, "+")
+	d, dErr := strconv.Atoi(data)
+	p, pErr := strconv.Atoi(parity)
+	if !ok || dErr != nil || pErr != nil || d < 1 || p < 1 {
+		t.Fatalf("-chaos.ec=%q is not in data+parity form, for example 4+2", code)
+	}
+	return d + p
+}
+
+// wantOwners is how many nodes an object's chunks belong on: its own code's width,
+// or N for a replicated one, and never more nodes than the cluster has.
+func wantOwners(m object.Manifest, nodes int) int {
+	if m.Coding.Valid() {
+		return m.Coding.Shards()
+	}
+	return min(cluster.Replicas, nodes)
+}
+
 // missingCopies reports the copies a manifest names that are not on the node it
 // names, and whether the cluster was settled enough for that to mean anything.
-func missingCopies(ctx context.Context, byID map[string]*node, store *meta.Store, want int) (holes []string, settled bool) {
+func missingCopies(ctx context.Context, byID map[string]*node, store *meta.Store, want int) (holes []string, copies int, settled bool) {
 	// Membership first: a node that is not a member owns nothing, so placement is
 	// still moving and every answer below would be about a layout in flux.
 	for id, n := range byID {
 		members, err := n.members()
 		if err != nil {
-			return []string{fmt.Sprintf("%s is not answering: %v", id, err)}, false
+			return []string{fmt.Sprintf("%s is not answering: %v", id, err)}, 0, false
 		}
 		if len(members) != want {
-			return []string{fmt.Sprintf("%s sees %d members, want %d", id, len(members), want)}, false
+			return []string{fmt.Sprintf("%s sees %d members, want %d", id, len(members), want)}, 0, false
 		}
 	}
 
 	objects, err := store.ScanObjects(ctx, "", "", 0)
 	if err != nil {
-		return []string{fmt.Sprintf("scan manifests: %v", err)}, false
+		return []string{fmt.Sprintf("scan manifests: %v", err)}, 0, false
 	}
 
 	for _, o := range objects {
+		// Invariant 4 is about the configured level of redundancy, and a manifest
+		// is where an object's redundancy is promised. A write acknowledged while
+		// some of the cluster was unreachable promises fewer copies than the
+		// configuration asks for — correctly, at the time — and the rebalance pass
+		// is the only thing that widens it afterwards. Checking only that the
+		// promised copies exist calls two of two whole, which is how an object
+		// spent its whole life a copy short of its configuration with every check
+		// in this suite satisfied.
+		if want := wantOwners(o.Manifest, len(byID)); len(o.Manifest.Nodes) < want {
+			holes = append(holes, fmt.Sprintf("%s: placed on %s, want %d owners",
+				o.Key, strings.Join(o.Manifest.Nodes, ","), want))
+			continue
+		}
 		for _, ref := range o.Manifest.Chunks {
 			for i, id := range o.Manifest.Nodes {
+				copies++
 				owner, ok := byID[id]
 				if !ok {
 					holes = append(holes, fmt.Sprintf("%s names node %s, which is not in the cluster", o.Key, id))
@@ -411,12 +591,17 @@ func missingCopies(ctx context.Context, byID map[string]*node, store *meta.Store
 					want = ref.ShardID(i)
 				}
 				if !owner.hasChunk(want) {
-					holes = append(holes, fmt.Sprintf("%s: %s is missing chunk %s", o.Key, id, want))
+					// With the placement, because the number of nodes in it is the
+					// difference between a copy to rebuild and an object that never
+					// had a second copy to rebuild it from. Without it, a manifest
+					// naming one node looks exactly like two thirds of a heal.
+					holes = append(holes, fmt.Sprintf("%s: %s is missing chunk %s (placed on %s)",
+						o.Key, id, want, strings.Join(o.Manifest.Nodes, ",")))
 				}
 			}
 		}
 	}
-	return holes, true
+	return holes, copies, true
 }
 
 var (
@@ -473,6 +658,53 @@ func chaosPut(ctx context.Context, client *awss3.Client, w write) bool {
 	}
 	_, err = client.CompleteMultipartUpload(ctx, &awss3.CompleteMultipartUploadInput{
 		Bucket: aws.String(chaosBucket), Key: aws.String(w.key), UploadId: create.UploadId,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
+	})
+	return err == nil
+}
+
+// chaosCopy copies an object server-side, either as one manifest copy or by
+// assembling it out of two ranges of the source with UploadPartCopy. Either way the
+// destination must end up byte-for-byte the source, which is what the checker reads
+// it back as — a copy that lands short is a copy the client was told succeeded.
+func chaosCopy(ctx context.Context, client *awss3.Client, from string, to write) bool {
+	if !to.viaPartCopy {
+		_, err := client.CopyObject(ctx, &awss3.CopyObjectInput{
+			Bucket: aws.String(chaosBucket), Key: aws.String(to.key),
+			CopySource: aws.String(chaosBucket + "/" + from),
+		})
+		return err == nil
+	}
+
+	create, err := client.CreateMultipartUpload(ctx, &awss3.CreateMultipartUploadInput{
+		Bucket: aws.String(chaosBucket), Key: aws.String(to.key),
+	})
+	if err != nil {
+		return false
+	}
+	// Split off a chunk boundary, so the ranges have to be re-chunked rather than
+	// handed the source's own chunk references.
+	split := to.size/3 + 1
+	ranges := []string{
+		fmt.Sprintf("bytes=0-%d", split-1),
+		fmt.Sprintf("bytes=%d-%d", split, to.size-1),
+	}
+	var parts []types.CompletedPart
+	for i, spec := range ranges {
+		out, err := client.UploadPartCopy(ctx, &awss3.UploadPartCopyInput{
+			Bucket: aws.String(chaosBucket), Key: aws.String(to.key), UploadId: create.UploadId,
+			PartNumber: aws.Int32(int32(i + 1)),
+			CopySource: aws.String(chaosBucket + "/" + from), CopySourceRange: aws.String(spec),
+		})
+		if err != nil || out.CopyPartResult == nil {
+			return false
+		}
+		parts = append(parts, types.CompletedPart{
+			ETag: out.CopyPartResult.ETag, PartNumber: aws.Int32(int32(i + 1)),
+		})
+	}
+	_, err = client.CompleteMultipartUpload(ctx, &awss3.CompleteMultipartUploadInput{
+		Bucket: aws.String(chaosBucket), Key: aws.String(to.key), UploadId: create.UploadId,
 		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
 	})
 	return err == nil

@@ -25,7 +25,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/0vertake/kavo/internal/ec"
 	"github.com/0vertake/kavo/internal/meta"
 	"github.com/0vertake/kavo/internal/object"
 )
@@ -53,12 +52,12 @@ type CompletedPart struct {
 }
 
 // CreateUpload begins a multipart upload and returns its id.
-func (c *Coordinator) CreateUpload(ctx context.Context, key, contentType string) (string, error) {
+func (c *Coordinator) CreateUpload(ctx context.Context, key, contentType string, metadata map[string]string) (string, error) {
 	// Random rather than derived from the key: two clients uploading the same key
 	// at once are two independent uploads, and each must be able to abort its own
 	// without touching the other's parts.
 	id := rand.Text()
-	u := meta.Upload{Key: key, ContentType: contentType, Created: time.Now().UTC()}
+	u := meta.Upload{Key: key, ContentType: contentType, Created: time.Now().UTC(), Meta: metadata}
 	if err := c.meta.CreateUpload(ctx, id, u); err != nil {
 		return "", err
 	}
@@ -82,11 +81,17 @@ func (c *Coordinator) UploadPart(ctx context.Context, id string, number int, bod
 		return "", err
 	}
 
-	m, err := c.write(ctx, u.Key, body, size)
+	m, writing, err := c.write(ctx, u.Key, body, size)
 	if err != nil {
 		return "", err
 	}
-	if err := c.meta.CommitPart(ctx, id, number, m); err != nil {
+	if writing == "" {
+		err = c.meta.CommitPart(ctx, id, number, m)
+	} else {
+		err = c.meta.CommitPartWhileWriting(ctx, id, number, m, writing)
+	}
+	c.stopWriting(ctx, writing)
+	if err != nil {
 		return "", err
 	}
 	return m.ETag, nil
@@ -99,8 +104,47 @@ func (c *Coordinator) UploadPart(ctx context.Context, id string, number int, bod
 // that does not exist, or one whose ETag does not match, is refused with nothing
 // changed. Committing a manifest over a client's mistake would produce an object
 // that is readable, checksum-valid, and not what anybody uploaded.
+// CopyPart stores a part whose bytes come from a range of an existing object, which
+// is UploadPartCopy — how every client copies an object too large to copy in one
+// call. The aws CLI switches to it above 8 MB, so without it a server-side copy of a
+// large object is not possible at all.
+//
+// The bytes are read from the source's owners and written to the part's, so a copy
+// of this kind moves data inside the cluster where CopyObject moves none. That is
+// the reason it was deferred rather than a reason not to have it: the alternative is
+// to give the part the source's own chunk references, which holds only when the
+// range's boundaries fall exactly on chunk boundaries — and a client choosing an
+// 8 MB part size against a 32 MB chunk never lands there. Re-chunking through the
+// ordinary write path is honest about the cost and keeps a part indistinguishable
+// from an uploaded one, which is what lets completion stay a single manifest commit.
+//
+// Streaming, so the part's size does not decide the footprint: the pipe hands each
+// chunk to the writer as the reader produces it.
+func (c *Coordinator) CopyPart(ctx context.Context, id string, number int, src object.Manifest, off, length int64) (string, error) {
+	pr, pw := io.Pipe()
+	go func() {
+		// CloseWithError(nil) closes cleanly, so this reports the end of the range
+		// and a failed read the same way, and the writer sees which.
+		pw.CloseWithError(c.StreamRange(ctx, src, pw, off, length))
+	}()
+	// Unblocks the goroutine above if the write side gives up early.
+	defer pr.Close()
+	return c.UploadPart(ctx, id, number, pr, length)
+}
+
 func (c *Coordinator) CompleteUpload(ctx context.Context, id string, parts []CompletedPart) (object.Manifest, error) {
 	u, err := c.meta.Upload(ctx, id)
+	if errors.Is(err, meta.ErrNotFound) {
+		// The upload may have completed already, with the client never seeing the
+		// answer: every SDK retries a request whose connection died, and telling
+		// it NoSuchUpload says the upload failed while the object is sitting
+		// there. What is returned is what this upload produced, which is not
+		// necessarily what is at the key now — the answer is about the upload.
+		if done, dErr := c.meta.Completion(ctx, id); dErr == nil {
+			return object.Manifest{ETag: done.ETag, Modified: done.When}, nil
+		}
+		return object.Manifest{}, err
+	}
 	if err != nil {
 		return object.Manifest{}, err
 	}
@@ -119,7 +163,7 @@ func (c *Coordinator) CompleteUpload(ctx context.Context, id string, parts []Com
 		return object.Manifest{}, fmt.Errorf("%w: a completion listed its parts descending", ErrPartOrder)
 	}
 
-	final := object.Manifest{ContentType: u.ContentType}
+	final := object.Manifest{ContentType: u.ContentType, Meta: u.Meta}
 	// The multipart ETag is the MD5 of the parts' MD5s, with the part count after
 	// a dash. Clients recompute it to check an upload, so it is not free to be
 	// anything simpler.
@@ -166,6 +210,15 @@ func (c *Coordinator) CompleteUpload(ctx context.Context, id string, parts []Com
 	if err := c.meta.Commit(ctx, u.Key, final); err != nil {
 		return object.Manifest{}, err
 	}
+	// Before forgetting the upload, so that there is no instant in which the id is
+	// neither in flight nor remembered — a retry landing there would be told its
+	// upload never existed.
+	done := meta.Completion{Key: u.Key, ETag: final.ETag, When: final.Modified, Parts: len(parts)}
+	if err := c.meta.FinishUpload(ctx, id, done); err != nil {
+		// The object is committed, so this is only about what a retry will be
+		// told: NoSuchUpload rather than the answer it missed.
+		log.Printf("complete upload %s: remember completion: %v", id, err)
+	}
 	if err := c.meta.DeleteUpload(ctx, id); err != nil {
 		// The object is committed and readable; a leftover upload record is
 		// clutter, not corruption.
@@ -174,34 +227,57 @@ func (c *Coordinator) CompleteUpload(ctx context.Context, id string, parts []Com
 	return final, nil
 }
 
-// AbortUpload discards an upload and reclaims the parts' chunks.
+// AbortUpload discards an upload. Forgetting the parts is what makes the chunks
+// they named unreferenced, and collection is what reclaims them — abandoning an
+// upload halfway leaves exactly the same garbage, and there is no second mechanism
+// for it.
+//
+// This used to drop the parts' chunks itself, which was safe only for as long as no
+// two manifests could name the same chunk. It also raced a completion of the same
+// upload: parts read here, the object committed there, and then the chunks of a
+// committed object deleted. Neither is possible now that nothing deletes a chunk
+// except the pass that reads every manifest first.
 func (c *Coordinator) AbortUpload(ctx context.Context, id string) error {
-	stored, err := c.meta.Parts(ctx, id)
-	if err != nil {
+	// Read before deleting, so that aborting an id that never existed is an error
+	// rather than a success. A client that is told it cleaned up something it made
+	// up cannot tell that from having cleaned up the wrong thing, and S3 answers
+	// NoSuchUpload.
+	if _, err := c.meta.Upload(ctx, id); err != nil {
 		return err
-	}
-	// No manifest references these chunks, so dropping them cannot make anything
-	// unreadable. A failure to drop leaks disk and is not worth failing the abort
-	// over — the client has already stopped caring about this upload.
-	for _, m := range stored {
-		c.dropChunks(ctx, m)
 	}
 	return c.meta.DeleteUpload(ctx, id)
 }
 
-// dropChunks removes every chunk a manifest names from every node that holds it.
-// Only ever called for manifests nothing can resolve.
-func (c *Coordinator) dropChunks(ctx context.Context, m object.Manifest) {
-	live := c.live.Load()
-	for _, ref := range m.Chunks {
-		for i, node := range m.Nodes {
-			id := ref.ID
-			if m.Coding != (ec.Scheme{}) {
-				id = ref.ShardID(i)
-			}
-			if err := c.drop(ctx, node, id, live); err != nil {
-				log.Printf("drop chunk %s from %s: %v", id, node, err)
-			}
-		}
+// Part is one uploaded part as a listing reports it.
+type Part struct {
+	Number   int
+	ETag     string
+	Size     int64
+	Modified time.Time
+}
+
+// Parts lists an upload's parts in part-number order. An upload has at most
+// MaxParts of them, so this is bounded by the protocol rather than by the store.
+func (c *Coordinator) Parts(ctx context.Context, id string) ([]Part, error) {
+	// So that listing the parts of an upload that does not exist says so, rather
+	// than reporting that it has none.
+	if _, err := c.meta.Upload(ctx, id); err != nil {
+		return nil, err
 	}
+	stored, err := c.meta.Parts(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	parts := make([]Part, 0, len(stored))
+	for number, m := range stored {
+		parts = append(parts, Part{Number: number, ETag: m.ETag, Size: m.Size, Modified: m.Modified})
+	}
+	slices.SortFunc(parts, func(a, b Part) int { return a.Number - b.Number })
+	return parts, nil
+}
+
+// Uploads lists in-flight uploads under a key prefix. See meta.Store.Uploads for
+// the order they come back in and why it is not S3's.
+func (c *Coordinator) Uploads(ctx context.Context, prefix, after string, limit int) ([]meta.UploadRef, bool, error) {
+	return c.meta.Uploads(ctx, prefix, after, limit)
 }

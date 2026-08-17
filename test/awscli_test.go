@@ -225,6 +225,103 @@ func TestTheAWSCLIListsAndSyncs(t *testing.T) {
 	}
 }
 
+// `aws s3 mv` is a copy and then a delete, and both halves are server-side: the
+// object never travels to the client and back. Which makes it the operation where
+// two keys name the same chunks, and the delete of the source arrives while they do.
+func TestTheAWSCLIMovesAndCopiesServerSide(t *testing.T) {
+	requireAWSCLI(t)
+	bin := buildKavod(t)
+	nodes := startCluster(t, bin, clusterPrefix(), 1<<20, clusterSize)
+
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	body := bytes.Repeat([]byte("kavo"), 3<<18) // 3 MB, so it spans chunks
+	if err := os.WriteFile(src, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := nodes[0].aws(t, "s3", "cp", src, "s3://bucket/original.bin"); err != nil {
+		t.Fatalf("cp up: %v\n%s", err, out)
+	}
+
+	// A copy first, so that three keys share one object's chunks.
+	if out, err := nodes[1].aws(t, "s3", "cp", "s3://bucket/original.bin", "s3://bucket/copy.bin"); err != nil {
+		t.Fatalf("cp server-side: %v\n%s", err, out)
+	}
+	if out, err := nodes[2].aws(t, "s3", "mv", "s3://bucket/original.bin", "s3://archive/moved.bin"); err != nil {
+		t.Fatalf("mv: %v\n%s", err, out)
+	}
+
+	// The move deleted the source, and the copy must not have gone with it.
+	if out, err := nodes[0].aws(t, "s3", "ls", "s3://bucket/original.bin"); err == nil {
+		t.Errorf("the moved object is still listed under its old key:\n%s", out)
+	}
+	for _, key := range []string{"s3://bucket/copy.bin", "s3://archive/moved.bin"} {
+		back := filepath.Join(dir, filepath.Base(key))
+		if out, err := nodes[1].aws(t, "s3", "cp", key, back); err != nil {
+			t.Fatalf("cp %s down: %v\n%s", key, err, out)
+		}
+		got, err := os.ReadFile(back)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, body) {
+			t.Errorf("%s came back as %d bytes, want the %d written", key, len(got), len(body))
+		}
+	}
+}
+
+// The same copy, past the size where the CLI stops copying in one call. Above 8 MB
+// it creates a multipart upload and copies the source in 8 MB pieces with
+// UploadPartCopy, which is a different code path on the server and was for a long
+// time not a path at all: the header naming the source was ignored, every piece was
+// answered 200 having stored nothing, and the assembled object was empty.
+//
+// The test above this one uses 3 MB and passed throughout. That is the lesson worth
+// keeping — the CLI was in the suite from early on, always on the near side of the
+// threshold where it changes strategy.
+//
+// No flags: the CLI reads the source's tags before a multipart copy, which is why
+// reading tags is answered — with none, truthfully — while asking for tags to exist
+// is refused. Refusing the read failed this copy on a call about a feature neither
+// side wants.
+func TestTheAWSCLICopiesServerSidePastTheMultipartThreshold(t *testing.T) {
+	requireAWSCLI(t)
+	bin := buildKavod(t)
+	nodes := startCluster(t, bin, clusterPrefix(), 1<<20, clusterSize)
+
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	// 20 MB and change, so the CLI sends three parts and the last one is short.
+	body := make([]byte, 20<<20+7919)
+	if _, err := rand.Read(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(src, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := nodes[0].aws(t, "s3", "cp", src, "s3://bucket/large.bin"); err != nil {
+		t.Fatalf("cp up: %v\n%s", err, out)
+	}
+
+	if out, err := nodes[1].aws(t, "s3", "cp", "s3://bucket/large.bin",
+		"s3://bucket/large-copy.bin"); err != nil {
+		t.Fatalf("server-side copy of a multipart-sized object: %v\n%s", err, out)
+	}
+
+	back := filepath.Join(dir, "back")
+	if out, err := nodes[2].aws(t, "s3", "cp", "s3://bucket/large-copy.bin", back); err != nil {
+		t.Fatalf("cp down: %v\n%s", err, out)
+	}
+	got, err := os.ReadFile(back)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("the copy is %d bytes, want the %d written, equal = %v",
+			len(got), len(body), bytes.Equal(got, body))
+	}
+}
+
 // The other operations a client leans on: describing an object without reading it,
 // and deleting it. `s3api` rather than `s3` so that the failure names the request
 // rather than a copy that gave up.

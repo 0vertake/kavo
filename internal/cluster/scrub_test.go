@@ -182,3 +182,38 @@ func TestScrubPacesItselfToTheGivenRate(t *testing.T) {
 	}
 	t.Logf("verified %d bytes at %d B/s in %v", st.BytesRead, rate, elapsed)
 }
+
+// A node that has left the membership can still answer, and reading from it is safe
+// for exactly the reason the read path already relies on: chunks are immutable and
+// verified against the manifest's checksum at both ends, so a stale address either
+// returns the bytes the manifest names or fails. So `fetch` reads from a departed
+// node and repair pulls its replacement copies through the same path.
+//
+// The scrubber did not. It asked only current members for a good copy, which made rot
+// unrecoverable in the one case where recovery matters most: the copies that verify
+// are on nodes whose leases have lapsed — an overloaded cluster, a partition — while
+// the copy on this node is the broken one. Reads kept working, so nothing complained,
+// and the rot sat there until the nodes still holding good bytes were gone too.
+func TestScrubRebuildsFromANodeThatHasLeftButStillAnswers(t *testing.T) {
+	tc := newCluster(t, 5)
+	const key = "rot/while/the/cluster/is/shrinking"
+	owners, outsider := tc.owners(t, key)
+	data := randBytes(2 * testChunkSize)
+	m := mustPut(t, outsider, key, data)
+
+	victim, rotted := owners[0], m.Chunks[0]
+	want := victim.chunkBytes(t, rotted)
+	victim.rot(t, rotted)
+
+	// Every other owner drops out of the victim's view while staying up, so the
+	// only good copies are on nodes it no longer counts as members.
+	victim.c.SetMembers(tc.without(m.Nodes...))
+
+	st := mustScrub(t, victim, 0)
+	if st.Rotted != 1 || st.Rebuilt != 1 {
+		t.Fatalf("scrub found %d rotted and rebuilt %d, want 1 and 1", st.Rotted, st.Rebuilt)
+	}
+	if got := victim.chunkBytes(t, rotted); !bytes.Equal(got, want) {
+		t.Error("the copy on disk is still the rotted one")
+	}
+}

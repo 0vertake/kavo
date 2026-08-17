@@ -57,6 +57,14 @@ type listPrefix struct {
 // Only v2: every current client uses it, and v1 differs in how it carries the
 // resume point. A v1 request is refused rather than answered with the wrong shape.
 func (h *handler) listObjects(w http.ResponseWriter, r *http.Request) {
+	// S3 overloads a GET on the bucket: with ?uploads it asks what multipart
+	// uploads are in flight rather than what objects exist. Answering that with an
+	// object listing is worse than refusing it, because a client parses the reply
+	// as "nothing in flight" and believes it.
+	if r.URL.Query().Has("uploads") {
+		h.listUploads(w, r)
+		return
+	}
 	bucket := r.PathValue("bucket")
 	q := r.URL.Query()
 	// Two other GETs live on the bucket path and carry no list-type, so they are

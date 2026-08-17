@@ -29,7 +29,6 @@ func New(c *cluster.Coordinator, s *store.Store) http.Handler {
 	mux.HandleFunc("PUT /peer/chunks/{id}", h.putChunk)
 	mux.HandleFunc("GET /peer/chunks/{id}", h.getChunk)
 	mux.HandleFunc("HEAD /peer/chunks/{id}", h.headChunk)
-	mux.HandleFunc("DELETE /peer/chunks/{id}", h.deleteChunk)
 	mux.HandleFunc("GET /cluster/members", h.members)
 	return mux
 }
@@ -156,23 +155,6 @@ func (h *handler) headChunk(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "chunk probe failed", http.StatusInternalServerError)
 	case !held:
 		http.Error(w, "not found", http.StatusNotFound)
-	}
-}
-
-// deleteChunk drops a chunk this node no longer owns. Only a rebalance sends
-// this, and only after committing a manifest that names the chunk's new homes,
-// so no reader can still be sent here for it.
-func (h *handler) deleteChunk(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	err := h.store.RemoveChunk(id)
-	switch {
-	case errors.Is(err, store.ErrInvalidID):
-		http.Error(w, "invalid chunk id", http.StatusBadRequest)
-	case err != nil:
-		log.Printf("peer delete chunk %s: %v", id, err)
-		http.Error(w, "chunk delete failed", http.StatusInternalServerError)
-	default:
-		w.WriteHeader(http.StatusNoContent)
 	}
 }
 
