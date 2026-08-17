@@ -197,8 +197,17 @@ func (c *Coordinator) verifyLocal(ref object.ChunkRef) error {
 func (c *Coordinator) rebuildFromPeers(ctx context.Context, ref object.ChunkRef, nodes []string, live *membership) error {
 	var errs []error
 	for _, node := range nodes {
-		addr, member := live.peers[node]
-		if node == c.self || !member {
+		// Whatever address the node was last known at, which is what the read path
+		// uses and for the same reason: a chunk is immutable and verified against
+		// the manifest's checksum at both ends, so a node that has left either
+		// hands over the bytes the manifest names or fails to answer.
+		//
+		// Asking only current members made rot unrecoverable in the case that needs
+		// recovery most — the good copies on nodes whose leases have lapsed, the bad
+		// one here. Reads went on working through those same addresses, so nothing
+		// reported it, and the rot waited for the good copies to disappear too.
+		addr := live.readAddr(node)
+		if node == c.self || addr == "" {
 			continue
 		}
 		src, err := peer.FetchChunk(ctx, addr, ref.ID, ref.CRC)
@@ -212,6 +221,12 @@ func (c *Coordinator) rebuildFromPeers(ctx context.Context, ref object.ChunkRef,
 			return nil
 		}
 		errs = append(errs, err)
+	}
+	if len(errs) == 0 {
+		// Nobody was even asked: this node is the only one the manifest names that
+		// the cluster has ever heard of. Worth saying plainly, since "no peer could
+		// supply a good copy" reads as though peers were tried and failed.
+		return fmt.Errorf("no other node has ever held chunk %s", ref.ID)
 	}
 	return fmt.Errorf("no peer could supply a good copy: %w", errors.Join(errs...))
 }

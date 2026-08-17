@@ -74,7 +74,12 @@ func TestARangedReadStillVerifiesTheWholeChunk(t *testing.T) {
 
 // A delete has to reclaim the chunks, not just the manifest. Leaving them is a
 // store that never gets smaller: every overwrite and every delete would add to a
-// pile nothing ever reads and nothing ever collects.
+// pile nothing ever reads.
+//
+// The delete does not take them itself, and must not: a copied object shares its
+// source's chunks, so this manifest's word alone is not enough to delete anything.
+// Collection reads every manifest and then takes them, which is why the pass is here
+// in the middle of what looks like a test about deleting.
 func TestDeleteReclaimsTheChunks(t *testing.T) {
 	tc := newCluster(t, 4)
 	key := "doomed/object"
@@ -92,6 +97,7 @@ func TestDeleteReclaimsTheChunks(t *testing.T) {
 	if err := outsider.c.Delete(context.Background(), key); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
+	collectEverywhere(t, tc, 0)
 	for _, o := range owners {
 		for _, ref := range m.Chunks {
 			if o.has(ref) {

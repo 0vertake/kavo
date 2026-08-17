@@ -68,7 +68,8 @@ object/partition-scoped, throttled, resumable.
 
 ## Testing / benchmarking tools
 
-- **Chaos**: etcd reimplemented Jepsen as a native Go runner — the model for `kavo-chaos`.
+- **Chaos**: etcd reimplemented Jepsen as a native Go runner — the model for what became
+  `test/chaos_test.go`.
   [toxiproxy](https://github.com/Shopify/toxiproxy) for network faults (HTTP API, CI-friendly);
   Docker SIGKILL for node death; direct byte-flips for corruption.
   [porcupine](https://github.com/anishathalye/porcupine) considered, scoped out (kavo's

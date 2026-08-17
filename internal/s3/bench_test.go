@@ -12,17 +12,21 @@ package s3_test
 
 import (
 	"bytes"
+	"cmp"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"sync/atomic"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/0vertake/kavo/internal/object"
+	"github.com/0vertake/kavo/internal/sigv4"
 )
 
 const benchNodes = 6
@@ -38,9 +42,38 @@ func sizeName(n int64) string {
 	return strconv.FormatInt(n>>10, 10) + "KB"
 }
 
+// benchGateway is the cluster these benchmarks drive: six nodes started here, or
+// whatever cluster KAVO_BENCH_ENDPOINT names.
+//
+// The second case is the only way these numbers stop being loopback numbers. Every
+// figure in docs/benchmarks.md was measured with six nodes on one host, so a chunk
+// reaches its second owner across a memory copy rather than a network, and the
+// per-chunk round trip that dominates small writes on real hardware is missing from
+// all of them. Pointing the same benchmarks at nodes on separate machines is the
+// measurement that settles it, and it needs no separate harness — only an address:
+//
+//	KAVO_BENCH_ENDPOINT=http://node1:9001 make bench
+//
+// Credentials come from KAVO_BENCH_KEY and KAVO_BENCH_SECRET, defaulting to kavod's
+// own defaults so a cluster from `make up` needs neither.
 func benchGateway(b *testing.B) *awss3.Client {
 	b.Helper()
-	return newGatewaySized(b, benchNodes, object.DefaultChunkSize)
+	endpoint := os.Getenv("KAVO_BENCH_ENDPOINT")
+	if endpoint == "" {
+		return newGatewaySized(b, benchNodes, object.DefaultChunkSize)
+	}
+	remote := sigv4.Credentials{
+		AccessKey: cmp.Or(os.Getenv("KAVO_BENCH_KEY"), "kavo"),
+		SecretKey: cmp.Or(os.Getenv("KAVO_BENCH_SECRET"), "kavosecret"),
+	}
+	b.Logf("benchmarking the cluster at %s, not one started here", endpoint)
+	return awss3.NewFromConfig(aws.Config{
+		Region:      "us-east-1",
+		Credentials: credentials.NewStaticCredentialsProvider(remote.AccessKey, remote.SecretKey, ""),
+	}, func(o *awss3.Options) {
+		o.BaseEndpoint = aws.String(endpoint)
+		o.UsePathStyle = true
+	})
 }
 
 func benchPut(b *testing.B, client *awss3.Client, key string, data []byte) {
@@ -283,4 +316,74 @@ func BenchmarkList(b *testing.B) {
 			}
 		}
 	})
+}
+
+// The two costs of a server-side copy, which are not the same cost.
+//
+// CopyObject commits a second manifest naming the first one's chunks, so it moves no
+// bytes and its number should not move with the size — that flatness is the reason
+// `aws s3 mv` of a large object is instant, and a size sweep is how the claim is
+// checked rather than asserted. UploadPartCopy has to read the range and write it
+// back, so it costs a read and a write of every byte and is bounded by whichever is
+// slower. A client without it pays a GET plus a PUT for the same result, over its own
+// link, so the pair of numbers is what the feature is worth.
+func BenchmarkCopy(b *testing.B) {
+	for _, size := range benchSizes {
+		b.Run("object/"+sizeName(size), func(b *testing.B) {
+			client := benchGateway(b)
+			const key = "copy/source"
+			benchPut(b, client, key, randBytes(int(size)))
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; b.Loop(); i++ {
+				_, err := client.CopyObject(b.Context(), &awss3.CopyObjectInput{
+					Bucket: aws.String("bench"), Key: aws.String("copy/dest/" + strconv.Itoa(i)),
+					CopySource: aws.String("bench/" + key),
+				})
+				if err != nil {
+					b.Fatalf("copy: %v", err)
+				}
+			}
+		})
+	}
+
+	// Only at sizes where moving the bytes is the whole cost: a copied part below a
+	// chunk is a measurement of the multipart calls around it.
+	for _, size := range []int64{1 << 20, 64 << 20} {
+		b.Run("parts/"+sizeName(size), func(b *testing.B) {
+			client := benchGateway(b)
+			const key = "copypart/source"
+			benchPut(b, client, key, randBytes(int(size)))
+
+			b.SetBytes(size)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; b.Loop(); i++ {
+				dest := "copypart/dest/" + strconv.Itoa(i)
+				create, err := client.CreateMultipartUpload(b.Context(), &awss3.CreateMultipartUploadInput{
+					Bucket: aws.String("bench"), Key: aws.String(dest),
+				})
+				if err != nil {
+					b.Fatalf("create upload: %v", err)
+				}
+				out, err := client.UploadPartCopy(b.Context(), &awss3.UploadPartCopyInput{
+					Bucket: aws.String("bench"), Key: aws.String(dest), UploadId: create.UploadId,
+					PartNumber: aws.Int32(1), CopySource: aws.String("bench/" + key),
+					CopySourceRange: aws.String(fmt.Sprintf("bytes=0-%d", size-1)),
+				})
+				if err != nil {
+					b.Fatalf("copy part: %v", err)
+				}
+				if _, err := client.CompleteMultipartUpload(b.Context(), &awss3.CompleteMultipartUploadInput{
+					Bucket: aws.String("bench"), Key: aws.String(dest), UploadId: create.UploadId,
+					MultipartUpload: &types.CompletedMultipartUpload{Parts: []types.CompletedPart{
+						{ETag: out.CopyPartResult.ETag, PartNumber: aws.Int32(1)},
+					}},
+				}); err != nil {
+					b.Fatalf("complete: %v", err)
+				}
+			}
+		})
+	}
 }

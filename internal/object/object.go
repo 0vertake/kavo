@@ -47,6 +47,20 @@ type ChunkRef struct {
 // address every shard without the manifest listing them.
 func (c ChunkRef) ShardID(i int) string { return fmt.Sprintf("%ss%02d", c.ID, i) }
 
+// indexWidth is how many trailing digits of a chunk id are the chunk's index within
+// its write. Everything before them is the write's own random prefix.
+const indexWidth = 6
+
+// WriteID is the id of the write a chunk came from. Every chunk of one write shares
+// it, and a shard id extends its chunk's, so it names an upload's whole footprint —
+// which is what lets one small record stand for a five-gigabyte upload in flight.
+func WriteID(chunkID string) string {
+	if len(chunkID) <= indexWidth {
+		return ""
+	}
+	return chunkID[:len(chunkID)-indexWidth]
+}
+
 // Manifest describes a stored object. It is the unit committed to etcd: an
 // object exists only once its manifest is committed.
 type Manifest struct {
@@ -61,6 +75,14 @@ type Manifest struct {
 	// affects how the object is stored.
 	ContentType string
 	Modified    time.Time
+	// Meta is what a client attached to the object and expects back verbatim: its
+	// x-amz-meta-* headers, and the few standard ones that describe the bytes
+	// rather than the transfer (Cache-Control, Content-Disposition,
+	// Content-Encoding, Content-Language, Expires). Stored in canonical HTTP
+	// form so a read replays it without a translation table, and never
+	// interpreted here — a store that acted on Content-Encoding would be
+	// deciding what the bytes mean, which is the client's business.
+	Meta map[string]string `json:",omitempty"`
 	// Nodes are the partition owners the chunks were written to. All chunks of
 	// an object share a partition, so one list covers them all.
 	//
@@ -129,7 +151,7 @@ func Write(r io.Reader, chunkSize, expect int64, commit func(*ChunkRef, []byte) 
 
 		data := buf[:n]
 		ref := ChunkRef{
-			ID:   fmt.Sprintf("%s%06d", prefix, i),
+			ID:   fmt.Sprintf("%s%0*d", prefix, indexWidth, i),
 			Size: int64(n),
 			CRC:  crc32.Checksum(data, castagnoli),
 		}

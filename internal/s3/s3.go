@@ -11,9 +11,14 @@
 package s3
 
 import (
+	"crypto/md5"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/xml"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -63,8 +68,107 @@ func (h *handler) authed(next http.HandlerFunc) http.HandlerFunc {
 			fail(w, r, authError(err), err)
 			return
 		}
+		// After the signature, so that an unsigned request is told about the
+		// signature rather than about this.
+		if encryptionRequested(r.Header) {
+			fail(w, r, errEncryptionNotImplemented, nil)
+			return
+		}
+		if taggingRequested(r.Header) {
+			fail(w, r, errTaggingNotImplemented, nil)
+			return
+		}
+		if key := r.PathValue("key"); key != "" {
+			for name := range r.URL.Query() {
+				if !knownObjectQuery(r.Method, name, r.URL.Query().Get(name)) {
+					fail(w, r, errNotImplemented, nil)
+					return
+				}
+			}
+		}
 		next(w, r)
 	}
+}
+
+// knownObjectQuery reports whether an object request may carry this query
+// parameter. Everything else hanging off an object's path — ?tagging, ?acl,
+// ?retention, ?legal-hold, ?attributes, ?versionId, the response-header overrides —
+// names a subresource this server does not implement.
+//
+// It is an allowlist because the failure is asymmetric, and this was not a
+// cosmetic bug. S3 addresses an object's subresources as a query on the object's
+// own path, so a server that ignores the query answers them with the object
+// operation instead: `put-object-tagging` reached the object PUT and replaced the
+// object with the tagging XML, `put-object-acl` truncated it to nothing because its
+// request has no body, and `delete-object-tagging` deleted it. All three answered
+// 200. A client tagging an object destroyed it and was told the tag was set.
+//
+// The bucket path has had the same guard since the suite found the same shape of
+// bug there (`bucketOnly`), where it only cost honesty. Here it cost the object.
+func knownObjectQuery(method, name, value string) bool {
+	switch name {
+	case "x-id": // The SDKs' own operation label. It names no subresource.
+		return true
+	case "uploadId": // Every multipart call names one, on all four methods.
+		return true
+	case "partNumber":
+		// On a PUT it numbers the part being uploaded. On a GET it asks for one
+		// part of a completed object, which is not implemented — and answering
+		// that with the whole object is the same class of mistake as the above.
+		return method == http.MethodPut
+	case "uploads":
+		return method == http.MethodPost
+	case "max-parts", "part-number-marker":
+		return method == http.MethodGet
+	case "tagging":
+		// Reading an object's tags is answered — with none, which is true, since
+		// nothing here stores any. Setting them is not: see taggingRequested.
+		// The asymmetry is the point. A client asking what the tags are gets a
+		// correct answer; a client asking for tags to exist is refused rather
+		// than told they do.
+		return method == http.MethodGet
+	case "versionId":
+		// Nothing here is versioned, and every object is reported by
+		// ListObjectVersions as the single version "null", so a request naming
+		// that version names the object — which is how a client empties a
+		// bucket. Any other id names a version that never existed, and answering
+		// it with the current object would return or delete something the client
+		// did not ask for.
+		return value == "null"
+	}
+	return false
+}
+
+// encryptionRequested reports whether a request asks for server-side encryption, in
+// any of its forms: SSE-S3, SSE-KMS, a customer key, or a customer key for a copy's
+// source.
+//
+// Refused rather than ignored, which is what this used to do. Encryption at rest is
+// an anti-goal, and ignoring the headers meant a client that sent a customer key was
+// answered 200 for an object stored in plaintext that anyone without the key could
+// read — the client believing otherwise being the whole point of sending the key.
+// Ceph's suite scored that arrangement as twenty passes, which is the clearest
+// argument available that a pass count is not a measure of a store.
+func encryptionRequested(header http.Header) bool {
+	for name := range header {
+		if strings.HasPrefix(name, "X-Amz-Server-Side-Encryption") ||
+			strings.HasPrefix(name, "X-Amz-Copy-Source-Server-Side-Encryption") {
+			return true
+		}
+	}
+	return false
+}
+
+// taggingRequested reports whether a request asks for tags to be attached, which is
+// x-amz-tagging on a PUT or a multipart creation.
+//
+// Refused rather than ignored, and refused for the same reason a read of tags is
+// *answered*: a store that drops the header and then reports the object has no tags
+// has told a client its tags are gone by way of two successful responses. Either
+// both are honest or neither is. An empty value asks for no tags, which is what the
+// object will have, so there is nothing there to drop.
+func taggingRequested(header http.Header) bool {
+	return header.Get("X-Amz-Tagging") != ""
 }
 
 // key is the etcd key for an object: the bucket and the key within it. Both parts
@@ -91,6 +195,11 @@ func (h *handler) putObject(w http.ResponseWriter, r *http.Request) {
 		h.uploadPart(w, r, id)
 		return
 	}
+	// A copy has no body, so it is answered before the length check below.
+	if source := r.Header.Get("X-Amz-Copy-Source"); source != "" {
+		h.copyObject(w, r, key, source)
+		return
+	}
 	// Without a length there is no way to tell a complete upload from a
 	// connection that died halfway, and S3 requires one.
 	if r.ContentLength < 0 {
@@ -98,9 +207,25 @@ func (h *handler) putObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Before the body is read, because a digest that cannot be a digest is worth
+	// saying so about without first streaming a gigabyte to disk.
+	digest, err := contentMD5(r.Header.Values("Content-MD5"))
+	if err != nil {
+		fail(w, r, errInvalidDigest, err)
+		return
+	}
+
+	stored, err := storedMeta(r.Header)
+	if err != nil {
+		fail(w, r, errMetadataTooLarge, err)
+		return
+	}
+
 	m, err := h.cluster.Put(r.Context(), key, r.Body, cluster.PutOptions{
 		ContentType: r.Header.Get("Content-Type"),
 		Size:        r.ContentLength,
+		MD5:         digest,
+		Meta:        stored,
 	})
 	if err != nil {
 		fail(w, r, storeError(err), err)
@@ -111,6 +236,116 @@ func (h *handler) putObject(w http.ResponseWriter, r *http.Request) {
 	// the next instant and still read the object back.
 	w.Header().Set("ETag", etag(m))
 	w.WriteHeader(http.StatusOK)
+}
+
+// copyObject answers a PUT carrying X-Amz-Copy-Source: the destination becomes
+// another name for the source's chunks. Clients reach for it constantly — `aws s3 mv`
+// is a copy and a delete, and `aws s3 cp` between two keys never touches the network
+// with the object itself.
+func (h *handler) copyObject(w http.ResponseWriter, r *http.Request, key, source string) {
+	from, ok := copySource(source)
+	if !ok {
+		fail(w, r, errInvalidCopySource, nil)
+		return
+	}
+	directive := r.Header.Get("X-Amz-Metadata-Directive")
+	replace := strings.EqualFold(directive, "REPLACE")
+	if directive != "" && !replace && !strings.EqualFold(directive, "COPY") {
+		fail(w, r, errInvalidDirective, nil)
+		return
+	}
+	// A copy onto itself is only meaningful as a metadata rewrite, so S3 allows it
+	// exactly when the request replaces the metadata. Without REPLACE it is a
+	// request to overwrite an object with itself, which is either a mistake or a
+	// client that meant to say REPLACE.
+	if from == key && !replace {
+		fail(w, r, errCopyOntoItself, nil)
+		return
+	}
+
+	stored, err := storedMeta(r.Header)
+	if err != nil {
+		fail(w, r, errMetadataTooLarge, err)
+		return
+	}
+
+	// Conditions on the source. Answered here rather than inside Copy because they
+	// are a question about a manifest, and they cost an etcd read only when a client
+	// asks one.
+	if conditions := copyConditions(r.Header); len(conditions) > 0 {
+		src, err := h.cluster.Resolve(r.Context(), from)
+		if err != nil {
+			fail(w, r, storeError(err), err)
+			return
+		}
+		if _, ok := precondition(conditions, src); !ok {
+			// A copy has no "you already have it" outcome, so a condition that
+			// does not hold is 412 whichever kind it was — where the same
+			// condition on a read would have been answered 304.
+			fail(w, r, errPreconditionFailed, nil)
+			return
+		}
+	}
+
+	m, err := h.cluster.Copy(r.Context(), from, key, cluster.CopyOptions{
+		Replace:     replace,
+		ContentType: r.Header.Get("Content-Type"),
+		Meta:        stored,
+	})
+	if err != nil {
+		fail(w, r, storeError(err), err)
+		return
+	}
+	writeXML(w, r, copyResult{ETag: etag(m), LastModified: m.Modified.UTC().Format(time.RFC3339)})
+}
+
+// taggingResult is the GetObjectTagging response: an object with no tags, which is
+// every object here.
+type taggingResult struct {
+	XMLName xml.Name `xml:"Tagging"`
+	XMLNS   string   `xml:"xmlns,attr"`
+	TagSet  struct{} `xml:"TagSet"`
+}
+
+// objectTagging answers a read of an object's tags with none.
+//
+// The object is resolved first, so a read of a key that does not exist is NoSuchKey
+// rather than an empty tag set — otherwise this would answer for objects that are
+// not there, which is the mistake buckets-as-prefixes already makes and does not
+// need company. It exists at all because the aws CLI reads the source's tags before
+// copying anything larger than 8 MB, so refusing it makes every large server-side
+// copy fail on a call about a feature neither side wants.
+func (h *handler) objectTagging(w http.ResponseWriter, r *http.Request, key string) {
+	if _, err := h.cluster.Resolve(r.Context(), key); err != nil {
+		fail(w, r, storeError(err), err)
+		return
+	}
+	writeXML(w, r, taggingResult{XMLNS: s3XMLNS})
+}
+
+// copySource parses the header's "/bucket/key" or "bucket/key", either of which a
+// client may send, and either of which may be percent-encoded. A version id
+// suffix is refused rather than ignored: nothing here is versioned, so honouring a
+// request for one version by returning another would be a lie.
+func copySource(source string) (string, bool) {
+	if at := strings.IndexByte(source, '?'); at >= 0 {
+		return "", false
+	}
+	decoded, err := url.PathUnescape(strings.TrimPrefix(source, "/"))
+	if err != nil {
+		return "", false
+	}
+	bucket, key, found := strings.Cut(decoded, "/")
+	if !found || bucket == "" || key == "" {
+		return "", false
+	}
+	return bucket + "/" + key, true
+}
+
+type copyResult struct {
+	XMLName      xml.Name `xml:"CopyObjectResult"`
+	ETag         string
+	LastModified string
 }
 
 func (h *handler) getObject(w http.ResponseWriter, r *http.Request) {
@@ -125,9 +360,37 @@ func (h *handler) getObject(w http.ResponseWriter, r *http.Request) {
 		h.listObjects(w, r)
 		return
 	}
+	if r.URL.Query().Has("tagging") {
+		h.objectTagging(w, r, key)
+		return
+	}
+	// A GET carrying an upload id asks what parts have arrived, not for the object:
+	// the object does not exist yet, and answering NoSuchKey tells a client
+	// resuming an upload that its work is gone.
+	if id := r.URL.Query().Get("uploadId"); id != "" {
+		h.listParts(w, r, key, id)
+		return
+	}
+
 	m, err := h.cluster.Resolve(r.Context(), key)
 	if err != nil {
 		fail(w, r, storeError(err), err)
+		return
+	}
+
+	// Before the range, because a conditional request that fails is answered
+	// whole: a client asking for bytes 0-99 of an object it already has wants to
+	// hear that it already has it, not the bytes.
+	if status, ok := precondition(r.Header, m); !ok {
+		if status == http.StatusNotModified {
+			// No body, and the validators it was tested against, so the client
+			// can go on using them. Not a fail(): 304 is a successful answer to
+			// the question that was asked.
+			validators(w.Header(), m)
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		fail(w, r, errPreconditionFailed, nil)
 		return
 	}
 
@@ -139,8 +402,15 @@ func (h *handler) getObject(w http.ResponseWriter, r *http.Request) {
 	}
 
 	header := w.Header()
-	header.Set("ETag", etag(m))
-	header.Set("Last-Modified", m.Modified.Format(http.TimeFormat))
+	validators(header, m)
+	// Assigned rather than Set, because the map keys are already the form these
+	// go out in and Set would canonicalise them — see storedMeta. Before the
+	// headers below, so that a stored header can never displace one describing
+	// this particular response: a Content-Length kept from an upload would make a
+	// range read unreadable.
+	for name, value := range m.Meta {
+		header[name] = []string{value}
+	}
 	header.Set("Accept-Ranges", "bytes")
 	header.Set("Content-Length", strconv.FormatInt(length, 10))
 	if m.ContentType != "" {
@@ -197,6 +467,189 @@ func (h *handler) unsupported(w http.ResponseWriter, r *http.Request) {
 // etag is the ETag header's value: quoted, as clients compare it verbatim
 // including the quotes.
 func etag(m object.Manifest) string { return `"` + m.ETag + `"` }
+
+// validators writes the two headers a conditional request is answered against, so
+// that a 304 carries the same pair a 200 would and the client's next request can
+// use them.
+func validators(header http.Header, m object.Manifest) {
+	header.Set("ETag", etag(m))
+	header.Set("Last-Modified", m.Modified.Format(http.TimeFormat))
+}
+
+// precondition evaluates the conditional headers on a read against the committed
+// manifest, returning the status to answer with and whether the read may proceed.
+//
+// Answered from metadata alone, which is what makes it worth having: a client that
+// already holds the object pays one etcd read instead of the object's bytes, and
+// `aws s3 sync` asks this of every file it considers.
+//
+// The precedence is HTTP's, which S3 follows: an entity tag is a better answer than
+// a date, so If-Match beats If-Unmodified-Since and If-None-Match beats
+// If-Modified-Since. A failed If-Match is 412 because the client's assumption about
+// what it was reading is wrong; a matched If-None-Match is 304 because the client's
+// copy is current.
+func precondition(header http.Header, m object.Manifest) (int, bool) {
+	tag := etag(m)
+	if want := header.Get("If-Match"); want != "" {
+		if !matchesTag(want, tag) {
+			return http.StatusPreconditionFailed, false
+		}
+	} else if since, ok := httpDate(header.Get("If-Unmodified-Since")); ok && modified(m).After(since) {
+		return http.StatusPreconditionFailed, false
+	}
+
+	if want := header.Get("If-None-Match"); want != "" {
+		if matchesTag(want, tag) {
+			return http.StatusNotModified, false
+		}
+	} else if since, ok := httpDate(header.Get("If-Modified-Since")); ok && !modified(m).After(since) {
+		return http.StatusNotModified, false
+	}
+	return http.StatusOK, true
+}
+
+// passthrough are the standard headers a write stores and a read replays. They
+// describe the bytes rather than the transfer, which is what makes them the
+// object's business and not this request's: Content-Length and Content-MD5 are
+// about one HTTP exchange, and storing them would answer a later reader with facts
+// about an exchange that is over.
+var passthrough = []string{
+	"Cache-Control",
+	"Content-Disposition",
+	"Content-Encoding",
+	"Content-Language",
+	"Expires",
+}
+
+// MaxMeta bounds what one object can carry, as S3 does. Unbounded metadata is
+// unbounded manifests, and a manifest is read by every request for the object and
+// by every background pass over it.
+const MaxMeta = 2 << 10
+
+// storedMeta collects what the object should carry: the client's x-amz-meta-*, and
+// the passthrough headers above, in canonical HTTP form.
+func storedMeta(header http.Header) (map[string]string, error) {
+	var stored map[string]string
+	size := 0
+	keep := func(name, value string) {
+		if stored == nil {
+			stored = make(map[string]string)
+		}
+		stored[name] = value
+		size += len(name) + len(value)
+	}
+	for name, values := range header {
+		if strings.HasPrefix(name, "X-Amz-Meta-") && len(values) > 0 {
+			// Lowercased, which is what S3 does and what clients compare
+			// against: botocore hands the caller whatever case the response
+			// used, so "Colour" and "colour" are different keys to the code on
+			// the other end. Go canonicalises header names on the way in, so
+			// without this every key comes back capitalised.
+			keep(strings.ToLower(name), values[0])
+		}
+	}
+	for _, name := range passthrough {
+		if value := header.Get(name); value != "" {
+			if name == "Content-Encoding" {
+				// aws-chunked is the framing of the body that just arrived, and
+				// kavo decoded it. Keeping it would tell a later reader the
+				// stored bytes are chunk-framed, which they are not.
+				if value = withoutAWSChunked(value); value == "" {
+					continue
+				}
+			}
+			keep(name, value)
+		}
+	}
+	if size > MaxMeta {
+		return nil, fmt.Errorf("%d bytes of metadata, at most %d", size, MaxMeta)
+	}
+	return stored, nil
+}
+
+func withoutAWSChunked(encoding string) string {
+	kept := make([]string, 0, 2)
+	for part := range strings.SplitSeq(encoding, ",") {
+		if part = strings.TrimSpace(part); part != "" && !strings.EqualFold(part, "aws-chunked") {
+			kept = append(kept, part)
+		}
+	}
+	return strings.Join(kept, ", ")
+}
+
+// copyConditions translates the x-amz-copy-source-if-* headers into the plain
+// conditional ones, so that a copy's conditions are evaluated by the rules above
+// rather than by a second implementation of them that drifts from the first.
+func copyConditions(header http.Header) http.Header {
+	var conditions http.Header
+	for _, name := range []string{"If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since"} {
+		value := header.Get("X-Amz-Copy-Source-" + name)
+		if value == "" {
+			continue
+		}
+		if conditions == nil {
+			conditions = http.Header{}
+		}
+		conditions.Set(name, value)
+	}
+	return conditions
+}
+
+// matchesTag reports whether a list of entity tags contains one, with "*" meaning
+// any. Weak tags are compared as strings: kavo only ever issues strong ones, so a
+// W/-prefixed tag in a request simply matches nothing.
+func matchesTag(header, tag string) bool {
+	for candidate := range strings.SplitSeq(header, ",") {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "*" || candidate == tag {
+			return true
+		}
+	}
+	return false
+}
+
+// modified is the object's Last-Modified as a client can see it. Truncated to the
+// second, because that is the resolution the header has: comparing the stored
+// nanoseconds against a date parsed from it would make an object appear modified
+// after the very timestamp it reported.
+func modified(m object.Manifest) time.Time { return m.Modified.Truncate(time.Second) }
+
+// httpDate parses one of the date-based conditional headers. An unparseable date is
+// ignored rather than rejected, which is what the HTTP spec requires.
+func httpDate(header string) (time.Time, bool) {
+	if header == "" {
+		return time.Time{}, false
+	}
+	t, err := http.ParseTime(header)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+// contentMD5 turns the Content-MD5 header into the hex digest the write path
+// computes as it streams, so the comparison is against the object's own ETag.
+//
+// S3 defines the header as exactly a base64-encoded 128-bit digest, and anything
+// else is InvalidDigest rather than a mismatch: the difference matters to a client,
+// which should retry one and fix the other.
+func contentMD5(values []string) (string, error) {
+	// Presence rather than emptiness, because the two mean different things: no
+	// header declares nothing, and an empty header declares an empty digest, which
+	// is malformed. It falls through to the length check below and is refused.
+	if len(values) == 0 {
+		return "", nil
+	}
+	header := values[0]
+	sum, err := base64.StdEncoding.DecodeString(header)
+	if err != nil {
+		return "", fmt.Errorf("s3: Content-MD5 %q is not base64: %w", header, err)
+	}
+	if len(sum) != md5.Size {
+		return "", fmt.Errorf("s3: Content-MD5 %q decodes to %d bytes, want %d", header, len(sum), md5.Size)
+	}
+	return hex.EncodeToString(sum), nil
+}
 
 // parseRange reads a Range header and returns the window it asks for, defaulting
 // to the whole object.

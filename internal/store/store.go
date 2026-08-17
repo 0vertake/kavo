@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 var (
@@ -225,13 +226,87 @@ func (s *Store) HasChunk(id string) (bool, error) {
 	return true, nil
 }
 
+// ChunkInfo is what a sweep can learn about a chunk without opening it: which
+// chunk it is, how much space it occupies, and when it was last written.
+//
+// The time is the load-bearing field. A chunk is durable before the manifest that
+// references it is committed, so at any moment some of what is on disk is
+// referenced by nothing and about to be — and telling that apart from real garbage
+// is a question about age and nothing else.
+type ChunkInfo struct {
+	ID       string
+	Size     int64
+	Modified time.Time
+}
+
+// ScanChunks visits every chunk on this node whose id begins with prefix, which
+// is how a caller sweeps the disk a slice at a time instead of holding a set of
+// every chunk id it holds.
+//
+// Chunks live in one directory per two-character id prefix, so a one-character
+// prefix reads a thirty-second of them and a two-character prefix reads one
+// directory. A caller that wants everything passes "".
+func (s *Store) ScanChunks(prefix string, visit func(ChunkInfo) error) error {
+	dirs, err := os.ReadDir(s.chunksDir)
+	if err != nil {
+		return fmt.Errorf("store: list chunk directories: %w", err)
+	}
+	for _, dir := range dirs {
+		if !dir.IsDir() || !within(dir.Name(), prefix) {
+			continue
+		}
+		path := filepath.Join(s.chunksDir, dir.Name())
+		files, err := os.ReadDir(path)
+		if err != nil {
+			// A directory that vanished mid-scan is a directory that had nothing
+			// left in it, which is not a reason to abandon the rest.
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("store: list chunks in %s: %w", dir.Name(), err)
+		}
+		for _, f := range files {
+			if f.IsDir() || !strings.HasPrefix(f.Name(), prefix) {
+				continue
+			}
+			info, err := f.Info()
+			if err != nil {
+				// Gone since the directory was read: a chunk being replaced by a
+				// repair, or one another pass has already collected.
+				if errors.Is(err, os.ErrNotExist) {
+					continue
+				}
+				return fmt.Errorf("store: stat chunk %s: %w", f.Name(), err)
+			}
+			if err := visit(ChunkInfo{
+				ID:       f.Name(),
+				Size:     info.Size(),
+				Modified: info.ModTime(),
+			}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// within reports whether a two-character chunk directory can hold ids beginning
+// with prefix.
+func within(dir, prefix string) bool {
+	if len(prefix) > len(dir) {
+		return strings.HasPrefix(prefix, dir)
+	}
+	return strings.HasPrefix(dir, prefix)
+}
+
 // RemoveChunk deletes this node's copy of a chunk, reporting success if it was
 // already gone.
 //
 // Only for a chunk no manifest points at any more: after a rebalance has placed
-// it elsewhere and committed the manifest that says so. Deleting a chunk a
-// manifest still references is how an acknowledged write is lost, which is why
-// nothing on the read or repair paths calls this.
+// it elsewhere and committed the manifest that says so, or after a garbage
+// collection pass has read every manifest in the cluster and found none that
+// names it. Deleting a chunk a manifest still references is how an acknowledged
+// write is lost, which is why nothing on the read or repair paths calls this.
 func (s *Store) RemoveChunk(id string) error {
 	if err := validateID(id); err != nil {
 		return err

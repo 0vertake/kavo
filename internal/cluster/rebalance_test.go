@@ -123,9 +123,14 @@ func TestDataFollowsOwnershipWhenANodeJoins(t *testing.T) {
 }
 
 // Moving an object must not cost it its old copies before the new ones are
-// committed, and must not leave them afterwards: a rebalance that only copies
-// would double the cluster's disk use every time a node joins.
-func TestMovedObjectLeavesNothingBehind(t *testing.T) {
+// committed, and must not leave them for good afterwards: a rebalance that only
+// ever copied would double the cluster's disk use every time a node joins.
+//
+// The move itself no longer deletes anything — a copied object shares its source's
+// chunks, so no pass may delete one on the strength of the single manifest in front
+// of it. Collection is what takes the superseded copies, so the collection is part
+// of what this test asserts rather than a detail behind it.
+func TestMovedObjectLeavesNothingBehindOnceCollected(t *testing.T) {
 	tc := newCluster(t, 5)
 	// A join rather than a departure, because a departure leaves the stale copy
 	// on a node that is gone and cannot be told to drop it. A join is what makes
@@ -137,6 +142,7 @@ func TestMovedObjectLeavesNothingBehind(t *testing.T) {
 
 	tc.tellEveryone(tc.without())
 	mustRebalance(t, tc.nodes[m.Nodes[0]], 0)
+	collectEverywhere(t, tc, 0)
 
 	after, err := tc.nodes[m.Nodes[0]].c.Resolve(context.Background(), key)
 	if err != nil {
@@ -239,10 +245,6 @@ func TestAClientOverwriteBeatsARebalance(t *testing.T) {
 	if st.Moved != 0 || st.Raced != 1 {
 		t.Errorf("raced pass moved %d and raced %d, want 0 and 1", st.Moved, st.Raced)
 	}
-	if st.Dropped != 0 {
-		t.Errorf("pass deleted %d copies although its commit was refused; nothing may be deleted before the commit succeeds", st.Dropped)
-	}
-
 	// The client's object is intact, manifest and chunks both.
 	after, err := owner.c.Resolve(context.Background(), key)
 	if err != nil {
@@ -291,12 +293,11 @@ func TestRebalanceMovesNothingWhenPlacementIsCorrect(t *testing.T) {
 		total.Objects += st.Objects
 		total.Misplaced += st.Misplaced
 		total.Copies += st.Copies
-		total.Dropped += st.Dropped
 	}
 	if total.Objects != 4 {
 		t.Errorf("nodes between them checked %d objects, want each of the 4 checked once", total.Objects)
 	}
-	if total.Misplaced != 0 || total.Copies != 0 || total.Dropped != 0 {
+	if total.Misplaced != 0 || total.Copies != 0 {
 		t.Errorf("a healthy cluster moved data: %+v", total)
 	}
 }
@@ -375,4 +376,54 @@ func ownersOf(t testing.TB, tc *testCluster, key string, width int) []string {
 		ids[i] = n.id
 	}
 	return ids
+}
+
+// Redundancy has to come back for an object that never had it, not only for one
+// that lost it. A write is acknowledged at W copies, so a coordinator seeing two of
+// five nodes places on two and is right to accept it — but nothing afterwards was
+// widening that manifest to N, and the object sat one copy short of its
+// configuration forever. Nothing noticed, either: every check in this codebase asks
+// whether the copies a manifest names exist, and two of two is a full house.
+//
+// Repair cannot fix it, by design: it refuses to put a copy anywhere the manifest
+// does not already name, because that is rewriting placement. So this is
+// rebalancing's job, and the difference from the tests above is the direction —
+// they replace an owner, this one adds a third.
+func TestAWriteMadeOnASmallerRingIsWidenedBackToN(t *testing.T) {
+	tc := newCluster(t, 5)
+	const key = "written/while/most/of/the/cluster/was/away"
+
+	// Two members is the narrowest ring that can still take a write, since a
+	// coordinator that cannot reach W nodes refuses it outright.
+	tc.tellEveryone(tc.without("n3", "n4", "n5"))
+	data := randBytes(2 * testChunkSize)
+	m := mustPut(t, tc.nodes["n1"], key, data)
+	if len(m.Nodes) != cluster.DefaultWriteQuorum {
+		t.Fatalf("the write named %v; this test needs a placement narrower than N", m.Nodes)
+	}
+
+	tc.tellEveryone(tc.without())
+	want := ownersOf(t, tc, key, cluster.Replicas)
+	if st := mustRebalance(t, tc.nodes[want[0]], 0); st.Moved != 1 {
+		t.Fatalf("rebalance moved %d objects, want 1", st.Moved)
+	}
+
+	after, err := tc.nodes[want[0]].c.Resolve(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(after.Nodes, want) {
+		t.Fatalf("object still names %v, want N owners %v", after.Nodes, want)
+	}
+	// Named is not held: the manifest promising three copies is worth nothing if
+	// the third was never sent, and a read from that owner is how it is worth
+	// something.
+	for _, id := range after.Nodes {
+		if held := tc.nodes[id].holds(t, after.Chunks[0].ID); len(held) != 1 {
+			t.Errorf("owner %s names the object but does not hold its chunks", id)
+		}
+		if got := mustGet(t, tc.nodes[id], key); !bytes.Equal(got, data) {
+			t.Errorf("%s cannot serve the widened object", id)
+		}
+	}
 }

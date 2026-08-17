@@ -16,7 +16,7 @@ claim without a failure injected is a wish.
 
 | | proven by |
 | --- | --- |
-| **No acknowledged write is ever lost.** | The chaos suite (`TestChaos`) records every ack and re-reads all of them after killing, freezing and wiping nodes mid-flight. `TestCrashDuringConcurrentUploads` SIGKILLs a node under concurrent uploads and re-reads every ack after it restarts. |
+| **No acknowledged write is ever lost.** | The chaos suite (`TestChaos`) records every ack and re-reads all of them after killing, freezing and wiping nodes mid-flight — including objects made by a server-side copy whose source was then deleted, and copies assembled out of ranges of the source while that source's owners were being killed, with the garbage collector turned up so that it is deleting chunks throughout. A 45-minute run acknowledged 51,623 writes, took 40 faults — the last wiping 40,274 chunks off a node — and re-read all 43,329 survivors byte-identical. `TestCrashDuringConcurrentUploads` SIGKILLs a node under concurrent uploads and re-reads every ack after it restarts. |
 | **No partially written object is ever readable.** | A write is acknowledged only once W chunk replicas are fsynced on distinct nodes *and* the manifest is committed to etcd. Readers resolve objects only through committed manifests, so a torn object has nothing to be read through. |
 | **Every read returns checksum-valid data or an explicit error.** | Every chunk is verified against the manifest's CRC32C on the way out, and the last byte of each chunk is withheld until that check passes — so a corrupt chunk becomes a transfer that stops short, never a successful wrong answer. The chaos suite flips bits on disk to check it. |
 | **After healing, redundancy is back to the configured level.** | Repair rebuilds missing copies against the ring; the chaos suite wipes a node's disk and then asserts every chunk is back on every owner it should be on. |
@@ -113,42 +113,79 @@ acknowledge one it cannot make durable.
 ## How compatible is compatible
 
 Ceph's `s3-tests` is the suite S3 implementations are measured against, and nobody here chose what it
-asserts. It has 886 tests and kavo does not implement most of what they cover, on purpose. Of the 641
-that fail: **429 are explicit anti-goals** — ACLs, versioning, server-side encryption, object lock,
-bucket policy, lifecycle, logging, CORS, tagging, SigV2, browser form uploads — **48 are v1
+asserts. It has 886 tests and kavo does not implement most of what they cover, on purpose. Of the 616
+that fail: **488 are explicit anti-goals** — ACLs, versioning, server-side encryption, object lock,
+bucket policy, lifecycle, logging, CORS, tagging, SigV2, browser form uploads — **47 are v1
 `ListObjects`**, which kavo answers only at v2, and **28 follow from buckets being prefixes** rather
-than records. **135 are named gaps**, half of them `CopyObject` and conditional requests. One is the
-suite asserting Ceph's own configured region name.
+than records. **24 are conditional writes**, which would make the commit a compare-and-set and so
+need arguing for rather than adding. **27 are named gaps**, led by non-MD5 checksum algorithms and
+reads of a single part. Two are artifacts of the suite's own environment.
 
-With that framing: **151 pass, 641 fail, 94 the suite skips, and nothing errors** — every test
+With that framing: **176 pass, 616 fail, 94 the suite skips, and nothing errors** — every test
 reaches a verdict rather than dying in setup, and every failure is accounted for in
 [`docs/s3-compatibility.md`](docs/s3-compatibility.md), which generates its breakdown from the
-suite's own output so it can be checked rather than believed. Of the tests covering `ListObjectsV2`,
-the operation kavo does claim, 37 of 40 pass.
+suite's own output so it can be checked rather than believed. Of the tests covering the operations
+kavo does claim, 37 of 40 `ListObjectsV2` tests pass, 15 of 23 single-object copy, 6 of 7
+server-side copies of a multipart-sized object, 14 of 25 multipart, 12 of 12 conditional reads, and
+6 of 7 user metadata.
 
-Running it was worth more than the number, twice over. It found four real defects, three of which
-kavo's own tests could not see — including a listing that reported itself truncated when it had ended
-exactly on a page boundary, which the in-repo test missed because it used three keys and a page size
-of two. And it started at 169: eighteen of those passes came from answering `PUT ?lifecycle`,
-`?policy` and `?encryption` with a 200, so kavo was passing by claiming to have configured things
-that exist nowhere in the code. Refusing them cost eighteen tests and is the right answer.
+The pass count has gone down three times on purpose, and those moves are the most useful thing the
+suite produced. It started at 169, of which eighteen came from answering `PUT ?lifecycle`, `?policy`
+and `?encryption` with a 200 — kavo was passing by claiming to have configured things that exist
+nowhere in the code. Later it reached 196, and twenty-two of those were requests for server-side
+encryption that kavo *ignored*: a client sending a customer key was told its object was stored, which
+it was, in plaintext that anyone could read back without the key. Both sets are refused now. The third move is the one to read: an object's
+subresources are a query on the object's own path, so `PUT /key?tagging` reached the handler that
+writes an object and **replaced the object with the tagging XML**, `PUT /key?acl` truncated it to
+nothing, and `DELETE /key?tagging` deleted it — each answered 200, so a client tagging an object
+destroyed it and was told the tag was set. Eight passes were tests doing precisely that, and 169 was
+the honest number — landing exactly where the measurement had started, which is a coincidence worth
+distrusting, since the same count covered `CopyObject`, conditional reads, `Content-MD5`, user
+metadata and three multipart calls that did not exist at the outset. Implementing `UploadPartCopy`
+then took it to 176. A pass count rewards a store for answering; only reading the failures tells you what
+it answered with.
+
+That last one the suite did not find, and neither did kavo's own tests. It is also what led to the
+copy path being finished: `UploadPartCopy` now works, so a server-side copy of an object above the
+CLI's 8 MB threshold streams inside the cluster instead of failing, and a read of an object's tags
+is answered with none — true here — while asking for tags to exist is refused, which is the pair
+that keeps either answer honest. Ten tagging tests were
+failing already, filed under an anti-goal, which is the easiest kind of failure to stop reading.
+What found it was `aws s3 cp` of a 20 MB object between two keys: past 8 MB the CLI copies by
+multipart, and the first call it makes is `GetObjectTagging`. Every guarantee here had been tested
+with the real CLI on the near side of that threshold.
+
+Running the suite found four real defects too, three of which kavo's own tests could not see —
+including a listing that reported itself truncated when it had ended exactly on a page boundary, and
+metadata keys replayed as `X-Amz-Meta-Colour` where S3 sends `x-amz-meta-colour`. That one was
+invisible in-repo because kavo's tests use the AWS Go SDK, which lowercases those keys before handing
+them over; botocore does not, and seven tests died on it.
 
 ## What it does not do
 
 Deliberate anti-goals, not a roadmap: no IAM, no ACLs, no versioning, no lifecycle rules, no
 bucket policies, no `ListObjects` v1. The S3 subset is PUT, GET (including ranges), HEAD, DELETE,
-`ListObjectsV2` and multipart upload, with SigV4 verification — plus the handful of calls clients
-make without being asked, which answer for records that do not exist: `CreateBucket` succeeds
-because a bucket is a prefix, `ListBuckets` is a root listing, `DeleteBucket` refuses while objects
-remain, and `ListObjectVersions` reports every object once as version `null`.
+`ListObjectsV2`, multipart upload (including `UploadPartCopy`, which is how a client copies an object
+too large to copy in one call) and `CopyObject`, with SigV4 verification, conditional reads,
+`Content-MD5` verification and `x-amz-meta-*` passthrough — plus the handful of calls clients make
+without being asked, which answer for records that do not exist: `CreateBucket` succeeds because a
+bucket is a prefix, `ListBuckets` is a root listing, `DeleteBucket` refuses while objects remain, and
+`ListObjectVersions` reports every object once as version `null`.
+
+A request kavo cannot honour is refused rather than ignored, which is a rule and not a habit: asking
+for server-side encryption gets a 501 saying so, because storing the object in plaintext and
+answering 200 tells a client its data is encrypted when it is readable by anyone. Asking for tags
+gets the same treatment, while *reading* an object's tags is answered with none — which is true, and
+only stays true because the write is refused rather than dropped.
 
 The gaps a client might actually notice are named in
-[`docs/s3-compatibility.md`](docs/s3-compatibility.md) rather than buried: no `CopyObject` (so no
-server-side `aws s3 mv`), no conditional requests, no `Content-MD5` verification, no
-`x-amz-meta-*` passthrough.
+[`docs/s3-compatibility.md`](docs/s3-compatibility.md) rather than buried: no checksum algorithms
+other than MD5, no reads of a single part, and the wrong error code for a malformed authorization
+header.
 
-Real limitations — leaked chunks with no GC pass yet, an etcd-bound object count, rot that can sit
-until the next scrub — are listed with their consequences in
+Real limitations — an etcd-bound object count, rot that can sit until the next scrub, deleted space
+that takes about half an hour to come back because collection is the only thing that deletes a
+chunk — are listed with their consequences in
 [`docs/design.md`](docs/design.md#known-limitations-publish-these). They are published rather than
 fixed because a known limit is cheaper than a surprise.
 
@@ -158,7 +195,7 @@ fixed because a known limit is cheaper than a surprise.
 cmd/kavod        the single binary: S3 gateway + chunk store + repair participant
 internal/s3      the S3 API: objects, ranges, listing, multipart
 internal/sigv4   SigV4 verification, checked against the AWS SDK's own signer
-internal/cluster placement, quorum, erasure coding, repair, scrub, rebalance
+internal/cluster placement, quorum, erasure coding, repair, scrub, rebalance, collection
 internal/ring    the consistent-hash ring: partitions, vnodes, owners
 internal/object  chunking and streaming reassembly
 internal/store   the local chunk store and its commit discipline
@@ -170,5 +207,7 @@ test             crash-safety harness, aws CLI tests, and the chaos suite
 ```
 
 `make test` runs everything with `-race` (it starts etcd itself). `make bench` reproduces the
-numbers above. Architecture and milestones: [`docs/design.md`](docs/design.md). Research notes with
+numbers above. `make demo` is the shortest way to see the point of it: six nodes on this host, an
+object, `SIGKILL` to one of the nodes holding it, and three copies again a second or two later —
+with every step checked rather than narrated. Architecture and milestones: [`docs/design.md`](docs/design.md). Research notes with
 sources: [`docs/research.md`](docs/research.md).

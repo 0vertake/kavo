@@ -19,15 +19,20 @@ package test
 //   - memory stays flat regardless of object size — measured on the node's own
 //     RSS, at a size no buffer could hide (milestone 1, at 1000x the size its
 //     unit test uses)
+//
+// Two more, for the mode the microbenchmarks already compare: heal by decode
+// rather than replica fetch, and the same RSS pair against a 4+2 object.
 
 import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/xml"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -213,6 +218,18 @@ func copiesHeld(nodes []*node) (perNode map[string]int, total int) {
 	return perNode, total
 }
 
+func bytesHeld(n *node) int64 {
+	var sum int64
+	for _, f := range n.chunkFiles() {
+		st, err := os.Stat(f)
+		if err != nil {
+			continue
+		}
+		sum += st.Size()
+	}
+	return sum
+}
+
 // Milestone 6's number. A node loses its entire disk while the cluster keeps
 // running, and nobody asks for a repair: this reports how long redundancy takes
 // to come back, and how much had to move to get there.
@@ -261,7 +278,7 @@ func TestMeasureHealTime(t *testing.T) {
 			victim.loseChunks()
 			var elapsed time.Duration
 			for {
-				if holes, settled := missingCopies(t.Context(), byID, store, len(nodes)); settled && len(holes) == 0 {
+				if holes, _, settled := missingCopies(t.Context(), byID, store, len(nodes)); settled && len(holes) == 0 {
 					elapsed = time.Since(start)
 					break
 				}
@@ -280,6 +297,59 @@ func TestMeasureHealTime(t *testing.T) {
 	}
 }
 
+// The same wipe, against a 4+2 cluster: repair rebuilds the missing shards by
+// decoding their siblings rather than fetching a replica. That is a different
+// cost — k sources per shard instead of one — and the number the replicated
+// measurement cannot speak for.
+func TestMeasureHealTimeCoded(t *testing.T) {
+	skipUnlessMeasuring(t)
+	defer withRepairRate("0")()
+
+	bin := buildKavod(t)
+	prefix := clusterPrefix()
+	nodes := startClusterCoded(t, bin, prefix, measureChunkSize, measureCluster, "4+2")
+	store, err := meta.Open([]string{meta.EndpointFromEnv()}, prefix)
+	if err != nil {
+		t.Fatalf("meta.Open: %v", err)
+	}
+	defer store.Close()
+
+	objects := writeObjects(t, nodes[0], *measureData, measureChunkSize)
+	before, totalShards := copiesHeld(nodes)
+
+	victim := nodes[len(nodes)-1]
+	lost := before[victim.id]
+	if lost == 0 {
+		t.Fatalf("%s holds no shards, so there is nothing to heal", victim.id)
+	}
+	lostBytes := bytesHeld(victim)
+
+	byID := make(map[string]*node, len(nodes))
+	for _, n := range nodes {
+		byID[n.id] = n
+	}
+
+	start := time.Now()
+	victim.loseChunks()
+	var elapsed time.Duration
+	for {
+		if holes, _, settled := missingCopies(t.Context(), byID, store, len(nodes)); settled && len(holes) == 0 {
+			elapsed = time.Since(start)
+			break
+		}
+		if time.Since(start) > 10*time.Minute {
+			t.Fatal("redundancy did not come back within 10 minutes")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	t.Logf("%d objects, %d shards over %d nodes; %s lost %d shards (%s)",
+		objects, totalShards, len(nodes), victim.id, lost, bytesOf(lostBytes))
+	t.Logf("redundancy restored in %v by decode (%s of shards rebuilt, %s effective)",
+		elapsed.Round(10*time.Millisecond), bytesOf(lostBytes),
+		rateOf(lostBytes, elapsed))
+}
+
 // Milestone 8's numbers. A seventh node joins a cluster that already holds data:
 // this reports what fraction of the copies move onto it, how long the cluster
 // takes to converge, and whether the nodes that gave data up let go of it.
@@ -289,6 +359,13 @@ func TestMeasureHealTime(t *testing.T) {
 // hashing keys modulo the node count would move most of the data.
 func TestMeasureRebalanceOnJoin(t *testing.T) {
 	skipUnlessMeasuring(t)
+
+	// A move leaves the copies it superseded for collection, so how long the cluster
+	// pays for two placements of the data that moved is part of what a join costs.
+	// Measuring that inside a run means turning the collector up; the shipped grace is
+	// an hour, which is longer than this measurement. Nothing is written after the
+	// join, so a ten-second grace cannot reach a write in flight.
+	defer withCollect("1s", "10s")()
 
 	bin := buildKavod(t)
 	prefix := clusterPrefix()
@@ -321,17 +398,16 @@ func TestMeasureRebalanceOnJoin(t *testing.T) {
 	// has stood still for three seconds.
 	//
 	// Deliberately not part of that definition: the total copy count returning to
-	// what it was. It usually does, and once in three runs it did not — three
-	// copies of 192 outlived the move by minutes. Nothing is lost or unreadable
-	// when that happens, and redundancy is above target rather than below it, so
-	// it is a garbage collection gap and not a durability one — the same chunk
-	// garbage collection `docs/design.md` defers. It is reported below as a
-	// number instead of failing a measurement on a rare race.
+	// what it was. It cannot have, at this point. A move copies to the new owners and
+	// commits, and stops there — nothing but the collection pass deletes a chunk, since
+	// a copied object shares its source's chunks. So the cluster holds two placements
+	// of everything that moved until a sweep comes past, and how long that takes is
+	// measured separately below.
 	var converged time.Duration
 	var moved int
 	stableSince := time.Time{}
 	for {
-		holes, settled := missingCopies(t.Context(), byID, store, len(grown))
+		holes, _, settled := missingCopies(t.Context(), byID, store, len(grown))
 		perNode, _ := copiesHeld(grown)
 		switch {
 		case !settled || len(holes) > 0 || perNode[joiner.id] != moved:
@@ -382,12 +458,40 @@ func TestMeasureRebalanceOnJoin(t *testing.T) {
 	}
 	_, after := copiesHeld(grown)
 
+	// Now wait for the residue to go, which is the other half of what a join costs:
+	// the space is committed to the old placement until a sweep reaches the slices
+	// those chunks are in.
+	reclaimStart := time.Now()
+	var reclaimed time.Duration
+	var left int
+	for {
+		extra, err := misplaced(t.Context(), grown, store)
+		if err != nil {
+			t.Fatal(err)
+		}
+		left = 0
+		for _, ids := range extra {
+			left += len(ids)
+		}
+		if left == 0 {
+			reclaimed = time.Since(reclaimStart)
+			break
+		}
+		if time.Since(reclaimStart) > 5*time.Minute {
+			t.Fatalf("%d copies no manifest names were still on disk five minutes after the move", left)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
 	t.Logf("%d objects, %d chunk copies over %d nodes before the join", objects, before, len(nodes))
 	t.Logf("%s joined: seen by every node in %v, converged in %v",
 		joiner.id, detected.Round(10*time.Millisecond), converged.Round(10*time.Millisecond))
 	t.Logf("%d of %d copies moved onto it (%.1f%%), and the seven-node ring owes it %d",
 		moved, before, 100*float64(moved)/float64(before), owed)
-	t.Logf("%d copies after against %d before; %d held that no manifest names", after, before, residue)
+	t.Logf("%d copies once the move committed against %d before, %d of them named by no manifest",
+		after, before, residue)
+	t.Logf("collection reclaimed all %d in %v after the move, at a 1s interval and a 10s grace",
+		residue, reclaimed.Round(100*time.Millisecond))
 }
 
 // Milestone 1's claim at a size that cannot be explained away: an object far
@@ -426,6 +530,42 @@ func TestMeasureStreamingALargeObject(t *testing.T) {
 
 			peak, which := watcher.close()
 			t.Logf("PUT %s in %v (%s), GET in %v (%s)",
+				bytesOf(size), put.Round(time.Millisecond), rateOf(size, put),
+				get.Round(time.Millisecond), rateOf(size, get))
+			t.Logf("peak RSS %s on %s, %s over idle, %.1f%% of the object",
+				bytesOf(peak), which, bytesOf(peak-idle), 100*float64(peak)/float64(size))
+		})
+	}
+}
+
+// The same pair of sizes, stored 4+2. A coded read holds a chunk's shards and the
+// reconstructed chunk before any of it is valid, which is why a 64 MB GET
+// allocates 168 MB in the microbenchmark. This is whether that shows up in the
+// process at gigabyte scale, or whether it still stays chunk-shaped.
+func TestMeasureStreamingACodedObject(t *testing.T) {
+	skipUnlessMeasuring(t)
+
+	bin := buildKavod(t)
+	nodes := startClusterCoded(t, bin, clusterPrefix(), measureChunkSize, measureCluster, "4+2")
+
+	idle, _ := watchRSS(nodes).close()
+	t.Logf("idle RSS, highest of %d nodes: %s", len(nodes), bytesOf(idle))
+
+	for _, size := range []int64{64 << 20, *measureObject} {
+		t.Run(bytesOf(size), func(t *testing.T) {
+			key := "measure/coded-" + bytesOf(size)
+			watcher := watchRSS(nodes)
+
+			start := time.Now()
+			putSigned(t, nodes[0], key, size)
+			put := time.Since(start)
+
+			start = time.Now()
+			getSigned(t, nodes[0], key, size)
+			get := time.Since(start)
+
+			peak, which := watcher.close()
+			t.Logf("PUT %s encoded 4+2 in %v (%s), GET in %v (%s)",
 				bytesOf(size), put.Round(time.Millisecond), rateOf(size, put),
 				get.Round(time.Millisecond), rateOf(size, get))
 			t.Logf("peak RSS %s on %s, %s over idle, %.1f%% of the object",
@@ -573,4 +713,166 @@ func misplaced(ctx context.Context, nodes []*node, store *meta.Store) (map[strin
 		}
 	}
 	return extra, nil
+}
+
+// copyPartSize is what a client picks for a large copy: big enough that a
+// multi-gigabyte object is a handful of calls, and far larger than the chunk size,
+// so a part is re-chunked rather than mapped one-to-one.
+const copyPartSize = 256 << 20
+
+// What a server-side copy costs, which is the question UploadPartCopy exists to
+// answer and the one the S3 surface cannot answer on its own.
+//
+// Three numbers, one object:
+//
+//   - CopyObject copies a manifest, so it moves no bytes and takes about as long as
+//     an etcd write. The point of measuring it at gigabyte scale is that the number
+//     does not change with the size.
+//   - a multipart copy does move the bytes, inside the cluster, through the
+//     ordinary write path. That is what a client above 8 MB gets, so its rate and
+//     its memory are the honest cost of the feature — and the memory is a claim:
+//     the part is streamed, so a 256 MB part must not appear in a node's RSS.
+//   - the round trip a client would make without it, out to the client and back.
+//     The saving is the difference, and it is the argument for the feature.
+func TestMeasureCopyingALargeObject(t *testing.T) {
+	skipUnlessMeasuring(t)
+
+	bin := buildKavod(t)
+	nodes := startCluster(t, bin, clusterPrefix(), measureChunkSize, measureCluster)
+
+	idle, _ := watchRSS(nodes).close()
+	t.Logf("idle RSS, highest of %d nodes: %s", len(nodes), bytesOf(idle))
+
+	size := *measureObject
+	const source = "copy/source"
+	putSigned(t, nodes[0], source, size)
+	t.Logf("source object: %s", bytesOf(size))
+
+	t.Run("CopyObject", func(t *testing.T) {
+		start := time.Now()
+		status, body := s3Do(t, nodes[0], http.MethodPut, "copy/whole", nil,
+			map[string]string{"X-Amz-Copy-Source": "measure/" + source})
+		took := time.Since(start)
+		if status != http.StatusOK {
+			t.Fatalf("CopyObject: status %d: %s", status, body)
+		}
+		// Read it back, or "instant" would only prove the request returned.
+		getSigned(t, nodes[1], "copy/whole", size)
+		t.Logf("copied %s in %v by copying the manifest, moving no bytes",
+			bytesOf(size), took.Round(time.Millisecond))
+	})
+
+	t.Run("UploadPartCopy", func(t *testing.T) {
+		watcher := watchRSS(nodes)
+		const dest = "copy/assembled"
+
+		start := time.Now()
+		id := createUpload(t, nodes[0], dest)
+		var parts []completedPart
+		for off, number := int64(0), 1; off < size; number++ {
+			end := min(off+copyPartSize, size) - 1
+			etag := copyPartRange(t, nodes[number%len(nodes)], dest, id, number,
+				"measure/"+source, fmt.Sprintf("bytes=%d-%d", off, end))
+			parts = append(parts, completedPart{PartNumber: number, ETag: etag})
+			off = end + 1
+		}
+		completeUpload(t, nodes[0], dest, id, parts)
+		took := time.Since(start)
+
+		getSigned(t, nodes[1], dest, size)
+		peak, which := watcher.close()
+		t.Logf("copied %s as %d parts of %s in %v (%s)",
+			bytesOf(size), len(parts), bytesOf(copyPartSize), took.Round(time.Millisecond), rateOf(size, took))
+		t.Logf("peak RSS %s on %s, %s over idle: %.1f%% of a part, %.1f%% of the object",
+			bytesOf(peak), which, bytesOf(peak-idle),
+			100*float64(peak-idle)/float64(copyPartSize), 100*float64(peak-idle)/float64(size))
+	})
+
+	t.Run("client round trip", func(t *testing.T) {
+		// What the same copy costs a client that has to fetch the object and send
+		// it back. Sequential, so this is an upper bound: a client piping one into
+		// the other overlaps them, at best halving it. Either way the bytes cross
+		// the client's link twice, which is the part a server-side copy removes.
+		start := time.Now()
+		getSigned(t, nodes[0], source, size)
+		down := time.Since(start)
+		start = time.Now()
+		putSigned(t, nodes[0], "copy/reuploaded", size)
+		up := time.Since(start)
+		t.Logf("out and back: %v down (%s) + %v up (%s) = %v of client traffic for the same copy",
+			down.Round(time.Millisecond), rateOf(size, down),
+			up.Round(time.Millisecond), rateOf(size, up),
+			(down + up).Round(time.Millisecond))
+	})
+}
+
+// s3Do signs and sends a request whose body is small enough to hash, which is every
+// call in a multipart copy: the bytes being copied never pass through here.
+func s3Do(t *testing.T, n *node, method, key string, body []byte, headers map[string]string) (int, []byte) {
+	t.Helper()
+	sum := sha256.Sum256(body)
+	req, err := http.NewRequestWithContext(t.Context(), method,
+		"http://"+n.s3Addr+"/measure/"+key, strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	sign(t, req, hex.EncodeToString(sum[:]))
+
+	resp, err := (&http.Client{Timeout: time.Hour}).Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, key, err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	return resp.StatusCode, out
+}
+
+type completedPart struct {
+	PartNumber int
+	ETag       string
+}
+
+func createUpload(t *testing.T, n *node, key string) string {
+	t.Helper()
+	status, body := s3Do(t, n, http.MethodPost, key+"?uploads", nil, nil)
+	if status != http.StatusOK {
+		t.Fatalf("CreateMultipartUpload: status %d: %s", status, body)
+	}
+	var out struct{ UploadId string }
+	if err := xml.Unmarshal(body, &out); err != nil {
+		t.Fatalf("CreateMultipartUpload body: %v: %s", err, body)
+	}
+	return out.UploadId
+}
+
+func copyPartRange(t *testing.T, n *node, key, id string, number int, source, byteRange string) string {
+	t.Helper()
+	status, body := s3Do(t, n, http.MethodPut,
+		fmt.Sprintf("%s?partNumber=%d&uploadId=%s", key, number, id), nil,
+		map[string]string{"X-Amz-Copy-Source": source, "X-Amz-Copy-Source-Range": byteRange})
+	if status != http.StatusOK {
+		t.Fatalf("UploadPartCopy %s: status %d: %s", byteRange, status, body)
+	}
+	var out struct{ ETag string }
+	if err := xml.Unmarshal(body, &out); err != nil {
+		t.Fatalf("UploadPartCopy body: %v: %s", err, body)
+	}
+	return out.ETag
+}
+
+func completeUpload(t *testing.T, n *node, key, id string, parts []completedPart) {
+	t.Helper()
+	var b strings.Builder
+	b.WriteString("<CompleteMultipartUpload>")
+	for _, p := range parts {
+		fmt.Fprintf(&b, "<Part><PartNumber>%d</PartNumber><ETag>%s</ETag></Part>", p.PartNumber, p.ETag)
+	}
+	b.WriteString("</CompleteMultipartUpload>")
+	status, body := s3Do(t, n, http.MethodPost, key+"?uploadId="+id, []byte(b.String()), nil)
+	if status != http.StatusOK {
+		t.Fatalf("CompleteMultipartUpload: status %d: %s", status, body)
+	}
 }
