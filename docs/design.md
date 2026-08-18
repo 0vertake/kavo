@@ -482,7 +482,7 @@ being asked to: `CreateBucket`, `ListBuckets`, `DeleteBucket`, `DeleteObjects`,
 `ListObjectVersions` and `GetBucketLocation`. Nothing else (no IAM/ACLs/versioning/lifecycle;
 anti-goal).
 
-Three things clients send as *headers* on those calls rather than as calls of their own, and all were
+Four things clients send as *headers* on those calls rather than as calls of their own, and all were
 added for the same reason the six were:
 
 - **Conditional reads.** `If-Match`, `If-None-Match`, `If-Modified-Since` and `If-Unmodified-Since`
@@ -510,6 +510,12 @@ added for the same reason the six were:
   client's bug and the other may be the network's. An *empty* `Content-MD5` is malformed rather than
   absent: the client said it was declaring a digest and then declared none, and reading that as "no
   digest was sent" would store the object under a promise nobody made.
+
+- **CRC32C.** The write already hashes the body to make the ETag; CRC32C (Castagnoli) is hashed
+  next to it. A client that names it — `x-amz-checksum-crc32c` on the request, or an aws-chunked
+  trailer — is compared before commit, and a mismatch stores nothing. A HEAD or GET that asks with
+  `x-amz-checksum-mode: ENABLED` gets the stored value back. SHA-256, CRC32, CRC64NVME, and a
+  checksum on a part or a copy are 501 rather than stored unread.
 
 - **User metadata and the headers that describe the bytes.** `x-amz-meta-*`, plus `Cache-Control`,
   `Content-Disposition`, `Content-Encoding`, `Content-Language` and `Expires`: stored with the
@@ -613,9 +619,9 @@ write, which is the only reason to have the operation at all: `aws s3 mv` is a c
 a copy that made the client download and re-upload would be slower than the client doing it itself.
 The copy keeps the source's placement rather than its own key's, so the ring considers it misplaced
 from the moment it exists and rebalancing moves it in the background; until then it is readable
-exactly where the source is. `UploadPartCopy` is not implemented — a range of a source object would
-have to be re-chunked at the range boundaries, and re-chunking is the one thing this copy never
-does.
+exactly where the source is. `UploadPartCopy` is the range form of this, and is under Multipart
+upload below: a client's part size does not land on chunk boundaries, so that path re-chunks
+through the ordinary write rather than handing over the source's references.
 
 ### Listing
 
@@ -886,13 +892,14 @@ implementation disagreeing is the only thing that catches a misreading.
   what was written, which the suite separates from every other failure and reports on its own.
 
   What it does not cover: a partition that isolates nodes from each other while leaving them
-  reachable by clients (SIGSTOP freezes a node from everyone at once), erasure-coded mode, and
-  anything that needs the page cache to disappear — see the fsync limitation below.
+  reachable by clients (SIGSTOP freezes a node from everyone at once), and anything that needs the
+  page cache to disappear — see the fsync limitation below. Erasure-coded mode is covered: CI runs
+  the same suite with `-chaos.ec=4+2` on every push, because the two modes fail differently.
 - **Benchmarks** (milestone 11): in-repo benchmarks cover both APIs, both redundancy modes, repair,
   scrub and listing — what they measured, what it changed, and what it deliberately did not, is in
-  `docs/benchmarks.md`. Still outstanding: MinIO `warp` for latency distributions (p50–p99.9) and
-  peak RSS while streaming, on 3–4 separate cloud VMs over a real network. Nothing measured on one
-  laptop with one disk is a headline number.
+  `docs/benchmarks.md`. MinIO `warp` is there too, as an outside client. Still outstanding: the
+  same numbers on separate machines over a real network. Nothing measured on one laptop with one
+  disk is a headline number.
 
 ## Known limitations (publish these)
 
@@ -996,8 +1003,8 @@ implementation disagreeing is the only thing that catches a misreading.
 10. Chaos suite in CI (invariants asserted under randomized faults; GitHub Actions runs it long
     on every push, which is where a fixed heal deadline was caught measuring the keyspace)
 11. Benchmarks + README (`docs/benchmarks.md`, including `warp` as an outside client and `make
-    measure` for the cluster-level numbers). Still outstanding: separate machines over a real
-    network, and a demo recording
+    measure` for the cluster-level numbers). `make demo` is the recorded kill-and-heal on this
+    host. Still outstanding: separate machines over a real network.
 
 Milestones 6, 7, 10 are where the project stops being a tutorial — never skip them for API
 surface.
