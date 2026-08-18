@@ -33,6 +33,14 @@ import (
 // at once.
 const MaxParts = 10000
 
+// UploadMaxAge is how long an unfinished multipart upload is left alone. After
+// this, the upload record is dropped and collection reclaims its chunks. S3
+// solves the same hole with a lifecycle rule, which is an anti-goal here, so the
+// age is a constant rather than a bucket configuration. Seven days is long enough
+// for a slow 5 GB upload and short enough that a client that walked away does not
+// keep its parts forever.
+const UploadMaxAge = 7 * 24 * time.Hour
+
 // ErrNoSuchPart reports that a completion named a part that was never uploaded.
 var ErrNoSuchPart = errors.New("cluster: no such part")
 
@@ -228,9 +236,8 @@ func (c *Coordinator) CompleteUpload(ctx context.Context, id string, parts []Com
 }
 
 // AbortUpload discards an upload. Forgetting the parts is what makes the chunks
-// they named unreferenced, and collection is what reclaims them — abandoning an
-// upload halfway leaves exactly the same garbage, and there is no second mechanism
-// for it.
+// they named unreferenced, and collection is what reclaims them. An upload
+// nobody aborts is expired after UploadMaxAge — the same forgetting, just later.
 //
 // This used to drop the parts' chunks itself, which was safe only for as long as no
 // two manifests could name the same chunk. It also raced a completion of the same
@@ -246,6 +253,12 @@ func (c *Coordinator) AbortUpload(ctx context.Context, id string) error {
 		return err
 	}
 	return c.meta.DeleteUpload(ctx, id)
+}
+
+// ExpireUploads forgets every in-flight upload older than UploadMaxAge.
+// Forgetting the record is what lets collection reclaim the parts.
+func (c *Coordinator) ExpireUploads(ctx context.Context) (int, error) {
+	return c.meta.ExpireUploads(ctx, time.Now().Add(-UploadMaxAge))
 }
 
 // Part is one uploaded part as a listing reports it.
