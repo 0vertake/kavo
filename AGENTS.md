@@ -134,7 +134,7 @@ Rules that make these structural:
   `ListBuckets`, `DeleteBucket`, `DeleteObjects`, `ListObjectVersions`, `GetBucketLocation`.
   Conditional *reads* (`If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, and
   the same four as `x-amz-copy-source-if-*` on a copy), `Content-MD5` verification, CRC32C on a
-  whole-object PUT (header or aws-chunked trailer, and a HEAD/GET that asks for it with
+  whole-object PUT or a multipart upload (header or aws-chunked trailer, and a HEAD/GET that asks for it with
   `x-amz-checksum-mode: ENABLED`), and user metadata
   (`x-amz-meta-*`, `Cache-Control`, `Content-Disposition`, `Content-Encoding`, `Content-Language`,
   `Expires`, and `x-amz-metadata-directive` on a copy) are in too, being headers on calls that already
@@ -157,11 +157,12 @@ Rules that make these structural:
   `x-amz-server-side-encryption*` or a customer key is answered 501, because storing the object in
   plaintext and answering 200 tells a client its data is encrypted while anyone can read it. Ignoring
   those headers was worth twenty-two `s3-tests` passes, which is the clearest argument on record that
-  a pass count is not a measure of a store. SHA-256, CRC32, CRC64NVME, a trailing checksum other than CRC32C, and a
-  checksum on a part or a copy are refused for the same reason: the header asks to record a number
-  this write would not look at. CRC32C on a whole-object PUT is the exception that is actually
-  checked, because the write already hashes the body to make the ETag — whether the client names
-  it in a header or in an aws-chunked trailer.
+  a pass count is not a measure of a store. SHA-256, CRC32, CRC64NVME, a trailing checksum other than CRC32C, COMPOSITE, and a
+  checksum on CopyObject are refused for the same reason: the header asks to record a number
+  this write would not look at. CRC32C on a whole-object PUT or a multipart upload is the
+  exception that is actually checked, because the write already hashes the body to make the
+  ETag — whether the client names it in a header or in an aws-chunked trailer — and completing
+  an upload combines the parts' hashes rather than re-reading the object.
   The same rule is structural for **subresources**, because S3 addresses them as a query on the same
   path an object or bucket already has, so ignoring the query does not drop the request — it runs a
   different one. Both paths take an allowlist of the queries they understand (`knownObjectQuery`,
