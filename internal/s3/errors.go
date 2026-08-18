@@ -72,6 +72,8 @@ var (
 		"This server does not implement that operation."}
 	errEncryptionNotImplemented = apiError{"NotImplemented", http.StatusNotImplemented,
 		"This server does not encrypt objects, and will not pretend to have encrypted one."}
+	errChecksumNotImplemented = apiError{"NotImplemented", http.StatusNotImplemented,
+		"This server verifies CRC32C on a PUT that names it, and will not accept a checksum it would drop"}
 	errTaggingNotImplemented = apiError{"NotImplemented", http.StatusNotImplemented,
 		"This server does not store object tags, and will not accept tags it would drop."}
 	errBucketNotEmpty = apiError{"BucketNotEmpty", http.StatusConflict,

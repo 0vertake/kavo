@@ -11,8 +11,10 @@ import (
 	"crypto/md5"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1304,5 +1306,96 @@ func TestTagsAreReportedAsNoneAndRefusedWhenSet(t *testing.T) {
 	})
 	if !errors.As(err, &api) || api.ErrorCode() != "NotImplemented" {
 		t.Errorf("create upload with tags = %v, want NotImplemented", err)
+	}
+}
+
+func crc32cOf(data []byte) string {
+	sum := crc32.Checksum(data, crc32.MakeTable(crc32.Castagnoli))
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], sum)
+	return base64.StdEncoding.EncodeToString(b[:])
+}
+
+// A CRC32C named on a PUT is checked against the body, echoed on the response,
+// omitted from a HEAD that did not ask, and returned when one did. A mismatch is
+// BadDigest rather than a stored object whose checksum header the client will
+// later read back as if it were true.
+func TestCRC32COnAPutIsVerifiedAndReplayed(t *testing.T) {
+	client := newGateway(t)
+	data := []byte("hello checksum")
+	sum := crc32cOf(data)
+
+	put, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("checked.bin"),
+		Body: bytes.NewReader(data), ChecksumCRC32C: aws.String(sum),
+		ChecksumAlgorithm: types.ChecksumAlgorithmCrc32c,
+	})
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if got := aws.ToString(put.ChecksumCRC32C); got != sum {
+		t.Errorf("PUT checksum = %q, want %q", got, sum)
+	}
+
+	head, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("checked.bin"),
+	})
+	if err != nil {
+		t.Fatalf("head: %v", err)
+	}
+	if head.ChecksumCRC32C != nil {
+		t.Errorf("HEAD without checksum mode returned %q", aws.ToString(head.ChecksumCRC32C))
+	}
+
+	head, err = client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("checked.bin"),
+		ChecksumMode: types.ChecksumModeEnabled,
+	})
+	if err != nil {
+		t.Fatalf("head with checksum mode: %v", err)
+	}
+	if got := aws.ToString(head.ChecksumCRC32C); got != sum {
+		t.Errorf("HEAD checksum = %q, want %q", got, sum)
+	}
+
+	_, err = client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("wrong.bin"),
+		Body: bytes.NewReader(data), ChecksumCRC32C: aws.String("AAAAAA=="),
+		ChecksumAlgorithm: types.ChecksumAlgorithmCrc32c,
+	})
+	var api smithy.APIError
+	if !errors.As(err, &api) || api.ErrorCode() != "BadDigest" {
+		t.Errorf("mismatched CRC32C = %v, want BadDigest", err)
+	}
+	if _, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("wrong.bin"),
+	}); err == nil {
+		t.Error("the mismatched write stored the object")
+	}
+}
+
+// SHA-256, CRC32, a CRC32C on a part, and a trailing checksum are all requests
+// to record a number this path would not look at. Refused rather than stored:
+// the same rule as encryption and tagging.
+func TestChecksumsThisServerDoesNotVerifyAreRefused(t *testing.T) {
+	client := newGateway(t)
+	data := randBytes(64)
+
+	_, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("sha.bin"),
+		Body: bytes.NewReader(data), ChecksumAlgorithm: types.ChecksumAlgorithmSha256,
+		ChecksumSHA256: aws.String("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+	})
+	var api smithy.APIError
+	if !errors.As(err, &api) || api.ErrorCode() != "NotImplemented" {
+		t.Errorf("SHA-256 put = %v, want NotImplemented", err)
+	}
+
+	_, err = client.CreateMultipartUpload(t.Context(), &awss3.CreateMultipartUploadInput{
+		Bucket: aws.String("bucket"), Key: aws.String("mpu.bin"),
+		ChecksumAlgorithm: types.ChecksumAlgorithmCrc32c,
+	})
+	if !errors.As(err, &api) || api.ErrorCode() != "NotImplemented" {
+		t.Errorf("multipart with CRC32C = %v, want NotImplemented", err)
 	}
 }
