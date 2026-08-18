@@ -13,6 +13,7 @@ package s3
 import (
 	"crypto/md5"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/xml"
 	"fmt"
@@ -76,6 +77,10 @@ func (h *handler) authed(next http.HandlerFunc) http.HandlerFunc {
 		}
 		if taggingRequested(r.Header) {
 			fail(w, r, errTaggingNotImplemented, nil)
+			return
+		}
+		if checksumRefused(r) {
+			fail(w, r, errChecksumNotImplemented, nil)
 			return
 		}
 		if key := r.PathValue("key"); key != "" {
@@ -171,6 +176,111 @@ func taggingRequested(header http.Header) bool {
 	return header.Get("X-Amz-Tagging") != ""
 }
 
+// checksumRefused reports whether a request asks for a checksum this server would
+// not actually verify. CRC32C on a whole-object PUT is the one that is checked:
+// the write already hashes the body as it streams, because that is how the ETag
+// is made. Everything else — a trailer whose value skipTrailers used to discard,
+// SHA-256, CRC32, CRC64NVME, a checksum on a part or a copy — is refused rather
+// than stored without being looked at.
+func checksumRefused(r *http.Request) bool {
+	if !writesObjectBytes(r) {
+		return false
+	}
+	if r.Header.Get("X-Amz-Trailer") != "" {
+		return true
+	}
+	algo, extras := checksumHeaders(r.Header)
+	if extras {
+		return true
+	}
+	if algo == "" {
+		return false
+	}
+	if !strings.EqualFold(algo, "CRC32C") {
+		return true
+	}
+	return r.Method != http.MethodPut ||
+		r.URL.Query().Get("uploadId") != "" ||
+		r.Header.Get("X-Amz-Copy-Source") != ""
+}
+
+// writesObjectBytes is a PUT of an object or part, a copy, a multipart create or
+// a completion — the requests whose checksum header would be a claim about stored
+// data. A DeleteObjects CRC32C is a checksum of the XML, which SigV4 already
+// authenticates; treating it as an object checksum refused every SDK call that
+// was not a PUT.
+func writesObjectBytes(r *http.Request) bool {
+	if r.Method == http.MethodPut && r.PathValue("key") != "" {
+		return true
+	}
+	if r.Method == http.MethodPost && r.PathValue("key") != "" &&
+		(r.URL.Query().Has("uploads") || r.URL.Query().Get("uploadId") != "") {
+		return true
+	}
+	return false
+}
+
+func checksumHeaders(header http.Header) (algo string, extras bool) {
+	if v := header.Get("X-Amz-Checksum-Type"); v != "" {
+		return "", true
+	}
+	for _, name := range []string{
+		"X-Amz-Checksum-Crc32", "X-Amz-Checksum-Sha1",
+		"X-Amz-Checksum-Sha256", "X-Amz-Checksum-Crc64nvme",
+	} {
+		if header.Get(name) != "" {
+			return "", true
+		}
+	}
+	algo = header.Get("X-Amz-Checksum-Algorithm")
+	if algo == "" {
+		algo = header.Get("X-Amz-Sdk-Checksum-Algorithm")
+	}
+	if header.Get("X-Amz-Checksum-Crc32c") != "" {
+		if algo == "" {
+			algo = "CRC32C"
+		} else if !strings.EqualFold(algo, "CRC32C") {
+			return "", true
+		}
+	}
+	return algo, false
+}
+
+func requestedCRC32C(header http.Header) bool {
+	algo, extras := checksumHeaders(header)
+	return !extras && strings.EqualFold(algo, "CRC32C")
+}
+
+func declaredCRC32C(header http.Header) (*uint32, error) {
+	raw := header.Get("X-Amz-Checksum-Crc32c")
+	if raw == "" {
+		return nil, nil
+	}
+	sum, err := decodeCRC32C(raw)
+	if err != nil {
+		return nil, err
+	}
+	return &sum, nil
+}
+
+func encodeCRC32C(sum uint32) string {
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], sum)
+	return base64.StdEncoding.EncodeToString(b[:])
+}
+
+func decodeCRC32C(raw string) (uint32, error) {
+	b, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil || len(b) != 4 {
+		return 0, fmt.Errorf("s3: checksum CRC32C %q is not a base64-encoded 32-bit digest", raw)
+	}
+	return binary.BigEndian.Uint32(b), nil
+}
+
+func checksumModeEnabled(header http.Header) bool {
+	return strings.EqualFold(header.Get("X-Amz-Checksum-Mode"), "ENABLED")
+}
+
 // key is the etcd key for an object: the bucket and the key within it. Both parts
 // come from the path, so this is also where a request that names neither is
 // refused.
@@ -214,6 +324,11 @@ func (h *handler) putObject(w http.ResponseWriter, r *http.Request) {
 		fail(w, r, errInvalidDigest, err)
 		return
 	}
+	crc32c, err := declaredCRC32C(r.Header)
+	if err != nil {
+		fail(w, r, errInvalidDigest, err)
+		return
+	}
 
 	stored, err := storedMeta(r.Header)
 	if err != nil {
@@ -225,6 +340,7 @@ func (h *handler) putObject(w http.ResponseWriter, r *http.Request) {
 		ContentType: r.Header.Get("Content-Type"),
 		Size:        r.ContentLength,
 		MD5:         digest,
+		CRC32C:      crc32c,
 		Meta:        stored,
 	})
 	if err != nil {
@@ -235,6 +351,9 @@ func (h *handler) putObject(w http.ResponseWriter, r *http.Request) {
 	// manifest is committed. A client that sees this response can lose power in
 	// the next instant and still read the object back.
 	w.Header().Set("ETag", etag(m))
+	if m.CRC32C != nil && (crc32c != nil || requestedCRC32C(r.Header)) {
+		w.Header().Set("X-Amz-Checksum-Crc32c", encodeCRC32C(*m.CRC32C))
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -415,6 +534,9 @@ func (h *handler) getObject(w http.ResponseWriter, r *http.Request) {
 	header.Set("Content-Length", strconv.FormatInt(length, 10))
 	if m.ContentType != "" {
 		header.Set("Content-Type", m.ContentType)
+	}
+	if checksumModeEnabled(r.Header) && m.CRC32C != nil {
+		header.Set("X-Amz-Checksum-Crc32c", encodeCRC32C(*m.CRC32C))
 	}
 	status := http.StatusOK
 	if length != m.Size {

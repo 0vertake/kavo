@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log"
 	"maps"
@@ -214,6 +215,10 @@ type PutOptions struct {
 	// committed: the client is saying it knows what it sent, and a store that
 	// accepted the other thing would have made a liar of one of them silently.
 	MD5 string
+	// CRC32C is the Castagnoli checksum the client declared for the body, or nil
+	// if it did not. Compared after the write the same way as MD5, and for the
+	// same reason.
+	CRC32C *uint32
 }
 
 // Put streams an object into the cluster and returns its committed manifest.
@@ -236,6 +241,10 @@ func (c *Coordinator) Put(ctx context.Context, key string, body io.Reader, opts 
 	if opts.MD5 != "" && !strings.EqualFold(opts.MD5, m.ETag) {
 		c.stopWriting(ctx, writing)
 		return object.Manifest{}, fmt.Errorf("%w: declared %s, received %s", ErrBadDigest, opts.MD5, m.ETag)
+	}
+	if opts.CRC32C != nil && m.CRC32C != nil && *opts.CRC32C != *m.CRC32C {
+		c.stopWriting(ctx, writing)
+		return object.Manifest{}, fmt.Errorf("%w: declared CRC32C %08x, received %08x", ErrBadDigest, *opts.CRC32C, *m.CRC32C)
 	}
 
 	m.ETag = cmp.Or(opts.ETag, m.ETag)
@@ -317,6 +326,7 @@ func (c *Coordinator) write(ctx context.Context, key string, body io.Reader, exp
 	// Both only read the chunk, which is what makes this safe, and chunks are
 	// hashed in the order they are cut, which is what keeps the sum the object's.
 	sum := md5.New()
+	crc := crc32.New(crc32.MakeTable(crc32.Castagnoli))
 	var writing string
 	m, err := object.Write(body, c.chunkSize, expect, func(ref *object.ChunkRef, data []byte) error {
 		// A write whose chunks will outlive the sweep's patience says so before it
@@ -336,6 +346,7 @@ func (c *Coordinator) write(ctx context.Context, key string, body io.Reader, exp
 		go func() {
 			defer close(hashed)
 			sum.Write(data)
+			crc.Write(data)
 		}()
 		// Before returning on any path: the next chunk overwrites this buffer.
 		defer func() { <-hashed }()
@@ -358,6 +369,8 @@ func (c *Coordinator) write(ctx context.Context, key string, body io.Reader, exp
 	m.Nodes = owners
 	m.Coding = c.scheme
 	m.ETag = hex.EncodeToString(sum.Sum(nil))
+	crc32c := crc.Sum32()
+	m.CRC32C = &crc32c
 	// Truncated to the second, because that is all the Last-Modified header can
 	// carry. A listing reports the same field to the millisecond, so keeping any
 	// finer resolution would have a HEAD and a listing disagree about when the same
