@@ -199,7 +199,7 @@ func TestAnAbandonedUploadIsExpiredAndThenCollected(t *testing.T) {
 		t.Fatal(err)
 	}
 	part := randBytes(2 * testChunkSize)
-	if _, err := driver.c.UploadPart(ctx, id, 1, bytes.NewReader(part), int64(len(part))); err != nil {
+	if _, err := driver.c.UploadPart(ctx, id, 1, bytes.NewReader(part), cluster.PutOptions{Size: int64(len(part))}); err != nil {
 		t.Fatal(err)
 	}
 	parts, err := driver.m.Parts(ctx, id)

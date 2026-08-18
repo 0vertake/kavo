@@ -787,7 +787,8 @@ The chain is what makes streaming safe: each chunk's signature includes the prev
 chunks cannot be reordered, duplicated, or dropped, and a body that stops before its
 zero-length terminator is rejected rather than stored as a short object. A CRC32C trailer is
 compared to the hash of the body before commit — the same check a header CRC32C gets, just later,
-because that is when the trailer exists. Any other trailer is refused rather than stored unread.
+because that is when the trailer exists, and the same on a part as on a whole-object PUT. Any other
+trailer is refused rather than stored unread.
 A signed trailer's own signature is not checked: the chunks already were.
 
 Credentials are one static key pair (`-access-key`/`-secret-key`). There is no user directory
