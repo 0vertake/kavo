@@ -178,12 +178,13 @@ func taggingRequested(header http.Header) bool {
 }
 
 // checksumRefused reports whether a request asks for a checksum this server would
-// not actually verify. CRC32C on a whole-object PUT is the one that is checked:
-// the write already hashes the body as it streams, because that is how the ETag
-// is made. The value may arrive in a header or, for a streaming PUT, in the
-// aws-chunked trailer named on X-Amz-Trailer. Everything else — SHA-256, CRC32,
-// CRC64NVME, a checksum on a part or a copy — is refused rather than stored
-// without being looked at.
+// not actually verify. CRC32C is checked on a whole-object PUT and on a
+// multipart write (create, part, complete): the write already hashes the body as
+// it streams, and completing an upload combines the parts' hashes rather than
+// re-reading the object. The value may arrive in a header or, for a streaming
+// PUT, in the aws-chunked trailer named on X-Amz-Trailer. Everything else —
+// SHA-256, CRC32, CRC64NVME, COMPOSITE, a checksum on CopyObject — is refused
+// rather than stored without being looked at.
 func checksumRefused(r *http.Request) bool {
 	if !writesObjectBytes(r) {
 		return false
@@ -198,9 +199,10 @@ func checksumRefused(r *http.Request) bool {
 	if !strings.EqualFold(algo, "CRC32C") {
 		return true
 	}
-	return r.Method != http.MethodPut ||
-		r.URL.Query().Get("uploadId") != "" ||
-		r.Header.Get("X-Amz-Copy-Source") != ""
+	// CopyObject copies a manifest, not bytes, and would store a number it did
+	// not compute from the destination. UploadPartCopy is a PUT with both a copy
+	// source and an upload id: that path writes the range, so CRC32C is checked.
+	return r.Header.Get("X-Amz-Copy-Source") != "" && r.URL.Query().Get("uploadId") == ""
 }
 
 // writesObjectBytes is a PUT of an object or part, a copy, a multipart create or
@@ -220,7 +222,7 @@ func writesObjectBytes(r *http.Request) bool {
 }
 
 func checksumHeaders(header http.Header) (algo string, extras bool) {
-	if v := header.Get("X-Amz-Checksum-Type"); v != "" {
+	if v := header.Get("X-Amz-Checksum-Type"); v != "" && !strings.EqualFold(v, "FULL_OBJECT") {
 		return "", true
 	}
 	for _, name := range []string{

@@ -97,8 +97,9 @@ type Manifest struct {
 	// after the cluster's default changes.
 	Coding ec.Scheme
 	// CRC32C is the Castagnoli checksum of the object's bytes, computed as they
-	// were written. A pointer because 0 is a real checksum (the empty object) and
-	// a missing value is an object written before this was stored.
+	// were written, or combined from its parts when a multipart upload completes.
+	// A pointer because 0 is a real checksum (the empty object) and a missing
+	// value is an object written before this was stored.
 	CRC32C *uint32 `json:",omitempty"`
 }
 

@@ -72,26 +72,30 @@ func (c *Coordinator) CreateUpload(ctx context.Context, key, contentType string,
 	return id, nil
 }
 
-// UploadPart stores one part and returns its ETag. size is the part's declared
-// length, used only to size the write buffer.
+// UploadPart stores one part and returns its manifest. size is taken from
+// opts.Size and used only to size the write buffer.
 //
 // The part's chunks are placed by the object's key, not the part's, so that
 // completion is a single manifest commit rather than a copy: the chunks are already
 // on the nodes the object's manifest will name.
-func (c *Coordinator) UploadPart(ctx context.Context, id string, number int, body io.Reader, size int64) (string, error) {
+func (c *Coordinator) UploadPart(ctx context.Context, id string, number int, body io.Reader, opts PutOptions) (object.Manifest, error) {
 	// Part 0 does not exist and part 10001 never will, so this is the same answer
 	// as naming a part that was never uploaded.
 	if number < 1 || number > MaxParts {
-		return "", fmt.Errorf("%w: part number %d is outside 1..%d", ErrNoSuchPart, number, MaxParts)
+		return object.Manifest{}, fmt.Errorf("%w: part number %d is outside 1..%d", ErrNoSuchPart, number, MaxParts)
 	}
 	u, err := c.meta.Upload(ctx, id)
 	if err != nil {
-		return "", err
+		return object.Manifest{}, err
 	}
 
-	m, writing, err := c.write(ctx, u.Key, body, size)
+	m, writing, err := c.write(ctx, u.Key, body, opts.Size)
 	if err != nil {
-		return "", err
+		return object.Manifest{}, err
+	}
+	if err := checkCRC32C(m, opts); err != nil {
+		c.stopWriting(ctx, writing)
+		return object.Manifest{}, err
 	}
 	if writing == "" {
 		err = c.meta.CommitPart(ctx, id, number, m)
@@ -100,9 +104,9 @@ func (c *Coordinator) UploadPart(ctx context.Context, id string, number int, bod
 	}
 	c.stopWriting(ctx, writing)
 	if err != nil {
-		return "", err
+		return object.Manifest{}, err
 	}
-	return m.ETag, nil
+	return m, nil
 }
 
 // CompleteUpload assembles the named parts into the object and returns its
@@ -128,7 +132,7 @@ func (c *Coordinator) UploadPart(ctx context.Context, id string, number int, bod
 //
 // Streaming, so the part's size does not decide the footprint: the pipe hands each
 // chunk to the writer as the reader produces it.
-func (c *Coordinator) CopyPart(ctx context.Context, id string, number int, src object.Manifest, off, length int64) (string, error) {
+func (c *Coordinator) CopyPart(ctx context.Context, id string, number int, src object.Manifest, off, length int64, opts PutOptions) (object.Manifest, error) {
 	pr, pw := io.Pipe()
 	go func() {
 		// CloseWithError(nil) closes cleanly, so this reports the end of the range
@@ -137,10 +141,11 @@ func (c *Coordinator) CopyPart(ctx context.Context, id string, number int, src o
 	}()
 	// Unblocks the goroutine above if the write side gives up early.
 	defer pr.Close()
-	return c.UploadPart(ctx, id, number, pr, length)
+	opts.Size = length
+	return c.UploadPart(ctx, id, number, pr, opts)
 }
 
-func (c *Coordinator) CompleteUpload(ctx context.Context, id string, parts []CompletedPart) (object.Manifest, error) {
+func (c *Coordinator) CompleteUpload(ctx context.Context, id string, parts []CompletedPart, crc32c *uint32) (object.Manifest, error) {
 	u, err := c.meta.Upload(ctx, id)
 	if errors.Is(err, meta.ErrNotFound) {
 		// The upload may have completed already, with the client never seeing the
@@ -208,9 +213,30 @@ func (c *Coordinator) CompleteUpload(ctx context.Context, id string, parts []Com
 		sums.Write(raw)
 		final.Chunks = append(final.Chunks, m.Chunks...)
 		final.Size += m.Size
+		// The object's CRC32C is the concatenation of its parts', combined here
+		// so completion does not re-read the bytes. A part written before this
+		// was stored has none, and then neither does the object.
+		if m.CRC32C == nil {
+			final.CRC32C = nil
+		} else if final.CRC32C == nil && i == 0 {
+			sum := *m.CRC32C
+			final.CRC32C = &sum
+		} else if final.CRC32C != nil {
+			*final.CRC32C = object.CombineCRC32C(*final.CRC32C, *m.CRC32C, m.Size)
+		}
 	}
 	final.ETag = fmt.Sprintf("%x-%d", sums.Sum(nil), len(parts))
 	final.Modified = time.Now().UTC().Truncate(time.Second)
+
+	if crc32c != nil && (final.CRC32C == nil || *crc32c != *final.CRC32C) {
+		// Before the commit, same as a PUT: a checksum the client named and this
+		// store cannot confirm is not stored as if it had been.
+		got := "none"
+		if final.CRC32C != nil {
+			got = fmt.Sprintf("%08x", *final.CRC32C)
+		}
+		return object.Manifest{}, fmt.Errorf("%w: declared CRC32C %08x, received %s", ErrBadDigest, *crc32c, got)
+	}
 
 	// The object exists from here. Chunks of parts the completion did not name are
 	// leaked, along with those of any part uploaded twice — the same hole overwrites

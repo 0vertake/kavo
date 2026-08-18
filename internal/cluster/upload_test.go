@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"hash/crc32"
 	"maps"
 	"slices"
 	"testing"
@@ -39,21 +40,21 @@ func TestACompletionIsRefusedWhenPlacementMovedMidUpload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := driver.c.UploadPart(ctx, id, 1, bytes.NewReader(randBytes(testChunkSize)), testChunkSize)
+	first, err := driver.c.UploadPart(ctx, id, 1, bytes.NewReader(randBytes(testChunkSize)), cluster.PutOptions{Size: testChunkSize})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	tc.tellEveryone(fewer)
 
-	second, err := driver.c.UploadPart(ctx, id, 2, bytes.NewReader(randBytes(1024)), 1024)
+	second, err := driver.c.UploadPart(ctx, id, 2, bytes.NewReader(randBytes(1024)), cluster.PutOptions{Size: 1024})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	_, err = driver.c.CompleteUpload(ctx, id, []cluster.CompletedPart{
-		{Number: 1, ETag: first}, {Number: 2, ETag: second},
-	})
+		{Number: 1, ETag: first.ETag}, {Number: 2, ETag: second.ETag},
+	}, nil)
 	if err == nil {
 		t.Fatal("completed an upload whose parts are on different nodes than the manifest would name")
 	}
@@ -81,7 +82,7 @@ func TestAbortReclaimsThePartsChunks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := driver.c.UploadPart(ctx, id, 1, bytes.NewReader(randBytes(2*testChunkSize)), 2*testChunkSize); err != nil {
+	if _, err := driver.c.UploadPart(ctx, id, 1, bytes.NewReader(randBytes(2*testChunkSize)), cluster.PutOptions{Size: 2 * testChunkSize}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -130,4 +131,53 @@ func movedKey(t testing.TB, before, after map[string]string) string {
 	}
 	t.Fatal("no key of the ones tried is placed differently by the two memberships")
 	return ""
+}
+
+// Completing an upload combines the parts' CRC32Cs rather than re-reading the
+// object. A declared checksum that does not match is refused before the commit.
+func TestCompleteUploadStoresTheObjectsCRC32C(t *testing.T) {
+	tc := newCluster(t, 3)
+	driver := tc.nodes["n1"]
+	ctx := context.Background()
+	const key = "crc32c/object"
+
+	id, err := driver.c.CreateUpload(ctx, key, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p1, p2 := randBytes(100), randBytes(250)
+	wrong := uint32(0xdeadbeef)
+	if _, err := driver.c.UploadPart(ctx, id, 1, bytes.NewReader(p1), cluster.PutOptions{
+		Size: int64(len(p1)), CRC32C: &wrong,
+	}); !errors.Is(err, cluster.ErrBadDigest) {
+		t.Fatalf("wrong part CRC32C = %v, want ErrBadDigest", err)
+	}
+
+	first, err := driver.c.UploadPart(ctx, id, 1, bytes.NewReader(p1), cluster.PutOptions{Size: int64(len(p1))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := driver.c.UploadPart(ctx, id, 2, bytes.NewReader(p2), cluster.PutOptions{Size: int64(len(p2))})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parts := []cluster.CompletedPart{
+		{Number: 1, ETag: first.ETag}, {Number: 2, ETag: second.ETag},
+	}
+	if _, err := driver.c.CompleteUpload(ctx, id, parts, &wrong); !errors.Is(err, cluster.ErrBadDigest) {
+		t.Fatalf("wrong object CRC32C = %v, want ErrBadDigest", err)
+	}
+	if _, err := driver.c.Resolve(ctx, key); !errors.Is(err, meta.ErrNotFound) {
+		t.Errorf("the mismatched completion stored the object")
+	}
+
+	want := crc32.Checksum(append(append([]byte{}, p1...), p2...), crc32.MakeTable(crc32.Castagnoli))
+	m, err := driver.c.CompleteUpload(ctx, id, parts, &want)
+	if err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	if m.CRC32C == nil || *m.CRC32C != want {
+		t.Errorf("completed CRC32C = %v, want %08x", m.CRC32C, want)
+	}
 }

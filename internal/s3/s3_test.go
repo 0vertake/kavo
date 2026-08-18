@@ -1382,9 +1382,10 @@ func TestCRC32COnAPutIsVerifiedAndReplayed(t *testing.T) {
 	}
 }
 
-// SHA-256, CRC32, and a CRC32C on a part are all requests to record a number
-// this path would not look at. Refused rather than stored: the same rule as
-// encryption and tagging.
+// SHA-256, CRC32, COMPOSITE, and a checksum on CopyObject are all requests to
+// record a number this path would not look at. Refused rather than stored: the
+// same rule as encryption and tagging. CRC32C on a multipart upload is checked,
+// so it is not among these.
 func TestChecksumsThisServerDoesNotVerifyAreRefused(t *testing.T) {
 	client := newGateway(t)
 	data := randBytes(64)
@@ -1401,10 +1402,19 @@ func TestChecksumsThisServerDoesNotVerifyAreRefused(t *testing.T) {
 
 	_, err = client.CreateMultipartUpload(t.Context(), &awss3.CreateMultipartUploadInput{
 		Bucket: aws.String("bucket"), Key: aws.String("mpu.bin"),
-		ChecksumAlgorithm: types.ChecksumAlgorithmCrc32c,
+		ChecksumAlgorithm: types.ChecksumAlgorithmSha256,
 	})
 	if !errors.As(err, &api) || api.ErrorCode() != "NotImplemented" {
-		t.Errorf("multipart with CRC32C = %v, want NotImplemented", err)
+		t.Errorf("multipart with SHA-256 = %v, want NotImplemented", err)
+	}
+
+	_, err = client.CreateMultipartUpload(t.Context(), &awss3.CreateMultipartUploadInput{
+		Bucket: aws.String("bucket"), Key: aws.String("composite.bin"),
+		ChecksumAlgorithm: types.ChecksumAlgorithmCrc32c,
+		ChecksumType:      types.ChecksumTypeComposite,
+	})
+	if !errors.As(err, &api) || api.ErrorCode() != "NotImplemented" {
+		t.Errorf("COMPOSITE CRC32C = %v, want NotImplemented", err)
 	}
 }
 

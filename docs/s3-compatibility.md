@@ -188,7 +188,7 @@ died on: many of these never reach their assertion because a `ListObjects` v1 ca
 | 14 | tagging | anti-goal |
 | 2 | versioned and cross-account copy | anti-goal |
 | 9 | multipart upload edge cases | mixed, see below |
-| 9 | non-MD5 checksum algorithms (CRC32, CRC32C, SHA-1) | gap |
+| 9 | non-MD5 checksum algorithms (CRC32, SHA-256, CRC64NVME, COMPOSITE) | gap |
 | 8 | anonymous and unsigned access | anti-goal: one key pair, everything signed |
 | 6 | error codes for malformed authorization and date headers | gap |
 | 3 | `100-continue` and `Expect` | gap |
@@ -228,12 +228,14 @@ kavo does not do yet, and they are worth naming honestly:
   its parts ended, so answering this means recording part boundaries at completion — a change to what
   a manifest is, for a feature whose only user is a client parallelising a download it could do with
   ranges.
-- **Non-MD5 checksums** (`x-amz-checksum-crc32`, `-crc32c`, `-sha1`, `-sha256`). CRC32C on a
-  whole-object PUT is checked and stored, whether the client names it in a header or in an
-  aws-chunked trailer, and a HEAD/GET with `x-amz-checksum-mode: ENABLED` returns it. The remaining
-  failures are SHA-256 and CRC64NVME on that same PUT, and every checksum on a multipart upload.
-  Chunks were already CRC32C-checksummed on disk; what was missing was the S3 header naming the
-  *object*.
+- **Non-MD5 checksums** (`x-amz-checksum-crc32`, `-sha1`, `-sha256`, CRC64NVME, COMPOSITE). CRC32C
+  on a whole-object PUT and on a multipart upload (FULL_OBJECT) is checked and stored, whether the
+  client names it in a header or in an aws-chunked trailer, and a HEAD/GET with
+  `x-amz-checksum-mode: ENABLED` returns it. Completing an upload combines the parts' hashes rather
+  than re-reading the object. The last measured run filed nine tests here, including multipart
+  CRC32C which is checked now; the count stays until the suite is re-run. What remains unread is
+  SHA-256, CRC64NVME, COMPOSITE, and every checksum other than CRC32C on a multipart upload. Chunks
+  were already CRC32C-checksummed on disk; what was missing was the S3 header naming the *object*.
 - **Error codes for malformed authorization and date headers**, where kavo answers a plausible
   refusal with the wrong code — a client is told `AccessDenied` where S3 says
   `MissingSecurityHeader`. Both refuse, so nothing is stored on a bad signature; a client
