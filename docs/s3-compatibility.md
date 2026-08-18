@@ -162,7 +162,7 @@ The one query whose *value* decides is `?versionId`, which is honoured for `null
 ListObjectVersions reports for everything, and how a client empties a bucket — and refused for any
 other id, since answering an invented version with the live object deletes the wrong thing.
 
-## Why the 615 fail
+## Why the 616 fail
 
 `docs/classify.py` produces this table from the suite's own failure list. Each test lands in exactly
 one family — the first that matches its name, in the order shown — so the counts sum to 616 rather
