@@ -777,9 +777,10 @@ without buffering it. The design note that `aws s3 cp` requires it is out of dat
 
 The chain is what makes streaming safe: each chunk's signature includes the previous chunk's, so
 chunks cannot be reordered, duplicated, or dropped, and a body that stops before its
-zero-length terminator is rejected rather than stored as a short object. Trailers are parsed and
-ignored — the only ones S3 clients send are whole-object checksums, and every byte has already
-been verified by the time they arrive.
+zero-length terminator is rejected rather than stored as a short object. A CRC32C trailer is
+compared to the hash of the body before commit — the same check a header CRC32C gets, just later,
+because that is when the trailer exists. Any other trailer is refused rather than stored unread.
+A signed trailer's own signature is not checked: the chunks already were.
 
 Credentials are one static key pair (`-access-key`/`-secret-key`). There is no user directory
 because IAM is an anti-goal: authentication is proof of holding the one secret, and

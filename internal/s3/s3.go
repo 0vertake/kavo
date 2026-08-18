@@ -17,6 +17,7 @@ import (
 	"encoding/hex"
 	"encoding/xml"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -179,15 +180,13 @@ func taggingRequested(header http.Header) bool {
 // checksumRefused reports whether a request asks for a checksum this server would
 // not actually verify. CRC32C on a whole-object PUT is the one that is checked:
 // the write already hashes the body as it streams, because that is how the ETag
-// is made. Everything else — a trailer whose value skipTrailers used to discard,
-// SHA-256, CRC32, CRC64NVME, a checksum on a part or a copy — is refused rather
-// than stored without being looked at.
+// is made. The value may arrive in a header or, for a streaming PUT, in the
+// aws-chunked trailer named on X-Amz-Trailer. Everything else — SHA-256, CRC32,
+// CRC64NVME, a checksum on a part or a copy — is refused rather than stored
+// without being looked at.
 func checksumRefused(r *http.Request) bool {
 	if !writesObjectBytes(r) {
 		return false
-	}
-	if r.Header.Get("X-Amz-Trailer") != "" {
-		return true
 	}
 	algo, extras := checksumHeaders(r.Header)
 	if extras {
@@ -232,11 +231,19 @@ func checksumHeaders(header http.Header) (algo string, extras bool) {
 			return "", true
 		}
 	}
+	var crc32cTrailer bool
+	for _, name := range announcedTrailers(header) {
+		if strings.EqualFold(name, "x-amz-checksum-crc32c") {
+			crc32cTrailer = true
+			continue
+		}
+		return "", true
+	}
 	algo = header.Get("X-Amz-Checksum-Algorithm")
 	if algo == "" {
 		algo = header.Get("X-Amz-Sdk-Checksum-Algorithm")
 	}
-	if header.Get("X-Amz-Checksum-Crc32c") != "" {
+	if header.Get("X-Amz-Checksum-Crc32c") != "" || crc32cTrailer {
 		if algo == "" {
 			algo = "CRC32C"
 		} else if !strings.EqualFold(algo, "CRC32C") {
@@ -244,6 +251,18 @@ func checksumHeaders(header http.Header) (algo string, extras bool) {
 		}
 	}
 	return algo, false
+}
+
+func announcedTrailers(header http.Header) []string {
+	var names []string
+	for _, v := range header.Values("X-Amz-Trailer") {
+		for _, n := range strings.Split(v, ",") {
+			if n = strings.TrimSpace(n); n != "" {
+				names = append(names, n)
+			}
+		}
+	}
+	return names
 }
 
 func requestedCRC32C(header http.Header) bool {
@@ -259,6 +278,18 @@ func declaredCRC32C(header http.Header) (*uint32, error) {
 	sum, err := decodeCRC32C(raw)
 	if err != nil {
 		return nil, err
+	}
+	return &sum, nil
+}
+
+func declaredTrailingCRC32C(body io.ReadCloser) (*uint32, error) {
+	raw := sigv4.Trailers(body).Get("X-Amz-Checksum-Crc32c")
+	if raw == "" {
+		return nil, fmt.Errorf("%w: trailing CRC32C was announced but not sent", cluster.ErrBadDigest)
+	}
+	sum, err := decodeCRC32C(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", cluster.ErrBadDigest, err)
 	}
 	return &sum, nil
 }
@@ -336,13 +367,21 @@ func (h *handler) putObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	m, err := h.cluster.Put(r.Context(), key, r.Body, cluster.PutOptions{
+	opts := cluster.PutOptions{
 		ContentType: r.Header.Get("Content-Type"),
 		Size:        r.ContentLength,
 		MD5:         digest,
 		CRC32C:      crc32c,
 		Meta:        stored,
-	})
+	}
+	if len(announcedTrailers(r.Header)) > 0 {
+		body := r.Body
+		opts.TrailingCRC32C = func() (*uint32, error) {
+			return declaredTrailingCRC32C(body)
+		}
+	}
+
+	m, err := h.cluster.Put(r.Context(), key, r.Body, opts)
 	if err != nil {
 		fail(w, r, storeError(err), err)
 		return
