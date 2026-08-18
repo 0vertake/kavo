@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -61,11 +62,12 @@ type chunkedReader struct {
 	signer *chunkSigner // nil when the client sent an unsigned streaming payload
 	closer io.Closer
 
-	left int64     // bytes still to come in the current chunk
-	hash hash.Hash // hash of the current chunk's data, nil when unsigned
-	want string    // signature the current chunk must produce
-	done bool
-	err  error
+	left     int64     // bytes still to come in the current chunk
+	hash     hash.Hash // hash of the current chunk's data, nil when unsigned
+	want     string    // signature the current chunk must produce
+	done     bool
+	err      error
+	trailers http.Header
 }
 
 func newChunkedReader(body io.ReadCloser, signer *chunkSigner) io.ReadCloser {
@@ -149,10 +151,22 @@ func (c *chunkedReader) next() error {
 		if err := c.endOfChunk(); err != nil {
 			return err
 		}
-		return c.skipTrailers()
+		return c.readTrailers()
 	}
 	return nil
 }
+
+// Trailers returns the headers that followed the zero-length chunk. Empty until
+// the body has been read to EOF, and empty if this reader was not aws-chunked.
+func Trailers(r io.ReadCloser) http.Header {
+	type has interface{ Trailers() http.Header }
+	if h, ok := r.(has); ok {
+		return h.Trailers()
+	}
+	return nil
+}
+
+func (c *chunkedReader) Trailers() http.Header { return c.trailers }
 
 // endOfChunk checks the chunk just read against its signature and links it into
 // the chain the next chunk is checked against.
@@ -168,13 +182,14 @@ func (c *chunkedReader) endOfChunk() error {
 	return nil
 }
 
-// skipTrailers consumes the trailing headers after the last chunk.
+// readTrailers consumes the trailing headers after the last chunk.
 //
-// Their values are not used: the only trailers S3 clients send are checksums of
-// the whole object, and every byte has already been verified against the
-// signature by the time they arrive. A signed trailer's own signature is
-// therefore not checked either — it would authenticate a value nothing reads.
-func (c *chunkedReader) skipTrailers() error {
+// A signed trailer's own signature is not checked: each chunk's signature
+// already covered those bytes on the way in. The object checksum a client puts
+// here is compared by the write, once it has hashed the body, against the same
+// number — so the value is kept rather than discarded.
+func (c *chunkedReader) readTrailers() error {
+	c.trailers = make(http.Header)
 	for {
 		line, err := c.line()
 		if errors.Is(err, io.EOF) || line == "" {
@@ -183,6 +198,11 @@ func (c *chunkedReader) skipTrailers() error {
 		if err != nil {
 			return err
 		}
+		name, value, ok := strings.Cut(line, ":")
+		if !ok {
+			return fmt.Errorf("%w: trailer line %q", ErrMalformed, line)
+		}
+		c.trailers.Add(strings.TrimSpace(name), strings.TrimSpace(value))
 	}
 }
 

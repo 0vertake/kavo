@@ -219,6 +219,10 @@ type PutOptions struct {
 	// if it did not. Compared after the write the same way as MD5, and for the
 	// same reason.
 	CRC32C *uint32
+	// TrailingCRC32C is consulted after the body is consumed, when the checksum
+	// arrived in a trailer rather than a header. The comparison is the same;
+	// only the moment it can run differs.
+	TrailingCRC32C func() (*uint32, error)
 }
 
 // Put streams an object into the cluster and returns its committed manifest.
@@ -242,9 +246,23 @@ func (c *Coordinator) Put(ctx context.Context, key string, body io.Reader, opts 
 		c.stopWriting(ctx, writing)
 		return object.Manifest{}, fmt.Errorf("%w: declared %s, received %s", ErrBadDigest, opts.MD5, m.ETag)
 	}
-	if opts.CRC32C != nil && m.CRC32C != nil && *opts.CRC32C != *m.CRC32C {
+	declared := opts.CRC32C
+	if opts.TrailingCRC32C != nil {
+		v, err := opts.TrailingCRC32C()
+		if err != nil {
+			c.stopWriting(ctx, writing)
+			return object.Manifest{}, err
+		}
+		if declared == nil {
+			declared = v
+		} else if v != nil && *v != *declared {
+			c.stopWriting(ctx, writing)
+			return object.Manifest{}, fmt.Errorf("%w: header CRC32C %08x, trailer %08x", ErrBadDigest, *declared, *v)
+		}
+	}
+	if declared != nil && m.CRC32C != nil && *declared != *m.CRC32C {
 		c.stopWriting(ctx, writing)
-		return object.Manifest{}, fmt.Errorf("%w: declared CRC32C %08x, received %08x", ErrBadDigest, *opts.CRC32C, *m.CRC32C)
+		return object.Manifest{}, fmt.Errorf("%w: declared CRC32C %08x, received %08x", ErrBadDigest, *declared, *m.CRC32C)
 	}
 
 	m.ETag = cmp.Or(opts.ETag, m.ETag)

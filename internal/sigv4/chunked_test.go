@@ -138,6 +138,13 @@ func TestStreamingBodyReadsBackAsTheObject(t *testing.T) {
 			if !bytes.Equal(got, tt.data) {
 				t.Errorf("read %d bytes, want %d", len(got), len(tt.data))
 			}
+			if tt.trailer != "" {
+				line, _, _ := strings.Cut(tt.trailer, "\r\n")
+				name, val, _ := strings.Cut(line, ":")
+				if got := sigv4.Trailers(r.Body).Get(name); got != val {
+					t.Errorf("trailer %s = %q, want %q", name, got, val)
+				}
+			}
 		})
 	}
 }

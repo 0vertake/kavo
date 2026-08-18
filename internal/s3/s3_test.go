@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -47,13 +48,20 @@ var creds = sigv4.Credentials{AccessKey: "AKIAIOSFODNN7EXAMPLE", SecretKey: "wJa
 // N=3: a smaller cluster cannot accept an object at all.
 func newGateway(t testing.TB) *awss3.Client {
 	t.Helper()
-	return newGatewaySized(t, 3, testChunkSize)
+	client, _ := newGatewayURL(t, 3, testChunkSize)
+	return client
 }
 
 // newGatewaySized is newGateway with the cluster size and chunk size the caller
 // needs. Benchmarks want six nodes at the production chunk size, so that their
 // numbers can be put next to the ones the internal API produces.
 func newGatewaySized(t testing.TB, n int, chunkSize int64) *awss3.Client {
+	t.Helper()
+	client, _ := newGatewayURL(t, n, chunkSize)
+	return client
+}
+
+func newGatewayURL(t testing.TB, n int, chunkSize int64) (*awss3.Client, string) {
 	t.Helper()
 	prefix := "/kavo-test/" + rand.Text()
 
@@ -98,7 +106,7 @@ func newGatewaySized(t testing.TB, n int, chunkSize int64) *awss3.Client {
 	}, func(o *awss3.Options) {
 		o.BaseEndpoint = aws.String(front.URL)
 		o.UsePathStyle = true // there is no DNS for buckets here
-	})
+	}), front.URL
 }
 
 func randBytes(n int) []byte {
@@ -1374,9 +1382,9 @@ func TestCRC32COnAPutIsVerifiedAndReplayed(t *testing.T) {
 	}
 }
 
-// SHA-256, CRC32, a CRC32C on a part, and a trailing checksum are all requests
-// to record a number this path would not look at. Refused rather than stored:
-// the same rule as encryption and tagging.
+// SHA-256, CRC32, and a CRC32C on a part are all requests to record a number
+// this path would not look at. Refused rather than stored: the same rule as
+// encryption and tagging.
 func TestChecksumsThisServerDoesNotVerifyAreRefused(t *testing.T) {
 	client := newGateway(t)
 	data := randBytes(64)
@@ -1397,5 +1405,108 @@ func TestChecksumsThisServerDoesNotVerifyAreRefused(t *testing.T) {
 	})
 	if !errors.As(err, &api) || api.ErrorCode() != "NotImplemented" {
 		t.Errorf("multipart with CRC32C = %v, want NotImplemented", err)
+	}
+}
+
+// A CRC32C that arrives after the body, as aws-chunked trailers, is checked
+// the same way as one named in a header: compared before commit, echoed, and a
+// mismatch stores nothing. Built by hand rather than through the Go SDK: that
+// client only frames a trailing checksum over TLS, and httptest is HTTP.
+func TestTrailingCRC32COnAPutIsVerified(t *testing.T) {
+	client, endpoint := newGatewayURL(t, 3, testChunkSize)
+	data := []byte("hello trailing checksum")
+	sum := crc32cOf(data)
+
+	resp := putUnsignedTrailer(t, endpoint, "trailed.bin", data, sum)
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT = %d: %s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("X-Amz-Checksum-Crc32c"); got != sum {
+		t.Errorf("PUT checksum = %q, want %q", got, sum)
+	}
+
+	head, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("trailed.bin"),
+		ChecksumMode: types.ChecksumModeEnabled,
+	})
+	if err != nil {
+		t.Fatalf("head: %v", err)
+	}
+	if got := aws.ToString(head.ChecksumCRC32C); got != sum {
+		t.Errorf("HEAD checksum = %q, want %q", got, sum)
+	}
+
+	resp = putUnsignedTrailer(t, endpoint, "wrong-trail.bin", data, "AAAAAA==")
+	body, err = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusBadRequest || !bytes.Contains(body, []byte("BadDigest")) {
+		t.Errorf("mismatched trailer = %d %s, want BadDigest", resp.StatusCode, body)
+	}
+	if _, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("wrong-trail.bin"),
+	}); err == nil {
+		t.Error("the mismatched write stored the object")
+	}
+
+	req, err := http.NewRequest(http.MethodPut, endpoint+"/bucket/ieee.bin", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("x-amz-trailer", "x-amz-checksum-crc32")
+	signS3(t, req, "UNSIGNED-PAYLOAD")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotImplemented || !bytes.Contains(body, []byte("NotImplemented")) {
+		t.Errorf("CRC32 trailer = %d %s, want NotImplemented", resp.StatusCode, body)
+	}
+}
+
+func putUnsignedTrailer(t *testing.T, endpoint, key string, data []byte, checksum string) *http.Response {
+	t.Helper()
+	var framed bytes.Buffer
+	if len(data) > 0 {
+		fmt.Fprintf(&framed, "%x\r\n%s\r\n", len(data), data)
+	}
+	fmt.Fprintf(&framed, "0\r\nx-amz-checksum-crc32c:%s\r\n\r\n", checksum)
+
+	req, err := http.NewRequest(http.MethodPut, endpoint+"/bucket/"+key, bytes.NewReader(framed.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("x-amz-decoded-content-length", fmt.Sprint(len(data)))
+	req.Header.Set("x-amz-trailer", "x-amz-checksum-crc32c")
+	req.Header.Set("x-amz-checksum-algorithm", "CRC32C")
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.ContentLength = int64(framed.Len())
+	signS3(t, req, "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+func signS3(t *testing.T, r *http.Request, payloadHash string) {
+	t.Helper()
+	r.Header.Set("x-amz-content-sha256", payloadHash)
+	c, err := credentials.NewStaticCredentialsProvider(creds.AccessKey, creds.SecretKey, "").Retrieve(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer := v4.NewSigner(func(o *v4.SignerOptions) { o.DisableURIPathEscaping = true })
+	if err := signer.SignHTTP(t.Context(), c, r, payloadHash, "s3", "us-east-1", time.Now()); err != nil {
+		t.Fatalf("sign: %v", err)
 	}
 }
