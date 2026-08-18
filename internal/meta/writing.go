@@ -96,10 +96,23 @@ func (s *Store) CommitPartWhileWriting(ctx context.Context, id string, number in
 	if err != nil {
 		return fmt.Errorf("meta: marshal part %d of upload %s: %w", number, id, err)
 	}
-	if err := s.whileWriting(ctx, writeID, clientv3.OpPut(s.partKey(id, number), string(data))); err != nil {
+	resp, err := s.client.Txn(ctx).
+		If(
+			clientv3.Compare(clientv3.CreateRevision(s.writingKey(writeID)), ">", 0),
+			clientv3.Compare(clientv3.CreateRevision(s.uploadKey(id)), ">", 0),
+		).
+		Then(clientv3.OpPut(s.partKey(id, number), string(data))).
+		Commit()
+	if err != nil {
 		return fmt.Errorf("meta: commit part %d of upload %s: %w", number, id, err)
 	}
-	return nil
+	if resp.Succeeded {
+		return nil
+	}
+	if _, err := s.Upload(ctx, id); err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: %s", ErrNotWriting, writeID)
 }
 
 func (s *Store) whileWriting(ctx context.Context, id string, op clientv3.Op) error {

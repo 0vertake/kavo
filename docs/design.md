@@ -966,13 +966,13 @@ implementation disagreeing is the only thing that catches a misreading.
   partitioned from etcd for longer than the five-second membership lease has its record dropped and
   its chunks made collectable, so its commit is refused and the client retries a 5 GB upload it had
   nearly finished. Wasteful, and the alternative is acknowledging an object with a hole in it.
-- **A multipart upload nobody finishes is never cleaned up**: an upload whose client walks away
-  without aborting keeps its parts' chunks and its etcd records forever, and collection does not
-  help — it is precisely the pass that keeps an in-flight upload's parts alive, and it cannot
-  tell a client that will come back from one that will not. The fix is ageing out the upload
-  record itself, which carries its creation time for that reason; S3 solves it with a lifecycle
-  rule, which is an anti-goal here. Parts uploaded twice, or uploaded and left out of the
-  completion, are reclaimed once the upload is completed or aborted.
+- **A multipart upload nobody finishes is cleaned up after seven days**: the upload
+  record carries its creation time, and the collection loop drops records older than
+  that. Until then the sweep treats the parts as live, because it cannot tell a client
+  that will come back from one that will not. S3 solves this with a lifecycle rule,
+  which is an anti-goal here, so the age is a constant rather than per-bucket
+  configuration. Parts uploaded twice, or uploaded and left out of the completion,
+  are reclaimed once the upload is completed, aborted, or expired.
 - **Multi-range requests are answered with the whole object**: `bytes=0-9,20-29` returns everything
   rather than a `multipart/byteranges` body. Allowed by HTTP, matches S3, and no S3 client asks.
 - **`ListObjects` v1 is refused**: only v2 is served. Every current client uses v2; a v1 client gets

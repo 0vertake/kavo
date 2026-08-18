@@ -99,6 +99,13 @@ type CollectStats struct {
 func (c *Coordinator) CollectLoop(ctx context.Context, grace, interval time.Duration) {
 	for {
 		start := time.Now()
+		if n, err := c.ExpireUploads(ctx); ctx.Err() != nil {
+			return
+		} else if err != nil {
+			log.Printf("collect: expiring abandoned uploads: %v", err)
+		} else if n > 0 {
+			log.Printf("collect: expired %d abandoned uploads", n)
+		}
 		st, err := c.Collect(ctx, grace)
 		if ctx.Err() != nil {
 			return

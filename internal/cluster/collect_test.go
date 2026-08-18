@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/0vertake/kavo/internal/cluster"
+	"github.com/0vertake/kavo/internal/meta"
 	"github.com/0vertake/kavo/internal/object"
 )
 
@@ -181,6 +182,71 @@ func TestChunksOfAnUploadInProgressAreKept(t *testing.T) {
 	}
 	if got := mustGet(t, outsider, key); !bytes.Equal(got, part) {
 		t.Error("the completed object does not read back as the part that was uploaded")
+	}
+}
+
+// An upload nobody finishes is forgotten after UploadMaxAge, and then collection
+// reclaims its chunks. Until the record is gone the sweep treats the parts as live,
+// because it cannot tell this client from one that will come back.
+func TestAnAbandonedUploadIsExpiredAndThenCollected(t *testing.T) {
+	tc := newCluster(t, 3)
+	driver := tc.nodes["n1"]
+	ctx := context.Background()
+	const key = "abandoned/object"
+
+	id, err := driver.c.CreateUpload(ctx, key, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	part := randBytes(2 * testChunkSize)
+	if _, err := driver.c.UploadPart(ctx, id, 1, bytes.NewReader(part), int64(len(part))); err != nil {
+		t.Fatal(err)
+	}
+	parts, err := driver.m.Parts(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploaded := parts[1]
+	if len(uploaded.Chunks) == 0 {
+		t.Fatal("the part recorded no chunks")
+	}
+
+	if n, err := driver.c.ExpireUploads(ctx); err != nil {
+		t.Fatal(err)
+	} else if n != 0 {
+		t.Errorf("expired %d uploads that are minutes old", n)
+	}
+	if st := collectEverywhere(t, tc, 0); st.Collected != 0 {
+		t.Errorf("collected %d chunks of a live upload", st.Collected)
+	}
+
+	u, err := driver.m.Upload(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.Created = time.Now().Add(-cluster.UploadMaxAge - time.Second)
+	if err := driver.m.CreateUpload(ctx, id, u); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := driver.c.ExpireUploads(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("expired %d uploads, want 1", n)
+	}
+	if _, err := driver.m.Upload(ctx, id); !errors.Is(err, meta.ErrNotFound) {
+		t.Errorf("expired upload is still recorded: %v", err)
+	}
+
+	collectEverywhere(t, tc, 0)
+	for _, node := range uploaded.Nodes {
+		for _, ref := range uploaded.Chunks {
+			if tc.nodes[node].has(ref) {
+				t.Errorf("%s still holds chunk %s after the abandoned upload was expired", node, ref.ID)
+			}
+		}
 	}
 }
 

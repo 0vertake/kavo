@@ -65,14 +65,23 @@ func (s *Store) Upload(ctx context.Context, id string) (Upload, error) {
 
 // CommitPart records a part's manifest. The part's chunks are already durable by
 // the time this is called, so a part behaves like a small object that only the
-// upload can see.
+// upload can see. The upload record has to still be there: an abort or an expiry
+// that won the race would otherwise leave a part whose upload no longer exists,
+// which collection would keep forever.
 func (s *Store) CommitPart(ctx context.Context, id string, number int, m object.Manifest) error {
 	data, err := json.Marshal(m)
 	if err != nil {
 		return fmt.Errorf("meta: marshal part %d of upload %s: %w", number, id, err)
 	}
-	if _, err := s.client.Put(ctx, s.partKey(id, number), string(data)); err != nil {
+	resp, err := s.client.Txn(ctx).
+		If(clientv3.Compare(clientv3.CreateRevision(s.uploadKey(id)), ">", 0)).
+		Then(clientv3.OpPut(s.partKey(id, number), string(data))).
+		Commit()
+	if err != nil {
 		return fmt.Errorf("meta: commit part %d of upload %s: %w", number, id, err)
+	}
+	if !resp.Succeeded {
+		return fmt.Errorf("%w: upload %s", ErrNotFound, id)
 	}
 	return nil
 }
@@ -276,13 +285,56 @@ func (s *Store) completionKey(id string) string {
 }
 
 // DeleteUpload forgets an upload and its parts. It says nothing about the parts'
-// chunks: a completed upload's chunks belong to the object's manifest now, and an
-// aborted one's are reclaimed by the caller before this is called.
+// chunks: collection reclaims them once nothing names them.
 func (s *Store) DeleteUpload(ctx context.Context, id string) error {
 	if _, err := s.client.Delete(ctx, s.uploadPrefix(id), clientv3.WithPrefix()); err != nil {
 		return fmt.Errorf("meta: delete upload %s: %w", id, err)
 	}
 	return nil
+}
+
+// ExpireUploads forgets every in-flight upload created at or before cutoff.
+// Collection cannot tell an abandoned upload from one still in progress, so the
+// records have to go first; the sweep then reclaims the parts.
+func (s *Store) ExpireUploads(ctx context.Context, cutoff time.Time) (int, error) {
+	start := path.Join(s.prefix, "uploads") + "/"
+	end := clientv3.GetPrefixRangeEnd(start)
+	var n int
+	for {
+		if start >= end {
+			return n, nil
+		}
+		resp, err := s.client.Get(ctx, start,
+			clientv3.WithRange(end),
+			clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend),
+			clientv3.WithLimit(64),
+		)
+		if err != nil {
+			return n, fmt.Errorf("meta: scan uploads from %q: %w", start, err)
+		}
+		if len(resp.Kvs) == 0 {
+			return n, nil
+		}
+		for _, kv := range resp.Kvs {
+			key := string(kv.Key)
+			start = After(key)
+			if !strings.HasSuffix(key, "/upload") {
+				continue
+			}
+			var u Upload
+			if err := json.Unmarshal(kv.Value, &u); err != nil {
+				return n, fmt.Errorf("meta: corrupt upload %s: %w", key, err)
+			}
+			if u.Created.After(cutoff) {
+				continue
+			}
+			id := path.Base(path.Dir(key))
+			if err := s.DeleteUpload(ctx, id); err != nil {
+				return n, err
+			}
+			n++
+		}
+	}
 }
 
 // uploadPrefix covers an upload's record and all its parts, so that forgetting an
