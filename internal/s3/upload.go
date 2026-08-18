@@ -36,12 +36,14 @@ type completeRequest struct {
 }
 
 type completeResult struct {
-	XMLName  xml.Name `xml:"CompleteMultipartUploadResult"`
-	XMLNS    string   `xml:"xmlns,attr"`
-	Location string   `xml:"Location"`
-	Bucket   string   `xml:"Bucket"`
-	Key      string   `xml:"Key"`
-	ETag     string   `xml:"ETag"`
+	XMLName        xml.Name `xml:"CompleteMultipartUploadResult"`
+	XMLNS          string   `xml:"xmlns,attr"`
+	Location       string   `xml:"Location"`
+	Bucket         string   `xml:"Bucket"`
+	Key            string   `xml:"Key"`
+	ETag           string   `xml:"ETag"`
+	ChecksumCRC32C string   `xml:"ChecksumCRC32C,omitempty"`
+	ChecksumType   string   `xml:"ChecksumType,omitempty"`
 }
 
 // maxCompleteRequest bounds the completion body. 10,000 parts of roughly 60 bytes
@@ -261,14 +263,30 @@ func (h *handler) uploadPart(w http.ResponseWriter, r *http.Request, id string) 
 		return
 	}
 
-	etag, err := h.cluster.UploadPart(r.Context(), id, number, r.Body, r.ContentLength)
+	crc32c, err := declaredCRC32C(r.Header)
+	if err != nil {
+		fail(w, r, errInvalidDigest, err)
+		return
+	}
+	opts := cluster.PutOptions{Size: r.ContentLength, CRC32C: crc32c}
+	if len(announcedTrailers(r.Header)) > 0 {
+		body := r.Body
+		opts.TrailingCRC32C = func() (*uint32, error) {
+			return declaredTrailingCRC32C(body)
+		}
+	}
+
+	m, err := h.cluster.UploadPart(r.Context(), id, number, r.Body, opts)
 	if err != nil {
 		fail(w, r, uploadError(err), err)
 		return
 	}
 	// The client keeps this and sends it back on completion, which is how it finds
 	// out that a part arrived intact.
-	w.Header().Set("ETag", `"`+etag+`"`)
+	w.Header().Set("ETag", `"`+m.ETag+`"`)
+	if m.CRC32C != nil && (crc32c != nil || requestedCRC32C(r.Header)) {
+		w.Header().Set("X-Amz-Checksum-Crc32c", encodeCRC32C(*m.CRC32C))
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -277,10 +295,11 @@ func (h *handler) uploadPart(w http.ResponseWriter, r *http.Request, id string) 
 // wrong one back cannot complete its upload — so an empty body here is a copy that
 // can never be finished, which is what an ignored copy source produced.
 type copyPartResult struct {
-	XMLName      xml.Name `xml:"CopyPartResult"`
-	XMLNS        string   `xml:"xmlns,attr"`
-	ETag         string   `xml:"ETag"`
-	LastModified string   `xml:"LastModified"`
+	XMLName        xml.Name `xml:"CopyPartResult"`
+	XMLNS          string   `xml:"xmlns,attr"`
+	ETag           string   `xml:"ETag"`
+	LastModified   string   `xml:"LastModified"`
+	ChecksumCRC32C string   `xml:"ChecksumCRC32C,omitempty"`
 }
 
 // copyPart stores a part copied from a range of another object.
@@ -313,16 +332,26 @@ func (h *handler) copyPart(w http.ResponseWriter, r *http.Request, id string, nu
 		return
 	}
 
-	etag, err := h.cluster.CopyPart(r.Context(), id, number, src, off, length)
+	crc32c, err := declaredCRC32C(r.Header)
+	if err != nil {
+		fail(w, r, errInvalidDigest, err)
+		return
+	}
+
+	m, err := h.cluster.CopyPart(r.Context(), id, number, src, off, length, cluster.PutOptions{CRC32C: crc32c})
 	if err != nil {
 		fail(w, r, uploadError(err), err)
 		return
 	}
-	writeXML(w, r, copyPartResult{
+	result := copyPartResult{
 		XMLNS:        s3XMLNS,
-		ETag:         `"` + etag + `"`,
+		ETag:         `"` + m.ETag + `"`,
 		LastModified: time.Now().UTC().Format(time.RFC3339),
-	})
+	}
+	if m.CRC32C != nil && (crc32c != nil || requestedCRC32C(r.Header)) {
+		result.ChecksumCRC32C = encodeCRC32C(*m.CRC32C)
+	}
+	writeXML(w, r, result)
 }
 
 // parseCopyRange reads x-amz-copy-source-range, which names the bytes of the source
@@ -385,22 +414,33 @@ func (h *handler) completeUpload(w http.ResponseWriter, r *http.Request, key, id
 		parts[i] = cluster.CompletedPart{Number: p.Number, ETag: p.ETag}
 	}
 
+	crc32c, err := declaredCRC32C(r.Header)
+	if err != nil {
+		fail(w, r, errInvalidDigest, err)
+		return
+	}
+
 	// A completion can take a while — it reads every part's manifest — and S3
 	// clients tolerate that. What they do not tolerate is a 200 with an error in
 	// the body, which S3 itself does and which is a well-known trap; kavo answers
 	// with a status that means what it says.
-	m, err := h.cluster.CompleteUpload(r.Context(), id, parts)
+	m, err := h.cluster.CompleteUpload(r.Context(), id, parts, crc32c)
 	if err != nil {
 		fail(w, r, uploadError(err), err)
 		return
 	}
-	writeXML(w, r, completeResult{
+	result := completeResult{
 		XMLNS:    s3XMLNS,
 		Location: "/" + key,
 		Bucket:   r.PathValue("bucket"),
 		Key:      r.PathValue("key"),
 		ETag:     etag(m),
-	})
+	}
+	if m.CRC32C != nil && (crc32c != nil || requestedCRC32C(r.Header)) {
+		result.ChecksumCRC32C = encodeCRC32C(*m.CRC32C)
+		result.ChecksumType = "FULL_OBJECT"
+	}
+	writeXML(w, r, result)
 }
 
 func (h *handler) abortUpload(w http.ResponseWriter, r *http.Request, id string) {

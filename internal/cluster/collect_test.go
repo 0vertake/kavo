@@ -150,7 +150,7 @@ func TestChunksOfAnUploadInProgressAreKept(t *testing.T) {
 		t.Fatalf("create upload: %v", err)
 	}
 	part := randBytes(2 * testChunkSize)
-	if _, err := outsider.c.UploadPart(context.Background(), id, 1, bytes.NewReader(part), int64(len(part))); err != nil {
+	if _, err := outsider.c.UploadPart(context.Background(), id, 1, bytes.NewReader(part), cluster.PutOptions{Size: int64(len(part))}); err != nil {
 		t.Fatalf("upload part: %v", err)
 	}
 
@@ -174,7 +174,7 @@ func TestChunksOfAnUploadInProgressAreKept(t *testing.T) {
 
 	// And once the upload becomes an object, the same chunks are still referenced —
 	// by the object now, not the part.
-	if _, err := outsider.c.CompleteUpload(context.Background(), id, []cluster.CompletedPart{{Number: 1, ETag: ""}}); err != nil {
+	if _, err := outsider.c.CompleteUpload(context.Background(), id, []cluster.CompletedPart{{Number: 1, ETag: ""}}, nil); err != nil {
 		t.Fatalf("complete upload: %v", err)
 	}
 	if st := collectEverywhere(t, tc, 0); st.Collected != 0 {

@@ -229,11 +229,11 @@ kavo does not do yet, and they are worth naming honestly:
   a manifest is, for a feature whose only user is a client parallelising a download it could do with
   ranges.
 - **Non-MD5 checksums** (`x-amz-checksum-crc32`, `-crc32c`, `-sha1`, `-sha256`). CRC32C on a
-  whole-object PUT is checked and stored, whether the client names it in a header or in an
-  aws-chunked trailer, and a HEAD/GET with `x-amz-checksum-mode: ENABLED` returns it. The remaining
-  failures are SHA-256 and CRC64NVME on that same PUT, and every checksum on a multipart upload.
-  Chunks were already CRC32C-checksummed on disk; what was missing was the S3 header naming the
-  *object*.
+  whole-object PUT and on a multipart upload (FULL_OBJECT) is checked and stored, whether the client
+  names it in a header or in an aws-chunked trailer, and a HEAD/GET with `x-amz-checksum-mode: ENABLED`
+  returns it. The remaining failures are SHA-256 and CRC64NVME on that same PUT, COMPOSITE, and
+  checksums other than CRC32C on a multipart upload. Chunks were already CRC32C-checksummed on disk;
+  what was missing was the S3 header naming the *object*.
 - **Error codes for malformed authorization and date headers**, where kavo answers a plausible
   refusal with the wrong code — a client is told `AccessDenied` where S3 says
   `MissingSecurityHeader`. Both refuse, so nothing is stored on a bad signature; a client

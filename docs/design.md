@@ -512,10 +512,12 @@ added for the same reason the six were:
   digest was sent" would store the object under a promise nobody made.
 
 - **CRC32C.** The write already hashes the body to make the ETag; CRC32C (Castagnoli) is hashed
-  next to it. A client that names it — `x-amz-checksum-crc32c` on the request, or an aws-chunked
-  trailer — is compared before commit, and a mismatch stores nothing. A HEAD or GET that asks with
-  `x-amz-checksum-mode: ENABLED` gets the stored value back. SHA-256, CRC32, CRC64NVME, and a
-  checksum on a part or a copy are 501 rather than stored unread.
+  next to it. A client that names it — `x-amz-checksum-crc32c` on a PUT or a part, or an aws-chunked
+  trailer — is compared before commit, and a mismatch stores nothing. Completing a multipart upload
+  combines the parts' CRC32Cs into the object's (FULL_OBJECT) rather than re-reading the bytes, and
+  a declared value that does not match is refused the same way. A HEAD or GET that asks with
+  `x-amz-checksum-mode: ENABLED` gets the stored value back. SHA-256, CRC32, CRC64NVME, COMPOSITE,
+  and a checksum on CopyObject are 501 rather than stored unread.
 
 - **User metadata and the headers that describe the bytes.** `x-amz-meta-*`, plus `Cache-Control`,
   `Content-Disposition`, `Content-Encoding`, `Content-Language` and `Expires`: stored with the

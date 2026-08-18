@@ -30,10 +30,11 @@ func (n *node) awsTuned(t *testing.T, s3Config string, args ...string) (string, 
 	t.Helper()
 	// The developer's own config is bypassed: it can point at a real account.
 	// Request checksums are pinned to when_required at both the profile and the
-	// process: recent CLIs default to when_supported and send CRC64NVME, or
-	// CRC32C on CreateMultipartUpload, which this server 501s rather than store
-	// unread. The setting lives on the profile, not under `s3 =` — that is the
-	// shared AWS config key, and putting it in the s3 subsection was a no-op.
+	// process: recent CLIs default to when_supported and send CRC64NVME, which
+	// this server 501s rather than store unread. CRC32C on a multipart upload is
+	// checked; the pin is the other algorithms. The setting lives on the
+	// profile, not under `s3 =` — that is the shared AWS config key, and putting
+	// it in the s3 subsection was a no-op.
 	config := filepath.Join(t.TempDir(), "config")
 	settings := "[default]\nrequest_checksum_calculation = when_required\n"
 	if s3Config != "" {

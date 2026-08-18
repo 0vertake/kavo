@@ -152,7 +152,7 @@ func TestACopiedPartIsAllOrNothingWhenItsSourceStopsReading(t *testing.T) {
 		}
 	}
 
-	if _, err := outsider.c.CopyPart(context.Background(), id, 1, m, 0, m.Size); err == nil {
+	if _, err := outsider.c.CopyPart(context.Background(), id, 1, m, 0, m.Size, cluster.PutOptions{}); err == nil {
 		t.Fatal("copying a part from a source that stops reading succeeded, so a client holds an etag for half a range")
 	}
 
