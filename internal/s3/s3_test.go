@@ -1413,6 +1413,9 @@ func TestCRC32COnAPutIsVerifiedAndReplayed(t *testing.T) {
 	if got := aws.ToString(head.ChecksumCRC32C); got != sum {
 		t.Errorf("HEAD checksum = %q, want %q", got, sum)
 	}
+	if head.ChecksumType != types.ChecksumTypeFullObject {
+		t.Errorf("HEAD checksum type = %q, want FULL_OBJECT", head.ChecksumType)
+	}
 
 	_, err = client.PutObject(t.Context(), &awss3.PutObjectInput{
 		Bucket: aws.String("bucket"), Key: aws.String("wrong.bin"),

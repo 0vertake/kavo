@@ -4,7 +4,7 @@ Ceph's [`s3-tests`](https://github.com/ceph/s3-tests) is the suite S3 implementa
 against. It is an independent oracle in the strongest sense available: nobody involved in kavo chose
 what it asserts, and it encodes S3's behaviour as observed by people who had to match it.
 
-**178 of 886 pass. 614 fail, 94 the suite skips itself, and nothing errors** — every test reaches a
+**179 of 886 pass. 613 fail, 94 the suite skips itself, and nothing errors** — every test reaches a
 verdict rather than dying in setup. The pass count is not the interesting number on its own, because
 most of what the suite covers is deliberately absent here (see the locked subset in
 `docs/design.md`). What is interesting is the classification below: what fails because of an
@@ -23,6 +23,7 @@ The count has moved eight times, and three of those moves were downward on purpo
 | 169 | refusing an object's subresources, which had been answered by overwriting the object |
 | 176 | `UploadPartCopy`, and answering a read of an object's tags with none |
 | 178 | RFC 822 `Date` / `x-amz-date` (boto3 writes UTC as `-0000`, which `http.ParseTime` rejects) |
+| 179 | a CRC64NVME of `bad` is `BadDigest` rather than `InvalidDigest` |
 
 The last line is the one that matters, and it is covered in "What the suite did not find" below:
 `PUT /key?tagging` was reaching the handler that writes an object and replacing the object with the
@@ -89,7 +90,8 @@ rather than on a missing config.
 
 The two `AWS_*_CHECKSUM_*` variables are load-bearing. botocore 1.43's default is
 `request_checksum_calculation=when_supported`, which attaches CRC32 to every PUT.
-Pinned (`when_required`) and unpinned both score **178 pass, 614 fail, 94 skip**.
+Pinned (`when_required`) is **179 pass, 613 fail, 94 skip**. Unpinned boto3, which attaches CRC32
+to every PUT, matched the pinned count after CRC32 was checked (it was 39 before).
 The unpinned run was **39 pass, 753 fail** before CRC32 was checked; default boto3
 PUTs no longer fail for naming an algorithm this store verifies.
 
@@ -171,10 +173,10 @@ The one query whose *value* decides is `?versionId`, which is honoured for `null
 ListObjectVersions reports for everything, and how a client empties a bucket — and refused for any
 other id, since answering an invented version with the live object deletes the wrong thing.
 
-## Why the 614 fail
+## Why the 613 fail
 
 `docs/classify.py` produces this table from the suite's own failure list. Each test lands in exactly
-one family — the first that matches its name, in the order shown — so the counts sum to 614 rather
+one family — the first that matches its name, in the order shown — so the counts sum to 613 rather
 than counting an SSE copy twice. A test is filed under what it is about, which is not always what it
 died on: many of these never reach their assertion because a `ListObjects` v1 call or a
 `GetBucketVersioning` in their setup is refused first.
@@ -197,7 +199,7 @@ died on: many of these never reach their assertion because a `ListObjects` v1 ca
 | 14 | tagging | anti-goal |
 | 2 | versioned and cross-account copy | anti-goal |
 | 9 | multipart upload edge cases | mixed, see below |
-| 9 | non-MD5 checksum algorithms (CRC32, SHA-256, CRC64NVME, COMPOSITE) | gap |
+| 8 | non-MD5 checksum algorithms (SHA-256, SHA-1, COMPOSITE) | gap |
 | 8 | anonymous and unsigned access | anti-goal: one key pair, everything signed |
 | 4 | error codes for malformed authorization and date headers | gap |
 | 3 | `100-continue` and `Expect` | gap |
@@ -215,9 +217,9 @@ requests it had been ignoring, which moved tests that had been passing into this
 only worth the numbers it produces, so both are filed here rather than quietly fixed.
 
 By verdict: **488 anti-goals, 47 v1 `ListObjects`, 28 consequences of buckets being prefixes, 24
-conditional writes, 25 named gaps, and 2 artifacts of the suite's own environment.** The gap column
+conditional writes, 24 named gaps, and 2 artifacts of the suite's own environment.** The gap column
 is the one to read — it is the list of things a client might reasonably expect and not get. With
-`UploadPartCopy` implemented it is led by non-MD5 checksums (9) and the multipart edge cases (9, of
+`UploadPartCopy` implemented it is led by non-MD5 checksums (8) and the multipart edge cases (9, of
 which 3 are `?partNumber` reads that still fail: an out-of-range part is 416 `InvalidPartNumber`
 where the suite wants 400 `InvalidPart`). Then the remaining authorization/length header cases (4)
 and `100-continue` (3). Nothing in the copy family is a gap any more.
@@ -244,10 +246,11 @@ kavo does not do yet, and they are worth naming honestly:
   client names them in a header or in an aws-chunked trailer, and a HEAD/GET with
   `x-amz-checksum-mode: ENABLED` returns them. Completing an upload combines the parts' hashes rather
   than re-reading the object. Create and complete echo `ChecksumAlgorithm` (FULL_OBJECT). A checksum
-  that is not a digest is `BadDigest`, matching S3 rather than Content-MD5's `InvalidDigest`. The last
-  measured run still filed nine tests here; CRC32 default PUTs no longer fail an unpinned boto3
-  (178, was 39). What remains unread is SHA-256, SHA-1, COMPOSITE, `GetObjectAttributes`, and a
-  checksum on CopyObject.
+  that is not a digest is `BadDigest`, matching S3 rather than Content-MD5's `InvalidDigest`. A HEAD
+  or GET with checksum mode also returns `x-amz-checksum-type: FULL_OBJECT`. Eight tests remain in
+  this row: SHA-256, SHA-1, COMPOSITE, and the CRC multipart helpers that then ask
+  `GetObjectAttributes`. An unpinned boto3 PUT no longer fails for naming CRC32 (39 before that
+  algorithm was checked).
 - **Malformed authorization and date headers.** A signed request with neither `x-amz-date` nor
   `Date` is `MissingSecurityHeader`. RFC 822 dates, including boto3's `-0000` UTC, are accepted.
   The four that remain are not wrong codes for a bad signature: `Transfer-Encoding: chunked` without

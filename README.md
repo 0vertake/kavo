@@ -113,16 +113,16 @@ acknowledge one it cannot make durable.
 ## How compatible is compatible
 
 Ceph's `s3-tests` is the suite S3 implementations are measured against, and nobody here chose what it
-asserts. It has 886 tests and kavo does not implement most of what they cover, on purpose. Of the 614
+asserts. It has 886 tests and kavo does not implement most of what they cover, on purpose. Of the 613
 that fail: **488 are explicit anti-goals** — ACLs, versioning, server-side encryption, object lock,
 bucket policy, lifecycle, logging, CORS, tagging, SigV2, browser form uploads — **47 are v1
 `ListObjects`**, which kavo answers only at v2, and **28 follow from buckets being prefixes** rather
 than records. **24 are conditional writes**, which would make the commit a compare-and-set and so
-need arguing for rather than adding. **25 are named gaps**, led by SHA-256 and COMPOSITE
+need arguing for rather than adding. **24 are named gaps**, led by SHA-256 and COMPOSITE
 checksums, and by `?partNumber` out of range answering 416 where S3 says 400. Two
 are artifacts of the suite's own environment.
 
-With that framing: **178 pass, 614 fail, 94 the suite skips, and nothing errors** — every test
+With that framing: **179 pass, 613 fail, 94 the suite skips, and nothing errors** — every test
 reaches a verdict rather than dying in setup, and every failure is accounted for in
 [`docs/s3-compatibility.md`](docs/s3-compatibility.md), which generates its breakdown from the
 suite's own output so it can be checked rather than believed. Of the tests covering the operations
@@ -143,7 +143,8 @@ destroyed it and was told the tag was set. Eight passes were tests doing precise
 the honest number — landing exactly where the measurement had started, which is a coincidence worth
 distrusting, since the same count covered `CopyObject`, conditional reads, `Content-MD5`, user
 metadata and three multipart calls that did not exist at the outset. Implementing `UploadPartCopy`
-then took it to 176, and accepting RFC 822 dates (boto3's `-0000` UTC) to 178. A pass count rewards a store for answering; only reading the failures tells you what
+then took it to 176, and accepting RFC 822 dates (boto3's `-0000` UTC) to 178. A malformed CRC64NVME
+is `BadDigest` rather than `InvalidDigest`, which is 179. A pass count rewards a store for answering; only reading the failures tells you what
 it answered with.
 
 That last one the suite did not find, and neither did kavo's own tests. It is also what led to the
