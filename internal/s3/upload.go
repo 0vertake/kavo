@@ -20,11 +20,13 @@ import (
 // all.
 
 type initiateResult struct {
-	XMLName  xml.Name `xml:"InitiateMultipartUploadResult"`
-	XMLNS    string   `xml:"xmlns,attr"`
-	Bucket   string   `xml:"Bucket"`
-	Key      string   `xml:"Key"`
-	UploadID string   `xml:"UploadId"`
+	XMLName           xml.Name `xml:"InitiateMultipartUploadResult"`
+	XMLNS             string   `xml:"xmlns,attr"`
+	Bucket            string   `xml:"Bucket"`
+	Key               string   `xml:"Key"`
+	UploadID          string   `xml:"UploadId"`
+	ChecksumAlgorithm string   `xml:"ChecksumAlgorithm,omitempty"`
+	ChecksumType      string   `xml:"ChecksumType,omitempty"`
 }
 
 type completeRequest struct {
@@ -45,6 +47,7 @@ type completeResult struct {
 	ChecksumCRC32C    string   `xml:"ChecksumCRC32C,omitempty"`
 	ChecksumCRC32     string   `xml:"ChecksumCRC32,omitempty"`
 	ChecksumCRC64NVME string   `xml:"ChecksumCRC64NVME,omitempty"`
+	ChecksumAlgorithm string   `xml:"ChecksumAlgorithm,omitempty"`
 	ChecksumType      string   `xml:"ChecksumType,omitempty"`
 }
 
@@ -89,12 +92,20 @@ func (h *handler) createUpload(w http.ResponseWriter, r *http.Request, key strin
 		fail(w, r, storeError(err), err)
 		return
 	}
-	writeXML(w, r, initiateResult{
+	result := initiateResult{
 		XMLNS:    s3XMLNS,
 		Bucket:   r.PathValue("bucket"),
 		Key:      r.PathValue("key"),
 		UploadID: id,
-	})
+	}
+	if algo := canonicalChecksumAlgo(r.Header); algo != "" {
+		result.ChecksumAlgorithm = algo
+		result.ChecksumType = "FULL_OBJECT"
+		// The SDKs read these from headers, not from the XML body.
+		w.Header().Set("x-amz-checksum-algorithm", algo)
+		w.Header().Set("x-amz-checksum-type", "FULL_OBJECT")
+	}
+	writeXML(w, r, result)
 }
 
 // listPartsResult is the ListParts response. A client that lost track of what it
@@ -267,17 +278,17 @@ func (h *handler) uploadPart(w http.ResponseWriter, r *http.Request, id string) 
 
 	crc32c, err := declaredCRC32C(r.Header)
 	if err != nil {
-		fail(w, r, errInvalidDigest, err)
+		fail(w, r, errMalformedChecksum, err)
 		return
 	}
 	crc32sum, err := declaredCRC32(r.Header)
 	if err != nil {
-		fail(w, r, errInvalidDigest, err)
+		fail(w, r, errMalformedChecksum, err)
 		return
 	}
 	crc64nvme, err := declaredCRC64NVME(r.Header)
 	if err != nil {
-		fail(w, r, errInvalidDigest, err)
+		fail(w, r, errMalformedChecksum, err)
 		return
 	}
 	opts := cluster.PutOptions{Size: r.ContentLength, CRC32C: crc32c, CRC32: crc32sum, CRC64NVME: crc64nvme}
@@ -349,17 +360,17 @@ func (h *handler) copyPart(w http.ResponseWriter, r *http.Request, id string, nu
 
 	crc32c, err := declaredCRC32C(r.Header)
 	if err != nil {
-		fail(w, r, errInvalidDigest, err)
+		fail(w, r, errMalformedChecksum, err)
 		return
 	}
 	crc32sum, err := declaredCRC32(r.Header)
 	if err != nil {
-		fail(w, r, errInvalidDigest, err)
+		fail(w, r, errMalformedChecksum, err)
 		return
 	}
 	crc64nvme, err := declaredCRC64NVME(r.Header)
 	if err != nil {
-		fail(w, r, errInvalidDigest, err)
+		fail(w, r, errMalformedChecksum, err)
 		return
 	}
 
@@ -447,17 +458,17 @@ func (h *handler) completeUpload(w http.ResponseWriter, r *http.Request, key, id
 
 	crc32c, err := declaredCRC32C(r.Header)
 	if err != nil {
-		fail(w, r, errInvalidDigest, err)
+		fail(w, r, errMalformedChecksum, err)
 		return
 	}
 	crc32sum, err := declaredCRC32(r.Header)
 	if err != nil {
-		fail(w, r, errInvalidDigest, err)
+		fail(w, r, errMalformedChecksum, err)
 		return
 	}
 	crc64nvme, err := declaredCRC64NVME(r.Header)
 	if err != nil {
-		fail(w, r, errInvalidDigest, err)
+		fail(w, r, errMalformedChecksum, err)
 		return
 	}
 
@@ -479,14 +490,17 @@ func (h *handler) completeUpload(w http.ResponseWriter, r *http.Request, key, id
 	}
 	if m.CRC32C != nil && (crc32c != nil || requestedCRC32C(r.Header)) {
 		result.ChecksumCRC32C = encodeCRC32C(*m.CRC32C)
+		result.ChecksumAlgorithm = "CRC32C"
 		result.ChecksumType = "FULL_OBJECT"
 	}
 	if m.CRC32 != nil && (crc32sum != nil || requestedCRC32(r.Header)) {
 		result.ChecksumCRC32 = encodeCRC32(*m.CRC32)
+		result.ChecksumAlgorithm = "CRC32"
 		result.ChecksumType = "FULL_OBJECT"
 	}
 	if m.CRC64NVME != nil && (crc64nvme != nil || requestedCRC64NVME(r.Header)) {
 		result.ChecksumCRC64NVME = encodeCRC64NVME(*m.CRC64NVME)
+		result.ChecksumAlgorithm = "CRC64NVME"
 		result.ChecksumType = "FULL_OBJECT"
 	}
 	writeXML(w, r, result)

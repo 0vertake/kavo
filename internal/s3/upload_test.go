@@ -1067,6 +1067,9 @@ func TestCRC32COnAMultipartUploadIsVerifiedAndReplayed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
+	if create.ChecksumAlgorithm != types.ChecksumAlgorithmCrc32c {
+		t.Errorf("create algorithm = %q, want CRC32C", create.ChecksumAlgorithm)
+	}
 	id := create.UploadId
 
 	_, err = client.UploadPart(t.Context(), &awss3.UploadPartInput{
@@ -1172,6 +1175,9 @@ func TestCRC32OnAMultipartUploadIsVerifiedAndReplayed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
+	if create.ChecksumAlgorithm != types.ChecksumAlgorithmCrc32 {
+		t.Errorf("create algorithm = %q, want CRC32", create.ChecksumAlgorithm)
+	}
 	id := create.UploadId
 
 	_, err = client.UploadPart(t.Context(), &awss3.UploadPartInput{
@@ -1276,6 +1282,9 @@ func TestCRC64NVMEOnAMultipartUploadIsVerifiedAndReplayed(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("create: %v", err)
+	}
+	if create.ChecksumAlgorithm != types.ChecksumAlgorithmCrc64nvme {
+		t.Errorf("create algorithm = %q, want CRC64NVME", create.ChecksumAlgorithm)
 	}
 	id := create.UploadId
 

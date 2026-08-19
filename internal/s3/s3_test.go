@@ -1538,6 +1538,33 @@ func TestCRC64NVMEOnAPutIsVerifiedAndReplayed(t *testing.T) {
 	}
 }
 
+// S3 answers BadDigest for a checksum that is not a digest, even though a
+// malformed Content-MD5 is InvalidDigest. The suite's CRC64NVME=bad is that case.
+func TestAMalformedChecksumIsBadDigest(t *testing.T) {
+	_, endpoint := newGatewayURL(t, 3, testChunkSize)
+	body := []byte("hello")
+	req, err := http.NewRequest(http.MethodPut, endpoint+"/bucket/bad-crc.bin", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("x-amz-checksum-crc64nvme", "bad")
+	req.Header.Set("x-amz-checksum-algorithm", "CRC64NVME")
+	req.ContentLength = int64(len(body))
+	signS3(t, req, "UNSIGNED-PAYLOAD")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusBadRequest || !bytes.Contains(got, []byte("BadDigest")) {
+		t.Errorf("malformed CRC64NVME = %d %s, want BadDigest", resp.StatusCode, got)
+	}
+}
+
 // SHA-256, COMPOSITE, and a checksum on CopyObject are all requests to record a
 // number this path would not look at. Refused rather than stored: the same rule
 // as encryption and tagging. CRC32, CRC32C and CRC64NVME on a PUT or multipart
