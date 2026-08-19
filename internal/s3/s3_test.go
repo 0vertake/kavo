@@ -1358,6 +1358,13 @@ func crc32cOf(data []byte) string {
 	return base64.StdEncoding.EncodeToString(b[:])
 }
 
+func crc32Of(data []byte) string {
+	sum := crc32.ChecksumIEEE(data)
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], sum)
+	return base64.StdEncoding.EncodeToString(b[:])
+}
+
 func crc64nvmeOf(data []byte) string {
 	sum := object.CRC64NVME(data)
 	var b [8]byte
@@ -1423,6 +1430,60 @@ func TestCRC32COnAPutIsVerifiedAndReplayed(t *testing.T) {
 	}
 }
 
+func TestCRC32OnAPutIsVerifiedAndReplayed(t *testing.T) {
+	client := newGateway(t)
+	data := []byte("hello ieee checksum")
+	sum := crc32Of(data)
+
+	put, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("checked32.bin"),
+		Body: bytes.NewReader(data), ChecksumCRC32: aws.String(sum),
+		ChecksumAlgorithm: types.ChecksumAlgorithmCrc32,
+	})
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if got := aws.ToString(put.ChecksumCRC32); got != sum {
+		t.Errorf("PUT checksum = %q, want %q", got, sum)
+	}
+
+	head, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("checked32.bin"),
+	})
+	if err != nil {
+		t.Fatalf("head: %v", err)
+	}
+	if head.ChecksumCRC32 != nil {
+		t.Errorf("HEAD without checksum mode returned %q", aws.ToString(head.ChecksumCRC32))
+	}
+
+	head, err = client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("checked32.bin"),
+		ChecksumMode: types.ChecksumModeEnabled,
+	})
+	if err != nil {
+		t.Fatalf("head with checksum mode: %v", err)
+	}
+	if got := aws.ToString(head.ChecksumCRC32); got != sum {
+		t.Errorf("HEAD checksum = %q, want %q", got, sum)
+	}
+
+	_, err = client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("wrong32.bin"),
+		Body: bytes.NewReader(data), ChecksumCRC32: aws.String("AAAAAA=="),
+		ChecksumAlgorithm: types.ChecksumAlgorithmCrc32,
+	})
+	var api smithy.APIError
+	if !errors.As(err, &api) || api.ErrorCode() != "BadDigest" {
+		t.Errorf("mismatched CRC32 = %v, want BadDigest", err)
+	}
+	if _, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("wrong32.bin"),
+	}); err == nil {
+		t.Error("the mismatched write stored the object")
+	}
+}
+
 func TestCRC64NVMEOnAPutIsVerifiedAndReplayed(t *testing.T) {
 	client := newGateway(t)
 	data := []byte("hello crc64nvme")
@@ -1477,9 +1538,9 @@ func TestCRC64NVMEOnAPutIsVerifiedAndReplayed(t *testing.T) {
 	}
 }
 
-// SHA-256, CRC32, COMPOSITE, and a checksum on CopyObject are all requests to
-// record a number this path would not look at. Refused rather than stored: the
-// same rule as encryption and tagging. CRC32C and CRC64NVME on a PUT or multipart
+// SHA-256, COMPOSITE, and a checksum on CopyObject are all requests to record a
+// number this path would not look at. Refused rather than stored: the same rule
+// as encryption and tagging. CRC32, CRC32C and CRC64NVME on a PUT or multipart
 // upload are checked, so they are not among these.
 func TestChecksumsThisServerDoesNotVerifyAreRefused(t *testing.T) {
 	client := newGateway(t)
@@ -1560,21 +1621,50 @@ func TestTrailingCRC32COnAPutIsVerified(t *testing.T) {
 	}); err == nil {
 		t.Error("the mismatched write stored the object")
 	}
+}
 
-	req, err := http.NewRequest(http.MethodPut, endpoint+"/bucket/ieee.bin", http.NoBody)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("x-amz-trailer", "x-amz-checksum-crc32")
-	signS3(t, req, "UNSIGNED-PAYLOAD")
-	resp, err = http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, _ = io.ReadAll(resp.Body)
+func TestTrailingCRC32OnAPutIsVerified(t *testing.T) {
+	client, endpoint := newGatewayURL(t, 3, testChunkSize)
+	data := []byte("hello trailing ieee")
+	sum := crc32Of(data)
+
+	resp := putUnsignedTrailer(t, endpoint, "trailed32.bin", data, sum, "x-amz-checksum-crc32", "CRC32")
+	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusNotImplemented || !bytes.Contains(body, []byte("NotImplemented")) {
-		t.Errorf("CRC32 trailer = %d %s, want NotImplemented", resp.StatusCode, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT = %d: %s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("X-Amz-Checksum-Crc32"); got != sum {
+		t.Errorf("PUT checksum = %q, want %q", got, sum)
+	}
+
+	head, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("trailed32.bin"),
+		ChecksumMode: types.ChecksumModeEnabled,
+	})
+	if err != nil {
+		t.Fatalf("head: %v", err)
+	}
+	if got := aws.ToString(head.ChecksumCRC32); got != sum {
+		t.Errorf("HEAD checksum = %q, want %q", got, sum)
+	}
+
+	resp = putUnsignedTrailer(t, endpoint, "wrong-trail32.bin", data, "AAAAAA==", "x-amz-checksum-crc32", "CRC32")
+	body, err = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusBadRequest || !bytes.Contains(body, []byte("BadDigest")) {
+		t.Errorf("mismatched trailer = %d %s, want BadDigest", resp.StatusCode, body)
+	}
+	if _, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("wrong-trail32.bin"),
+	}); err == nil {
+		t.Error("the mismatched write stored the object")
 	}
 }
 

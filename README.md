@@ -118,9 +118,9 @@ that fail: **488 are explicit anti-goals** — ACLs, versioning, server-side enc
 bucket policy, lifecycle, logging, CORS, tagging, SigV2, browser form uploads — **47 are v1
 `ListObjects`**, which kavo answers only at v2, and **28 follow from buckets being prefixes** rather
 than records. **24 are conditional writes**, which would make the commit a compare-and-set and so
-need arguing for rather than adding. **25 are named gaps**, led by SHA-256, CRC32 and COMPOSITE
-checksums, and by `?partNumber` out of range answering 416 where S3 says 400. Two
-are artifacts of the suite's own environment.
+need arguing for rather than adding. **25 are named gaps**, led by SHA-256 and COMPOSITE
+checksums, and by `?partNumber` out of range answering 416 where S3 says 400. CRC32 was in that
+count on the last measured run and is checked now. Two are artifacts of the suite's own environment.
 
 With that framing: **178 pass, 614 fail, 94 the suite skips, and nothing errors** — every test
 reaches a verdict rather than dying in setup, and every failure is accounted for in
@@ -168,7 +168,7 @@ Deliberate anti-goals, not a roadmap: no IAM, no ACLs, no versioning, no lifecyc
 bucket policies, no `ListObjects` v1. The S3 subset is PUT, GET (including ranges), HEAD, DELETE,
 `ListObjectsV2`, multipart upload (including `UploadPartCopy`, which is how a client copies an object
 too large to copy in one call, and GET/HEAD `?partNumber` of a completed object) and `CopyObject`, with SigV4 verification, conditional reads,
-`Content-MD5` verification, CRC32C and CRC64NVME on a whole-object PUT or a multipart upload (header or aws-chunked trailer), and
+`Content-MD5` verification, CRC32, CRC32C and CRC64NVME on a whole-object PUT or a multipart upload (header or aws-chunked trailer), and
 `x-amz-meta-*` passthrough — plus the handful of calls clients make
 without being asked, which answer for records that do not exist: `CreateBucket` succeeds because a
 bucket is a prefix, `ListBuckets` is a root listing, `DeleteBucket` refuses while objects remain, and
@@ -181,9 +181,9 @@ gets the same treatment, while *reading* an object's tags is answered with none 
 only stays true because the write is refused rather than dropped.
 
 The gaps a client might actually notice are named in
-[`docs/s3-compatibility.md`](docs/s3-compatibility.md) rather than buried: SHA-256, CRC32 and
-COMPOSITE checksums, an out-of-range `?partNumber` answered 416 rather than 400, and HTTP
-`Transfer-Encoding: chunked` without a declared length. CRC32C and CRC64NVME on a
+[`docs/s3-compatibility.md`](docs/s3-compatibility.md) rather than buried: SHA-256, COMPOSITE
+checksums, an out-of-range `?partNumber` answered 416 rather than 400, and HTTP
+`Transfer-Encoding: chunked` without a declared length. CRC32, CRC32C and CRC64NVME on a
 whole-object PUT or a multipart upload are not among them — they are checked, stored, and returned
 on a HEAD/GET that asks. A GET of one completed part (`?partNumber`) works; only a number past the
 last part still fails, and only on the error code.

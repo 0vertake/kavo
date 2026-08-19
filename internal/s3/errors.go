@@ -79,7 +79,7 @@ var (
 	errEncryptionNotImplemented = apiError{"NotImplemented", http.StatusNotImplemented,
 		"This server does not encrypt objects, and will not pretend to have encrypted one."}
 	errChecksumNotImplemented = apiError{"NotImplemented", http.StatusNotImplemented,
-		"This server verifies CRC32C and CRC64NVME on a PUT or multipart upload that names them, and will not accept a checksum it would drop"}
+		"This server verifies CRC32, CRC32C and CRC64NVME on a PUT or multipart upload that names them, and will not accept a checksum it would drop"}
 	errTaggingNotImplemented = apiError{"NotImplemented", http.StatusNotImplemented,
 		"This server does not store object tags, and will not accept tags it would drop."}
 	errBucketNotEmpty = apiError{"BucketNotEmpty", http.StatusConflict,

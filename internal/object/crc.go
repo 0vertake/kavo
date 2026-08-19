@@ -66,6 +66,44 @@ func CombineCRC32C(a, b uint32, n int64) uint32 {
 	return a ^ b
 }
 
+// CombineCRC32 is CombineCRC32C for the IEEE polynomial, which is what S3
+// calls CRC32 and what botocore sends by default.
+func CombineCRC32(a, b uint32, n int64) uint32 {
+	if n <= 0 {
+		return a
+	}
+
+	var even, odd [32]uint32
+	odd[0] = crc32.IEEE
+	row := uint32(1)
+	for i := 1; i < 32; i++ {
+		odd[i] = row
+		row <<= 1
+	}
+	gf2Square(&even, &odd)
+	gf2Square(&odd, &even)
+
+	for {
+		gf2Square(&even, &odd)
+		if n&1 != 0 {
+			a = gf2Times(&even, a)
+		}
+		n >>= 1
+		if n == 0 {
+			break
+		}
+		gf2Square(&odd, &even)
+		if n&1 != 0 {
+			a = gf2Times(&odd, a)
+		}
+		n >>= 1
+		if n == 0 {
+			break
+		}
+	}
+	return a ^ b
+}
+
 // CombineCRC64NVME is CombineCRC32C for CRC-64/NVME. Same reason: completing a
 // multipart upload combines the parts rather than re-reading the object.
 func CombineCRC64NVME(a, b uint64, n int64) uint64 {

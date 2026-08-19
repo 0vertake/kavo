@@ -88,11 +88,10 @@ pair, because kavo authenticates exactly one — so the multi-user tests fail on
 rather than on a missing config.
 
 The two `AWS_*_CHECKSUM_*` variables are load-bearing. botocore 1.43's default is
-`request_checksum_calculation=when_supported`, which attaches CRC32 to every PUT. kavo refuses a
-checksum it would not verify, so an unpinned run against that boto3 scores **39 pass, 753 fail** —
-the same tests, a different client. The comparable measurement asks for a checksum only when a test
-names one. CRC32 on a default SDK PUT is why that algorithm is a named gap rather than nine tests
-that mention it.
+`request_checksum_calculation=when_supported`, which attaches CRC32 to every PUT. The last
+unpinned run against that boto3 scored **39 pass, 753 fail** because kavo refused CRC32; that
+algorithm is checked now, and the count stays until the suite is re-run. The comparable
+measurement still asks for a checksum only when a test names one.
 
 The other five test files are not run: `test_iam.py`, `test_sts.py`, `test_sns.py`,
 `test_s3control.py` and `test_s3select.py` target IAM, STS, SNS, S3 Control and S3 Select, which are
@@ -240,14 +239,15 @@ kavo does not do yet, and they are worth naming honestly:
   the out-of-range case: part 5 of a 4-part object is 416 `InvalidPartNumber` where the suite wants
   400 `InvalidPart`. Objects completed before parts were stored have no recoverable boundaries, and
   are treated as a single PUT: part 1 is the object, any other number is `InvalidPartNumber`.
-- **Non-MD5 checksums** (`x-amz-checksum-crc32`, `-sha1`, `-sha256`, COMPOSITE). CRC32C and CRC64NVME
+- **Non-MD5 checksums** (`x-amz-checksum-sha1`, `-sha256`, COMPOSITE). CRC32, CRC32C and CRC64NVME
   on a whole-object PUT and on a multipart upload (FULL_OBJECT) are checked and stored, whether the
   client names them in a header or in an aws-chunked trailer, and a HEAD/GET with
   `x-amz-checksum-mode: ENABLED` returns them. Completing an upload combines the parts' hashes rather
-  than re-reading the object. The nine tests still fail: a PUT of CRC64NVME with the value `bad` is
-  `InvalidDigest` where S3 says `BadDigest`; a multipart complete does not echo `ChecksumAlgorithm`;
-  SHA-256, CRC32, SHA-1 and COMPOSITE are refused. botocore's default CRC32 on every PUT is the
-  same refusal at the scale of a current Python SDK, which is why an unpinned suite run scores 39.
+  than re-reading the object. The nine tests still fail on the last measured run: a PUT of CRC64NVME
+  with the value `bad` is `InvalidDigest` where S3 says `BadDigest`; a multipart complete does not
+  echo `ChecksumAlgorithm`; SHA-256, SHA-1 and COMPOSITE are refused. CRC32 is checked now, including
+  botocore's default on every PUT, which is why the unpinned 39-pass score should move; the count
+  stays until the suite is re-run.
 - **Malformed authorization and date headers.** A signed request with neither `x-amz-date` nor
   `Date` is `MissingSecurityHeader`. RFC 822 dates, including boto3's `-0000` UTC, are accepted.
   The four that remain are not wrong codes for a bad signature: `Transfer-Encoding: chunked` without

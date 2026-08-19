@@ -101,6 +101,10 @@ type Manifest struct {
 	// A pointer because 0 is a real checksum (the empty object) and a missing
 	// value is an object written before this was stored.
 	CRC32C *uint32 `json:",omitempty"`
+	// CRC32 is the IEEE checksum, stored the same way. botocore's default PUT
+	// names this algorithm, so a store that only had Castagnoli refused every
+	// unsigned Python client.
+	CRC32 *uint32 `json:",omitempty"`
 	// CRC64NVME is the CRC-64/NVME of the object's bytes, stored the same way
 	// and for the same reason: a client that names it is checked, and a HEAD
 	// that asks gets it back. Default `aws s3 cp` sends this algorithm.

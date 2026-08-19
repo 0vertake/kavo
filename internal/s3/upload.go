@@ -43,6 +43,7 @@ type completeResult struct {
 	Key               string   `xml:"Key"`
 	ETag              string   `xml:"ETag"`
 	ChecksumCRC32C    string   `xml:"ChecksumCRC32C,omitempty"`
+	ChecksumCRC32     string   `xml:"ChecksumCRC32,omitempty"`
 	ChecksumCRC64NVME string   `xml:"ChecksumCRC64NVME,omitempty"`
 	ChecksumType      string   `xml:"ChecksumType,omitempty"`
 }
@@ -269,12 +270,17 @@ func (h *handler) uploadPart(w http.ResponseWriter, r *http.Request, id string) 
 		fail(w, r, errInvalidDigest, err)
 		return
 	}
+	crc32sum, err := declaredCRC32(r.Header)
+	if err != nil {
+		fail(w, r, errInvalidDigest, err)
+		return
+	}
 	crc64nvme, err := declaredCRC64NVME(r.Header)
 	if err != nil {
 		fail(w, r, errInvalidDigest, err)
 		return
 	}
-	opts := cluster.PutOptions{Size: r.ContentLength, CRC32C: crc32c, CRC64NVME: crc64nvme}
+	opts := cluster.PutOptions{Size: r.ContentLength, CRC32C: crc32c, CRC32: crc32sum, CRC64NVME: crc64nvme}
 	attachTrailingChecksums(&opts, r)
 
 	m, err := h.cluster.UploadPart(r.Context(), id, number, r.Body, opts)
@@ -287,6 +293,9 @@ func (h *handler) uploadPart(w http.ResponseWriter, r *http.Request, id string) 
 	w.Header().Set("ETag", `"`+m.ETag+`"`)
 	if m.CRC32C != nil && (crc32c != nil || requestedCRC32C(r.Header)) {
 		w.Header().Set("X-Amz-Checksum-Crc32c", encodeCRC32C(*m.CRC32C))
+	}
+	if m.CRC32 != nil && (crc32sum != nil || requestedCRC32(r.Header)) {
+		w.Header().Set("X-Amz-Checksum-Crc32", encodeCRC32(*m.CRC32))
 	}
 	if m.CRC64NVME != nil && (crc64nvme != nil || requestedCRC64NVME(r.Header)) {
 		w.Header().Set("X-Amz-Checksum-Crc64nvme", encodeCRC64NVME(*m.CRC64NVME))
@@ -304,6 +313,7 @@ type copyPartResult struct {
 	ETag              string   `xml:"ETag"`
 	LastModified      string   `xml:"LastModified"`
 	ChecksumCRC32C    string   `xml:"ChecksumCRC32C,omitempty"`
+	ChecksumCRC32     string   `xml:"ChecksumCRC32,omitempty"`
 	ChecksumCRC64NVME string   `xml:"ChecksumCRC64NVME,omitempty"`
 }
 
@@ -342,13 +352,18 @@ func (h *handler) copyPart(w http.ResponseWriter, r *http.Request, id string, nu
 		fail(w, r, errInvalidDigest, err)
 		return
 	}
+	crc32sum, err := declaredCRC32(r.Header)
+	if err != nil {
+		fail(w, r, errInvalidDigest, err)
+		return
+	}
 	crc64nvme, err := declaredCRC64NVME(r.Header)
 	if err != nil {
 		fail(w, r, errInvalidDigest, err)
 		return
 	}
 
-	m, err := h.cluster.CopyPart(r.Context(), id, number, src, off, length, cluster.PutOptions{CRC32C: crc32c, CRC64NVME: crc64nvme})
+	m, err := h.cluster.CopyPart(r.Context(), id, number, src, off, length, cluster.PutOptions{CRC32C: crc32c, CRC32: crc32sum, CRC64NVME: crc64nvme})
 	if err != nil {
 		fail(w, r, uploadError(err), err)
 		return
@@ -360,6 +375,9 @@ func (h *handler) copyPart(w http.ResponseWriter, r *http.Request, id string, nu
 	}
 	if m.CRC32C != nil && (crc32c != nil || requestedCRC32C(r.Header)) {
 		result.ChecksumCRC32C = encodeCRC32C(*m.CRC32C)
+	}
+	if m.CRC32 != nil && (crc32sum != nil || requestedCRC32(r.Header)) {
+		result.ChecksumCRC32 = encodeCRC32(*m.CRC32)
 	}
 	if m.CRC64NVME != nil && (crc64nvme != nil || requestedCRC64NVME(r.Header)) {
 		result.ChecksumCRC64NVME = encodeCRC64NVME(*m.CRC64NVME)
@@ -432,6 +450,11 @@ func (h *handler) completeUpload(w http.ResponseWriter, r *http.Request, key, id
 		fail(w, r, errInvalidDigest, err)
 		return
 	}
+	crc32sum, err := declaredCRC32(r.Header)
+	if err != nil {
+		fail(w, r, errInvalidDigest, err)
+		return
+	}
 	crc64nvme, err := declaredCRC64NVME(r.Header)
 	if err != nil {
 		fail(w, r, errInvalidDigest, err)
@@ -442,7 +465,7 @@ func (h *handler) completeUpload(w http.ResponseWriter, r *http.Request, key, id
 	// clients tolerate that. What they do not tolerate is a 200 with an error in
 	// the body, which S3 itself does and which is a well-known trap; kavo answers
 	// with a status that means what it says.
-	m, err := h.cluster.CompleteUpload(r.Context(), id, parts, crc32c, crc64nvme)
+	m, err := h.cluster.CompleteUpload(r.Context(), id, parts, crc32c, crc64nvme, crc32sum)
 	if err != nil {
 		fail(w, r, uploadError(err), err)
 		return
@@ -456,6 +479,10 @@ func (h *handler) completeUpload(w http.ResponseWriter, r *http.Request, key, id
 	}
 	if m.CRC32C != nil && (crc32c != nil || requestedCRC32C(r.Header)) {
 		result.ChecksumCRC32C = encodeCRC32C(*m.CRC32C)
+		result.ChecksumType = "FULL_OBJECT"
+	}
+	if m.CRC32 != nil && (crc32sum != nil || requestedCRC32(r.Header)) {
+		result.ChecksumCRC32 = encodeCRC32(*m.CRC32)
 		result.ChecksumType = "FULL_OBJECT"
 	}
 	if m.CRC64NVME != nil && (crc64nvme != nil || requestedCRC64NVME(r.Header)) {
