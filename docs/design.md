@@ -557,7 +557,7 @@ is encrypted while anyone can read it back without the key. That is the one fail
 cannot detect for itself, and it is worth being explicit that this rule *cost* pass count rather than
 earning it.
 
-External validation: Ceph `s3-tests`. **178 of 886 pass, nothing errors**, and every failure is
+External validation: Ceph `s3-tests`. **179 of 886 pass, nothing errors**, and every failure is
 classified in `docs/s3-compatibility.md` — as an anti-goal, a consequence of buckets being prefixes,
 or a named gap. The suite found four real defects, three of which kavo's own tests could not see;
 they are listed there too. It also found two sets of passes that were not real. Eighteen came from a
