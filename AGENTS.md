@@ -133,7 +133,7 @@ Rules that make these structural:
   upload, SigV4, `CopyObject`, and the six calls clients make unprompted: `CreateBucket`,
   `ListBuckets`, `DeleteBucket`, `DeleteObjects`, `ListObjectVersions`, `GetBucketLocation`.
   Conditional *reads* (`If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, and
-  the same four as `x-amz-copy-source-if-*` on a copy), `Content-MD5` verification, CRC32C and
+  the same four as `x-amz-copy-source-if-*` on a copy), `Content-MD5` verification, CRC32, CRC32C and
   CRC64NVME on a whole-object PUT or a multipart upload (header or aws-chunked trailer, and a HEAD/GET that asks for it with
   `x-amz-checksum-mode: ENABLED`), and user metadata
   (`x-amz-meta-*`, `Cache-Control`, `Content-Disposition`, `Content-Encoding`, `Content-Language`,
@@ -159,9 +159,9 @@ Rules that make these structural:
   `x-amz-server-side-encryption*` or a customer key is answered 501, because storing the object in
   plaintext and answering 200 tells a client its data is encrypted while anyone can read it. Ignoring
   those headers was worth twenty-two `s3-tests` passes, which is the clearest argument on record that
-  a pass count is not a measure of a store. SHA-256, CRC32, a trailing checksum other than CRC32C or CRC64NVME, COMPOSITE, and a
+  a pass count is not a measure of a store. SHA-256, a trailing checksum other than CRC32, CRC32C or CRC64NVME, COMPOSITE, and a
   checksum on CopyObject are refused for the same reason: the header asks to record a number
-  this write would not look at. CRC32C and CRC64NVME on a whole-object PUT or a multipart upload are
+  this write would not look at. CRC32, CRC32C and CRC64NVME on a whole-object PUT or a multipart upload are
   the exceptions that are actually checked, because the write already hashes the body to make the
   ETag — whether the client names it in a header or in an aws-chunked trailer — and completing
   an upload combines the parts' hashes rather than re-reading the object.

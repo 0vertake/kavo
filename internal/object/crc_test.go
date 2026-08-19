@@ -42,6 +42,31 @@ func TestCombineCRC32CMatchesASingleHash(t *testing.T) {
 	}
 }
 
+func TestCombineCRC32MatchesASingleHash(t *testing.T) {
+	table := crc32.MakeTable(crc32.IEEE)
+	cases := []struct {
+		a, b []byte
+	}{
+		{[]byte("hello"), []byte(" world")},
+		{[]byte{}, []byte("x")},
+		{[]byte("x"), []byte{}},
+		{bytes.Repeat([]byte("a"), 1), bytes.Repeat([]byte("b"), 7)},
+		{bytes.Repeat([]byte("a"), 1000), []byte("z")},
+		{bytes.Repeat([]byte{0}, 65537), []byte("tail")},
+		{randBytes(17), randBytes(4099)},
+	}
+	for _, tt := range cases {
+		a := crc32.Checksum(tt.a, table)
+		b := crc32.Checksum(tt.b, table)
+		got := CombineCRC32(a, b, int64(len(tt.b)))
+		want := crc32.Checksum(append(append([]byte{}, tt.a...), tt.b...), table)
+		if got != want {
+			t.Errorf("CombineCRC32(%d+%d bytes) = %08x, want %08x",
+				len(tt.a), len(tt.b), got, want)
+		}
+	}
+}
+
 func TestCRC64NVMEKnownAnswer(t *testing.T) {
 	// CRC catalogue check value for CRC-64/NVME over the ASCII digits 1–9.
 	got := CRC64NVME([]byte("123456789"))
