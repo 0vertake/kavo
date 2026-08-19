@@ -32,6 +32,7 @@ import (
 var (
 	ErrMissingSignature = errors.New("sigv4: request is not signed")
 	ErrMalformed        = errors.New("sigv4: authorization header is malformed")
+	ErrMissingDate      = errors.New("sigv4: request has neither x-amz-date nor date")
 	ErrUnknownKey       = errors.New("sigv4: unknown access key")
 	ErrMismatch         = errors.New("sigv4: signature does not match")
 	ErrSkew             = errors.New("sigv4: request time is too far from ours")
@@ -231,20 +232,44 @@ func parseAuthorization(header string) (authorization, error) {
 // it or, failing that, the ordinary Date header.
 func requestTime(r *http.Request) (time.Time, error) {
 	if raw := r.Header.Get("x-amz-date"); raw != "" {
-		t, err := time.Parse("20060102T150405Z", raw)
+		t, err := parseAmzDate(raw)
 		if err != nil {
 			return time.Time{}, fmt.Errorf("%w: x-amz-date %q", ErrMalformed, raw)
 		}
 		return t, nil
 	}
 	if raw := r.Header.Get("Date"); raw != "" {
-		t, err := http.ParseTime(raw)
+		t, err := parseHTTPDate(raw)
 		if err != nil {
 			return time.Time{}, fmt.Errorf("%w: Date %q", ErrMalformed, raw)
 		}
 		return t, nil
 	}
-	return time.Time{}, fmt.Errorf("%w: neither x-amz-date nor Date", ErrMalformed)
+	return time.Time{}, fmt.Errorf("%w: neither x-amz-date nor Date", ErrMissingDate)
+}
+
+// parseAmzDate accepts the ISO-8601 form SigV4 clients send, and the HTTP-date
+// form a client may put in x-amz-date instead of Date. The canonical request
+// hashes whichever string arrived; this only has to recover the instant.
+func parseAmzDate(raw string) (time.Time, error) {
+	if t, err := time.Parse("20060102T150405Z", raw); err == nil {
+		return t, nil
+	}
+	return parseHTTPDate(raw)
+}
+
+func parseHTTPDate(raw string) (time.Time, error) {
+	if t, err := http.ParseTime(raw); err == nil {
+		return t, nil
+	}
+	// http.ParseTime only accepts the GMT form. boto3 writes Date as RFC 822
+	// with a numeric zone, and uses -0000 for UTC.
+	for _, layout := range []string{time.RFC1123, time.RFC1123Z} {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("unparseable http-date %q", raw)
 }
 
 // canonicalRequest rebuilds the string the client hashed. Every difference from

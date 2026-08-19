@@ -113,17 +113,16 @@ acknowledge one it cannot make durable.
 ## How compatible is compatible
 
 Ceph's `s3-tests` is the suite S3 implementations are measured against, and nobody here chose what it
-asserts. It has 886 tests and kavo does not implement most of what they cover, on purpose. Of the 616
+asserts. It has 886 tests and kavo does not implement most of what they cover, on purpose. Of the 614
 that fail: **488 are explicit anti-goals** — ACLs, versioning, server-side encryption, object lock,
 bucket policy, lifecycle, logging, CORS, tagging, SigV2, browser form uploads — **47 are v1
 `ListObjects`**, which kavo answers only at v2, and **28 follow from buckets being prefixes** rather
 than records. **24 are conditional writes**, which would make the commit a compare-and-set and so
-need arguing for rather than adding. **27 are named gaps**, led by the checksum algorithms CRC32C
-does not cover (SHA-256, COMPOSITE). CRC64NVME and reads of a single part were in that count on
-the last measured run; both are implemented now, and the count stays until the suite is re-run. Two
+need arguing for rather than adding. **25 are named gaps**, led by SHA-256, CRC32 and COMPOSITE
+checksums, and by `?partNumber` out of range answering 416 where S3 says 400. Two
 are artifacts of the suite's own environment.
 
-With that framing: **176 pass, 616 fail, 94 the suite skips, and nothing errors** — every test
+With that framing: **178 pass, 614 fail, 94 the suite skips, and nothing errors** — every test
 reaches a verdict rather than dying in setup, and every failure is accounted for in
 [`docs/s3-compatibility.md`](docs/s3-compatibility.md), which generates its breakdown from the
 suite's own output so it can be checked rather than believed. Of the tests covering the operations
@@ -144,7 +143,7 @@ destroyed it and was told the tag was set. Eight passes were tests doing precise
 the honest number — landing exactly where the measurement had started, which is a coincidence worth
 distrusting, since the same count covered `CopyObject`, conditional reads, `Content-MD5`, user
 metadata and three multipart calls that did not exist at the outset. Implementing `UploadPartCopy`
-then took it to 176. A pass count rewards a store for answering; only reading the failures tells you what
+then took it to 176, and accepting RFC 822 dates (boto3's `-0000` UTC) to 178. A pass count rewards a store for answering; only reading the failures tells you what
 it answered with.
 
 That last one the suite did not find, and neither did kavo's own tests. It is also what led to the
@@ -182,10 +181,12 @@ gets the same treatment, while *reading* an object's tags is answered with none 
 only stays true because the write is refused rather than dropped.
 
 The gaps a client might actually notice are named in
-[`docs/s3-compatibility.md`](docs/s3-compatibility.md) rather than buried: SHA-256, COMPOSITE
-checksums, and the wrong error code for a malformed authorization header. CRC32C and CRC64NVME on a
+[`docs/s3-compatibility.md`](docs/s3-compatibility.md) rather than buried: SHA-256, CRC32 and
+COMPOSITE checksums, an out-of-range `?partNumber` answered 416 rather than 400, and HTTP
+`Transfer-Encoding: chunked` without a declared length. CRC32C and CRC64NVME on a
 whole-object PUT or a multipart upload are not among them — they are checked, stored, and returned
-on a HEAD/GET that asks. A GET of one completed part (`?partNumber`) is not among them either.
+on a HEAD/GET that asks. A GET of one completed part (`?partNumber`) works; only a number past the
+last part still fails, and only on the error code.
 
 Real limitations — an etcd-bound object count, rot that can sit until the next scrub, deleted space
 that takes about half an hour to come back because collection is the only thing that deletes a
