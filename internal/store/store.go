@@ -226,6 +226,26 @@ func (s *Store) HasChunk(id string) (bool, error) {
 	return true, nil
 }
 
+// HasChunks reports which of the given IDs this node holds. The returned slice
+// contains only the IDs that are present; invalid IDs are silently skipped.
+// Same presence-not-integrity caveat as HasChunk.
+func (s *Store) HasChunks(ids []string) ([]string, error) {
+	var have []string
+	for _, id := range ids {
+		held, err := s.HasChunk(id)
+		if errors.Is(err, ErrInvalidID) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if held {
+			have = append(have, id)
+		}
+	}
+	return have, nil
+}
+
 // ChunkInfo is what a sweep can learn about a chunk without opening it: which
 // chunk it is, how much space it occupies, and when it was last written.
 //
