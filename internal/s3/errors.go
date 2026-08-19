@@ -68,6 +68,11 @@ var (
 		"the Content-MD5 you specified did not match what was received"}
 	errInvalidDigest = apiError{"InvalidDigest", http.StatusBadRequest,
 		"the Content-MD5 you specified is not a base64-encoded 128-bit digest"}
+	// A checksum header that cannot be a digest is BadDigest, not InvalidDigest:
+	// InvalidDigest is the Content-MD5 code, and S3 uses BadDigest for a CRC that
+	// is not a digest at all (the suite's ChecksumCRC64NVME=bad).
+	errMalformedChecksum = apiError{"BadDigest", http.StatusBadRequest,
+		"the checksum you specified is not valid"}
 	errMetadataTooLarge = apiError{"MetadataTooLarge", http.StatusBadRequest,
 		"the metadata headers exceed the maximum allowed size"}
 	errInvalidDirective = apiError{"InvalidArgument", http.StatusBadRequest,

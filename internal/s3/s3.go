@@ -327,6 +327,22 @@ func attachTrailingChecksums(opts *cluster.PutOptions, r *http.Request) {
 	}
 }
 
+func canonicalChecksumAlgo(header http.Header) string {
+	algo, extras := checksumHeaders(header)
+	if extras {
+		return ""
+	}
+	switch {
+	case strings.EqualFold(algo, "CRC32"):
+		return "CRC32"
+	case strings.EqualFold(algo, "CRC32C"):
+		return "CRC32C"
+	case strings.EqualFold(algo, "CRC64NVME"):
+		return "CRC64NVME"
+	}
+	return ""
+}
+
 func requestedCRC32(header http.Header) bool {
 	algo, extras := checksumHeaders(header)
 	return !extras && strings.EqualFold(algo, "CRC32")
@@ -503,17 +519,17 @@ func (h *handler) putObject(w http.ResponseWriter, r *http.Request) {
 	}
 	crc32c, err := declaredCRC32C(r.Header)
 	if err != nil {
-		fail(w, r, errInvalidDigest, err)
+		fail(w, r, errMalformedChecksum, err)
 		return
 	}
 	crc32sum, err := declaredCRC32(r.Header)
 	if err != nil {
-		fail(w, r, errInvalidDigest, err)
+		fail(w, r, errMalformedChecksum, err)
 		return
 	}
 	crc64nvme, err := declaredCRC64NVME(r.Header)
 	if err != nil {
-		fail(w, r, errInvalidDigest, err)
+		fail(w, r, errMalformedChecksum, err)
 		return
 	}
 
