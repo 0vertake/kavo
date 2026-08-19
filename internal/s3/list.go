@@ -28,7 +28,7 @@ type listResult struct {
 	MaxKeys               int          `xml:"MaxKeys"`
 	KeyCount              int          `xml:"KeyCount"`
 	IsTruncated           bool         `xml:"IsTruncated"`
-	ContinuationToken     string       `xml:"ContinuationToken,omitempty"`
+	ContinuationToken     *string      `xml:"ContinuationToken,omitempty"`
 	NextContinuationToken string       `xml:"NextContinuationToken,omitempty"`
 	StartAfter            string       `xml:"StartAfter,omitempty"`
 	EncodingType          string       `xml:"EncodingType,omitempty"`
@@ -75,6 +75,14 @@ func (h *handler) listObjects(w http.ResponseWriter, r *http.Request) {
 	}
 	if q.Has("location") {
 		h.bucketLocation(w, r)
+		return
+	}
+	// Ceph's allow-unordered extension lives on ListObjects v1 and is unsupported
+	// here. The one invalid combination the suite checks is with a delimiter,
+	// which S3 answers as InvalidArgument rather than NotImplemented.
+	if q.Get("list-type") != "2" && q.Get("allow-unordered") == "true" && q.Get("delimiter") != "" {
+		fail(w, r, apiError{"InvalidArgument", http.StatusBadRequest,
+			"allow-unordered may not be combined with delimiter."}, nil)
 		return
 	}
 	if q.Get("list-type") != "2" {
@@ -125,6 +133,11 @@ func (h *handler) listObjects(w http.ResponseWriter, r *http.Request) {
 	if q.Get("encoding-type") == "url" {
 		encode = escapeKey
 	}
+	var continuation *string
+	if q.Has("continuation-token") {
+		v := q.Get("continuation-token")
+		continuation = &v
+	}
 
 	result := listResult{
 		XMLNS:             s3XMLNS,
@@ -133,7 +146,7 @@ func (h *handler) listObjects(w http.ResponseWriter, r *http.Request) {
 		Delimiter:         encode(delimiter),
 		MaxKeys:           maxKeys,
 		IsTruncated:       page.Next != "",
-		ContinuationToken: q.Get("continuation-token"),
+		ContinuationToken: continuation,
 		StartAfter:        encode(q.Get("start-after")),
 		EncodingType:      q.Get("encoding-type"),
 	}
