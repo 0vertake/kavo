@@ -178,12 +178,12 @@ func taggingRequested(header http.Header) bool {
 }
 
 // checksumRefused reports whether a request asks for a checksum this server would
-// not actually verify. CRC32C and CRC64NVME are checked on a whole-object PUT and
-// on a multipart write (create, part, complete): the write already hashes the
-// body as it streams, and completing an upload combines the parts' hashes rather
+// not actually verify. CRC32, CRC32C and CRC64NVME are checked on a whole-object
+// PUT and on a multipart write (create, part, complete): the write already hashes
+// the body as it streams, and completing an upload combines the parts' hashes rather
 // than re-reading the object. The value may arrive in a header or, for a
 // streaming PUT, in the aws-chunked trailer named on X-Amz-Trailer. Everything
-// else — SHA-256, CRC32, COMPOSITE, a checksum on CopyObject — is refused rather
+// else — SHA-256, COMPOSITE, a checksum on CopyObject — is refused rather
 // than stored without being looked at.
 func checksumRefused(r *http.Request) bool {
 	if !writesObjectBytes(r) {
@@ -196,7 +196,7 @@ func checksumRefused(r *http.Request) bool {
 	if algo == "" {
 		return false
 	}
-	if !strings.EqualFold(algo, "CRC32C") && !strings.EqualFold(algo, "CRC64NVME") {
+	if !strings.EqualFold(algo, "CRC32") && !strings.EqualFold(algo, "CRC32C") && !strings.EqualFold(algo, "CRC64NVME") {
 		return true
 	}
 	// CopyObject copies a manifest, not bytes, and would store a number it did
@@ -226,16 +226,18 @@ func checksumHeaders(header http.Header) (algo string, extras bool) {
 		return "", true
 	}
 	for _, name := range []string{
-		"X-Amz-Checksum-Crc32", "X-Amz-Checksum-Sha1",
+		"X-Amz-Checksum-Sha1",
 		"X-Amz-Checksum-Sha256",
 	} {
 		if header.Get(name) != "" {
 			return "", true
 		}
 	}
-	var crc32c, crc64 bool
+	var ieee, crc32c, crc64 bool
 	for _, name := range announcedTrailers(header) {
 		switch {
+		case strings.EqualFold(name, "x-amz-checksum-crc32"):
+			ieee = true
 		case strings.EqualFold(name, "x-amz-checksum-crc32c"):
 			crc32c = true
 		case strings.EqualFold(name, "x-amz-checksum-crc64nvme"):
@@ -244,13 +246,26 @@ func checksumHeaders(header http.Header) (algo string, extras bool) {
 			return "", true
 		}
 	}
+	if header.Get("X-Amz-Checksum-Crc32") != "" {
+		ieee = true
+	}
 	if header.Get("X-Amz-Checksum-Crc32c") != "" {
 		crc32c = true
 	}
 	if header.Get("X-Amz-Checksum-Crc64nvme") != "" {
 		crc64 = true
 	}
-	if crc32c && crc64 {
+	n := 0
+	if ieee {
+		n++
+	}
+	if crc32c {
+		n++
+	}
+	if crc64 {
+		n++
+	}
+	if n > 1 {
 		return "", true
 	}
 	algo = header.Get("X-Amz-Checksum-Algorithm")
@@ -258,6 +273,12 @@ func checksumHeaders(header http.Header) (algo string, extras bool) {
 		algo = header.Get("X-Amz-Sdk-Checksum-Algorithm")
 	}
 	switch {
+	case ieee:
+		if algo == "" {
+			algo = "CRC32"
+		} else if !strings.EqualFold(algo, "CRC32") {
+			return "", true
+		}
 	case crc32c:
 		if algo == "" {
 			algo = "CRC32C"
@@ -290,6 +311,10 @@ func attachTrailingChecksums(opts *cluster.PutOptions, r *http.Request) {
 	body := r.Body
 	for _, name := range announcedTrailers(r.Header) {
 		switch {
+		case strings.EqualFold(name, "x-amz-checksum-crc32"):
+			opts.TrailingCRC32 = func() (*uint32, error) {
+				return declaredTrailingCRC32(body)
+			}
 		case strings.EqualFold(name, "x-amz-checksum-crc32c"):
 			opts.TrailingCRC32C = func() (*uint32, error) {
 				return declaredTrailingCRC32C(body)
@@ -302,6 +327,11 @@ func attachTrailingChecksums(opts *cluster.PutOptions, r *http.Request) {
 	}
 }
 
+func requestedCRC32(header http.Header) bool {
+	algo, extras := checksumHeaders(header)
+	return !extras && strings.EqualFold(algo, "CRC32")
+}
+
 func requestedCRC32C(header http.Header) bool {
 	algo, extras := checksumHeaders(header)
 	return !extras && strings.EqualFold(algo, "CRC32C")
@@ -310,6 +340,18 @@ func requestedCRC32C(header http.Header) bool {
 func requestedCRC64NVME(header http.Header) bool {
 	algo, extras := checksumHeaders(header)
 	return !extras && strings.EqualFold(algo, "CRC64NVME")
+}
+
+func declaredCRC32(header http.Header) (*uint32, error) {
+	raw := header.Get("X-Amz-Checksum-Crc32")
+	if raw == "" {
+		return nil, nil
+	}
+	sum, err := decodeCRC32(raw)
+	if err != nil {
+		return nil, err
+	}
+	return &sum, nil
 }
 
 func declaredCRC32C(header http.Header) (*uint32, error) {
@@ -336,6 +378,18 @@ func declaredCRC64NVME(header http.Header) (*uint64, error) {
 	return &sum, nil
 }
 
+func declaredTrailingCRC32(body io.ReadCloser) (*uint32, error) {
+	raw := sigv4.Trailers(body).Get("X-Amz-Checksum-Crc32")
+	if raw == "" {
+		return nil, fmt.Errorf("%w: trailing CRC32 was announced but not sent", cluster.ErrBadDigest)
+	}
+	sum, err := decodeCRC32(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", cluster.ErrBadDigest, err)
+	}
+	return &sum, nil
+}
+
 func declaredTrailingCRC32C(body io.ReadCloser) (*uint32, error) {
 	raw := sigv4.Trailers(body).Get("X-Amz-Checksum-Crc32c")
 	if raw == "" {
@@ -358,6 +412,18 @@ func declaredTrailingCRC64NVME(body io.ReadCloser) (*uint64, error) {
 		return nil, fmt.Errorf("%w: %v", cluster.ErrBadDigest, err)
 	}
 	return &sum, nil
+}
+
+func encodeCRC32(sum uint32) string {
+	return encodeCRC32C(sum)
+}
+
+func decodeCRC32(raw string) (uint32, error) {
+	b, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil || len(b) != 4 {
+		return 0, fmt.Errorf("s3: checksum CRC32 %q is not a base64-encoded 32-bit digest", raw)
+	}
+	return binary.BigEndian.Uint32(b), nil
 }
 
 func encodeCRC32C(sum uint32) string {
@@ -440,6 +506,11 @@ func (h *handler) putObject(w http.ResponseWriter, r *http.Request) {
 		fail(w, r, errInvalidDigest, err)
 		return
 	}
+	crc32sum, err := declaredCRC32(r.Header)
+	if err != nil {
+		fail(w, r, errInvalidDigest, err)
+		return
+	}
 	crc64nvme, err := declaredCRC64NVME(r.Header)
 	if err != nil {
 		fail(w, r, errInvalidDigest, err)
@@ -457,6 +528,7 @@ func (h *handler) putObject(w http.ResponseWriter, r *http.Request) {
 		Size:        r.ContentLength,
 		MD5:         digest,
 		CRC32C:      crc32c,
+		CRC32:       crc32sum,
 		CRC64NVME:   crc64nvme,
 		Meta:        stored,
 	}
@@ -473,6 +545,9 @@ func (h *handler) putObject(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("ETag", etag(m))
 	if m.CRC32C != nil && (crc32c != nil || requestedCRC32C(r.Header)) {
 		w.Header().Set("X-Amz-Checksum-Crc32c", encodeCRC32C(*m.CRC32C))
+	}
+	if m.CRC32 != nil && (crc32sum != nil || requestedCRC32(r.Header)) {
+		w.Header().Set("X-Amz-Checksum-Crc32", encodeCRC32(*m.CRC32))
 	}
 	if m.CRC64NVME != nil && (crc64nvme != nil || requestedCRC64NVME(r.Header)) {
 		w.Header().Set("X-Amz-Checksum-Crc64nvme", encodeCRC64NVME(*m.CRC64NVME))
@@ -684,6 +759,9 @@ func (h *handler) getObject(w http.ResponseWriter, r *http.Request) {
 		// will reject the download.
 		if m.CRC32C != nil {
 			header.Set("X-Amz-Checksum-Crc32c", encodeCRC32C(*m.CRC32C))
+		}
+		if m.CRC32 != nil {
+			header.Set("X-Amz-Checksum-Crc32", encodeCRC32(*m.CRC32))
 		}
 		if m.CRC64NVME != nil {
 			header.Set("X-Amz-Checksum-Crc64nvme", encodeCRC64NVME(*m.CRC64NVME))
