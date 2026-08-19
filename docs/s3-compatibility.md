@@ -88,10 +88,10 @@ pair, because kavo authenticates exactly one — so the multi-user tests fail on
 rather than on a missing config.
 
 The two `AWS_*_CHECKSUM_*` variables are load-bearing. botocore 1.43's default is
-`request_checksum_calculation=when_supported`, which attaches CRC32 to every PUT. The last
-unpinned run against that boto3 scored **39 pass, 753 fail** because kavo refused CRC32; that
-algorithm is checked now, and the count stays until the suite is re-run. The comparable
-measurement still asks for a checksum only when a test names one.
+`request_checksum_calculation=when_supported`, which attaches CRC32 to every PUT.
+Pinned (`when_required`) and unpinned both score **178 pass, 614 fail, 94 skip**.
+The unpinned run was **39 pass, 753 fail** before CRC32 was checked; default boto3
+PUTs no longer fail for naming an algorithm this store verifies.
 
 The other five test files are not run: `test_iam.py`, `test_sts.py`, `test_sns.py`,
 `test_s3control.py` and `test_s3select.py` target IAM, STS, SNS, S3 Control and S3 Select, which are
@@ -243,11 +243,11 @@ kavo does not do yet, and they are worth naming honestly:
   on a whole-object PUT and on a multipart upload (FULL_OBJECT) are checked and stored, whether the
   client names them in a header or in an aws-chunked trailer, and a HEAD/GET with
   `x-amz-checksum-mode: ENABLED` returns them. Completing an upload combines the parts' hashes rather
-  than re-reading the object. The nine tests still fail on the last measured run: a PUT of CRC64NVME
-  with the value `bad` is `InvalidDigest` where S3 says `BadDigest`; a multipart complete does not
-  echo `ChecksumAlgorithm`; SHA-256, SHA-1 and COMPOSITE are refused. CRC32 is checked now, including
-  botocore's default on every PUT, which is why the unpinned 39-pass score should move; the count
-  stays until the suite is re-run.
+  than re-reading the object. Create and complete echo `ChecksumAlgorithm` (FULL_OBJECT). A checksum
+  that is not a digest is `BadDigest`, matching S3 rather than Content-MD5's `InvalidDigest`. The last
+  measured run still filed nine tests here; CRC32 default PUTs no longer fail an unpinned boto3
+  (178, was 39). What remains unread is SHA-256, SHA-1, COMPOSITE, `GetObjectAttributes`, and a
+  checksum on CopyObject.
 - **Malformed authorization and date headers.** A signed request with neither `x-amz-date` nor
   `Date` is `MissingSecurityHeader`. RFC 822 dates, including boto3's `-0000` UTC, are accepted.
   The four that remain are not wrong codes for a bad signature: `Transfer-Encoding: chunked` without

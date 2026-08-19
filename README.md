@@ -119,8 +119,8 @@ bucket policy, lifecycle, logging, CORS, tagging, SigV2, browser form uploads â€
 `ListObjects`**, which kavo answers only at v2, and **28 follow from buckets being prefixes** rather
 than records. **24 are conditional writes**, which would make the commit a compare-and-set and so
 need arguing for rather than adding. **25 are named gaps**, led by SHA-256 and COMPOSITE
-checksums, and by `?partNumber` out of range answering 416 where S3 says 400. CRC32 was in that
-count on the last measured run and is checked now. Two are artifacts of the suite's own environment.
+checksums, and by `?partNumber` out of range answering 416 where S3 says 400. Two
+are artifacts of the suite's own environment.
 
 With that framing: **178 pass, 614 fail, 94 the suite skips, and nothing errors** â€” every test
 reaches a verdict rather than dying in setup, and every failure is accounted for in
