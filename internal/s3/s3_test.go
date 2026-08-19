@@ -32,6 +32,7 @@ import (
 	"github.com/0vertake/kavo/internal/api"
 	"github.com/0vertake/kavo/internal/cluster"
 	"github.com/0vertake/kavo/internal/meta"
+	"github.com/0vertake/kavo/internal/object"
 	"github.com/0vertake/kavo/internal/s3"
 	"github.com/0vertake/kavo/internal/sigv4"
 	"github.com/0vertake/kavo/internal/store"
@@ -1324,6 +1325,13 @@ func crc32cOf(data []byte) string {
 	return base64.StdEncoding.EncodeToString(b[:])
 }
 
+func crc64nvmeOf(data []byte) string {
+	sum := object.CRC64NVME(data)
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], sum)
+	return base64.StdEncoding.EncodeToString(b[:])
+}
+
 // A CRC32C named on a PUT is checked against the body, echoed on the response,
 // omitted from a HEAD that did not ask, and returned when one did. A mismatch is
 // BadDigest rather than a stored object whose checksum header the client will
@@ -1382,10 +1390,64 @@ func TestCRC32COnAPutIsVerifiedAndReplayed(t *testing.T) {
 	}
 }
 
+func TestCRC64NVMEOnAPutIsVerifiedAndReplayed(t *testing.T) {
+	client := newGateway(t)
+	data := []byte("hello crc64nvme")
+	sum := crc64nvmeOf(data)
+
+	put, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("checked64.bin"),
+		Body: bytes.NewReader(data), ChecksumCRC64NVME: aws.String(sum),
+		ChecksumAlgorithm: types.ChecksumAlgorithmCrc64nvme,
+	})
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if got := aws.ToString(put.ChecksumCRC64NVME); got != sum {
+		t.Errorf("PUT checksum = %q, want %q", got, sum)
+	}
+
+	head, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("checked64.bin"),
+	})
+	if err != nil {
+		t.Fatalf("head: %v", err)
+	}
+	if head.ChecksumCRC64NVME != nil {
+		t.Errorf("HEAD without checksum mode returned %q", aws.ToString(head.ChecksumCRC64NVME))
+	}
+
+	head, err = client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("checked64.bin"),
+		ChecksumMode: types.ChecksumModeEnabled,
+	})
+	if err != nil {
+		t.Fatalf("head with checksum mode: %v", err)
+	}
+	if got := aws.ToString(head.ChecksumCRC64NVME); got != sum {
+		t.Errorf("HEAD checksum = %q, want %q", got, sum)
+	}
+
+	_, err = client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("wrong64.bin"),
+		Body: bytes.NewReader(data), ChecksumCRC64NVME: aws.String("AAAAAAAAAAA="),
+		ChecksumAlgorithm: types.ChecksumAlgorithmCrc64nvme,
+	})
+	var api smithy.APIError
+	if !errors.As(err, &api) || api.ErrorCode() != "BadDigest" {
+		t.Errorf("mismatched CRC64NVME = %v, want BadDigest", err)
+	}
+	if _, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("wrong64.bin"),
+	}); err == nil {
+		t.Error("the mismatched write stored the object")
+	}
+}
+
 // SHA-256, CRC32, COMPOSITE, and a checksum on CopyObject are all requests to
 // record a number this path would not look at. Refused rather than stored: the
-// same rule as encryption and tagging. CRC32C on a multipart upload is checked,
-// so it is not among these.
+// same rule as encryption and tagging. CRC32C and CRC64NVME on a PUT or multipart
+// upload are checked, so they are not among these.
 func TestChecksumsThisServerDoesNotVerifyAreRefused(t *testing.T) {
 	client := newGateway(t)
 	data := randBytes(64)
@@ -1427,7 +1489,7 @@ func TestTrailingCRC32COnAPutIsVerified(t *testing.T) {
 	data := []byte("hello trailing checksum")
 	sum := crc32cOf(data)
 
-	resp := putUnsignedTrailer(t, endpoint, "trailed.bin", data, sum)
+	resp := putUnsignedTrailer(t, endpoint, "trailed.bin", data, sum, "x-amz-checksum-crc32c", "CRC32C")
 	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if err != nil {
@@ -1451,7 +1513,7 @@ func TestTrailingCRC32COnAPutIsVerified(t *testing.T) {
 		t.Errorf("HEAD checksum = %q, want %q", got, sum)
 	}
 
-	resp = putUnsignedTrailer(t, endpoint, "wrong-trail.bin", data, "AAAAAA==")
+	resp = putUnsignedTrailer(t, endpoint, "wrong-trail.bin", data, "AAAAAA==", "x-amz-checksum-crc32c", "CRC32C")
 	body, err = io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if err != nil {
@@ -1483,21 +1545,61 @@ func TestTrailingCRC32COnAPutIsVerified(t *testing.T) {
 	}
 }
 
-func putUnsignedTrailer(t *testing.T, endpoint, key string, data []byte, checksum string) *http.Response {
+func TestTrailingCRC64NVMEOnAPutIsVerified(t *testing.T) {
+	client, endpoint := newGatewayURL(t, 3, testChunkSize)
+	data := []byte("hello trailing crc64")
+	sum := crc64nvmeOf(data)
+
+	resp := putUnsignedTrailer(t, endpoint, "trailed64.bin", data, sum, "x-amz-checksum-crc64nvme", "CRC64NVME")
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT = %d: %s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("X-Amz-Checksum-Crc64nvme"); got != sum {
+		t.Errorf("PUT checksum = %q, want %q", got, sum)
+	}
+
+	head, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("trailed64.bin"),
+		ChecksumMode: types.ChecksumModeEnabled,
+	})
+	if err != nil {
+		t.Fatalf("head: %v", err)
+	}
+	if got := aws.ToString(head.ChecksumCRC64NVME); got != sum {
+		t.Errorf("HEAD checksum = %q, want %q", got, sum)
+	}
+
+	resp = putUnsignedTrailer(t, endpoint, "wrong-trail64.bin", data, "AAAAAAAAAAA=", "x-amz-checksum-crc64nvme", "CRC64NVME")
+	body, err = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusBadRequest || !bytes.Contains(body, []byte("BadDigest")) {
+		t.Errorf("mismatched trailer = %d %s, want BadDigest", resp.StatusCode, body)
+	}
+}
+
+func putUnsignedTrailer(t *testing.T, endpoint, key string, data []byte, checksum, trailer, algo string) *http.Response {
 	t.Helper()
 	var framed bytes.Buffer
 	if len(data) > 0 {
 		fmt.Fprintf(&framed, "%x\r\n%s\r\n", len(data), data)
 	}
-	fmt.Fprintf(&framed, "0\r\nx-amz-checksum-crc32c:%s\r\n\r\n", checksum)
+	fmt.Fprintf(&framed, "0\r\n%s:%s\r\n\r\n", trailer, checksum)
 
 	req, err := http.NewRequest(http.MethodPut, endpoint+"/bucket/"+key, bytes.NewReader(framed.Bytes()))
 	if err != nil {
 		t.Fatal(err)
 	}
 	req.Header.Set("x-amz-decoded-content-length", fmt.Sprint(len(data)))
-	req.Header.Set("x-amz-trailer", "x-amz-checksum-crc32c")
-	req.Header.Set("x-amz-checksum-algorithm", "CRC32C")
+	req.Header.Set("x-amz-trailer", trailer)
+	req.Header.Set("x-amz-checksum-algorithm", algo)
 	req.Header.Set("Content-Encoding", "aws-chunked")
 	req.ContentLength = int64(framed.Len())
 	signS3(t, req, "STREAMING-UNSIGNED-PAYLOAD-TRAILER")

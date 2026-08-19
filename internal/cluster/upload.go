@@ -97,6 +97,10 @@ func (c *Coordinator) UploadPart(ctx context.Context, id string, number int, bod
 		c.stopWriting(ctx, writing)
 		return object.Manifest{}, err
 	}
+	if err := checkCRC64NVME(m, opts); err != nil {
+		c.stopWriting(ctx, writing)
+		return object.Manifest{}, err
+	}
 	if writing == "" {
 		err = c.meta.CommitPart(ctx, id, number, m)
 	} else {
@@ -145,7 +149,7 @@ func (c *Coordinator) CopyPart(ctx context.Context, id string, number int, src o
 	return c.UploadPart(ctx, id, number, pr, opts)
 }
 
-func (c *Coordinator) CompleteUpload(ctx context.Context, id string, parts []CompletedPart, crc32c *uint32) (object.Manifest, error) {
+func (c *Coordinator) CompleteUpload(ctx context.Context, id string, parts []CompletedPart, crc32c *uint32, crc64nvme *uint64) (object.Manifest, error) {
 	u, err := c.meta.Upload(ctx, id)
 	if errors.Is(err, meta.ErrNotFound) {
 		// The upload may have completed already, with the client never seeing the
@@ -225,6 +229,14 @@ func (c *Coordinator) CompleteUpload(ctx context.Context, id string, parts []Com
 		} else if final.CRC32C != nil {
 			*final.CRC32C = object.CombineCRC32C(*final.CRC32C, *m.CRC32C, m.Size)
 		}
+		if m.CRC64NVME == nil {
+			final.CRC64NVME = nil
+		} else if final.CRC64NVME == nil && i == 0 {
+			sum := *m.CRC64NVME
+			final.CRC64NVME = &sum
+		} else if final.CRC64NVME != nil {
+			*final.CRC64NVME = object.CombineCRC64NVME(*final.CRC64NVME, *m.CRC64NVME, m.Size)
+		}
 	}
 	final.ETag = fmt.Sprintf("%x-%d", sums.Sum(nil), len(parts))
 	final.Modified = time.Now().UTC().Truncate(time.Second)
@@ -237,6 +249,13 @@ func (c *Coordinator) CompleteUpload(ctx context.Context, id string, parts []Com
 			got = fmt.Sprintf("%08x", *final.CRC32C)
 		}
 		return object.Manifest{}, fmt.Errorf("%w: declared CRC32C %08x, received %s", ErrBadDigest, *crc32c, got)
+	}
+	if crc64nvme != nil && (final.CRC64NVME == nil || *crc64nvme != *final.CRC64NVME) {
+		got := "none"
+		if final.CRC64NVME != nil {
+			got = fmt.Sprintf("%016x", *final.CRC64NVME)
+		}
+		return object.Manifest{}, fmt.Errorf("%w: declared CRC64NVME %016x, received %s", ErrBadDigest, *crc64nvme, got)
 	}
 
 	// The object exists from here. Chunks of parts the completion did not name are

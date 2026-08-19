@@ -1155,3 +1155,89 @@ func TestCRC32COnAMultipartUploadIsVerifiedAndReplayed(t *testing.T) {
 		t.Errorf("got %q, want %q", got, want)
 	}
 }
+
+func TestCRC64NVMEOnAMultipartUploadIsVerifiedAndReplayed(t *testing.T) {
+	client := newGateway(t)
+	const bucket, key = "bucket", "checked-mpu64.bin"
+	p1, p2 := []byte("hello "), []byte("crc64 parts")
+	want := append(append([]byte{}, p1...), p2...)
+	sum := crc64nvmeOf(want)
+
+	create, err := client.CreateMultipartUpload(t.Context(), &awss3.CreateMultipartUploadInput{
+		Bucket:            aws.String(bucket),
+		Key:               aws.String(key),
+		ChecksumAlgorithm: types.ChecksumAlgorithmCrc64nvme,
+		ChecksumType:      types.ChecksumTypeFullObject,
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	id := create.UploadId
+
+	_, err = client.UploadPart(t.Context(), &awss3.UploadPartInput{
+		Bucket: aws.String(bucket), Key: aws.String(key), UploadId: id,
+		PartNumber: aws.Int32(1), Body: bytes.NewReader(p1),
+		ChecksumAlgorithm: types.ChecksumAlgorithmCrc64nvme,
+		ChecksumCRC64NVME: aws.String("AAAAAAAAAAA="),
+	})
+	var api smithy.APIError
+	if !errors.As(err, &api) || api.ErrorCode() != "BadDigest" {
+		t.Errorf("mismatched part CRC64NVME = %v, want BadDigest", err)
+	}
+
+	var parts []types.CompletedPart
+	for i, data := range [][]byte{p1, p2} {
+		up, err := client.UploadPart(t.Context(), &awss3.UploadPartInput{
+			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: id,
+			PartNumber:        aws.Int32(int32(i + 1)),
+			Body:              bytes.NewReader(data),
+			ChecksumAlgorithm: types.ChecksumAlgorithmCrc64nvme,
+			ChecksumCRC64NVME: aws.String(crc64nvmeOf(data)),
+		})
+		if err != nil {
+			t.Fatalf("upload part %d: %v", i+1, err)
+		}
+		if got := aws.ToString(up.ChecksumCRC64NVME); got != crc64nvmeOf(data) {
+			t.Errorf("part %d checksum = %q, want %q", i+1, got, crc64nvmeOf(data))
+		}
+		parts = append(parts, types.CompletedPart{
+			ETag:              up.ETag,
+			PartNumber:        aws.Int32(int32(i + 1)),
+			ChecksumCRC64NVME: up.ChecksumCRC64NVME,
+		})
+	}
+
+	_, err = client.CompleteMultipartUpload(t.Context(), &awss3.CompleteMultipartUploadInput{
+		Bucket: aws.String(bucket), Key: aws.String(key), UploadId: id,
+		MultipartUpload:   &types.CompletedMultipartUpload{Parts: parts},
+		ChecksumCRC64NVME: aws.String("AAAAAAAAAAA="),
+		ChecksumType:      types.ChecksumTypeFullObject,
+	})
+	if !errors.As(err, &api) || api.ErrorCode() != "BadDigest" {
+		t.Errorf("mismatched complete CRC64NVME = %v, want BadDigest", err)
+	}
+
+	done, err := client.CompleteMultipartUpload(t.Context(), &awss3.CompleteMultipartUploadInput{
+		Bucket: aws.String(bucket), Key: aws.String(key), UploadId: id,
+		MultipartUpload:   &types.CompletedMultipartUpload{Parts: parts},
+		ChecksumCRC64NVME: aws.String(sum),
+		ChecksumType:      types.ChecksumTypeFullObject,
+	})
+	if err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	if got := aws.ToString(done.ChecksumCRC64NVME); got != sum {
+		t.Errorf("complete checksum = %q, want %q", got, sum)
+	}
+
+	head, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(key),
+		ChecksumMode: types.ChecksumModeEnabled,
+	})
+	if err != nil {
+		t.Fatalf("head: %v", err)
+	}
+	if got := aws.ToString(head.ChecksumCRC64NVME); got != sum {
+		t.Errorf("HEAD checksum = %q, want %q", got, sum)
+	}
+}

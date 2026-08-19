@@ -119,8 +119,8 @@ bucket policy, lifecycle, logging, CORS, tagging, SigV2, browser form uploads �
 `ListObjects`**, which kavo answers only at v2, and **28 follow from buckets being prefixes** rather
 than records. **24 are conditional writes**, which would make the commit a compare-and-set and so
 need arguing for rather than adding. **27 are named gaps**, led by the checksum algorithms CRC32C
-does not cover (SHA-256, CRC64NVME, COMPOSITE). The last measured run also filed reads of a
-single part there; those are implemented now, and the count stays until the suite is re-run. Two
+does not cover (SHA-256, COMPOSITE). CRC64NVME and reads of a single part were in that count on
+the last measured run; both are implemented now, and the count stays until the suite is re-run. Two
 are artifacts of the suite's own environment.
 
 With that framing: **176 pass, 616 fail, 94 the suite skips, and nothing errors** — every test
@@ -169,7 +169,7 @@ Deliberate anti-goals, not a roadmap: no IAM, no ACLs, no versioning, no lifecyc
 bucket policies, no `ListObjects` v1. The S3 subset is PUT, GET (including ranges), HEAD, DELETE,
 `ListObjectsV2`, multipart upload (including `UploadPartCopy`, which is how a client copies an object
 too large to copy in one call, and GET/HEAD `?partNumber` of a completed object) and `CopyObject`, with SigV4 verification, conditional reads,
-`Content-MD5` verification, CRC32C on a whole-object PUT or a multipart upload (header or aws-chunked trailer), and
+`Content-MD5` verification, CRC32C and CRC64NVME on a whole-object PUT or a multipart upload (header or aws-chunked trailer), and
 `x-amz-meta-*` passthrough — plus the handful of calls clients make
 without being asked, which answer for records that do not exist: `CreateBucket` succeeds because a
 bucket is a prefix, `ListBuckets` is a root listing, `DeleteBucket` refuses while objects remain, and
@@ -182,10 +182,10 @@ gets the same treatment, while *reading* an object's tags is answered with none 
 only stays true because the write is refused rather than dropped.
 
 The gaps a client might actually notice are named in
-[`docs/s3-compatibility.md`](docs/s3-compatibility.md) rather than buried: SHA-256, CRC64NVME and
-COMPOSITE checksums, and the wrong error code for a malformed authorization header. CRC32C on a
-whole-object PUT or a multipart upload is not among them — it is checked, stored, and returned on a
-HEAD/GET that asks. A GET of one completed part (`?partNumber`) is not among them either.
+[`docs/s3-compatibility.md`](docs/s3-compatibility.md) rather than buried: SHA-256, COMPOSITE
+checksums, and the wrong error code for a malformed authorization header. CRC32C and CRC64NVME on a
+whole-object PUT or a multipart upload are not among them — they are checked, stored, and returned
+on a HEAD/GET that asks. A GET of one completed part (`?partNumber`) is not among them either.
 
 Real limitations — an etcd-bound object count, rot that can sit until the next scrub, deleted space
 that takes about half an hour to come back because collection is the only thing that deletes a

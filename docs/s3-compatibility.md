@@ -230,14 +230,15 @@ kavo does not do yet, and they are worth naming honestly:
   tests here; the count stays until the suite is re-run. Objects completed before this was stored
   have no recoverable boundaries, and are treated as a single PUT: part 1 is the object, any other
   number is `InvalidPartNumber`.
-- **Non-MD5 checksums** (`x-amz-checksum-crc32`, `-sha1`, `-sha256`, CRC64NVME, COMPOSITE). CRC32C
-  on a whole-object PUT and on a multipart upload (FULL_OBJECT) is checked and stored, whether the
-  client names it in a header or in an aws-chunked trailer, and a HEAD/GET with
-  `x-amz-checksum-mode: ENABLED` returns it. Completing an upload combines the parts' hashes rather
+- **Non-MD5 checksums** (`x-amz-checksum-crc32`, `-sha1`, `-sha256`, COMPOSITE). CRC32C and CRC64NVME
+  on a whole-object PUT and on a multipart upload (FULL_OBJECT) are checked and stored, whether the
+  client names them in a header or in an aws-chunked trailer, and a HEAD/GET with
+  `x-amz-checksum-mode: ENABLED` returns them. Completing an upload combines the parts' hashes rather
   than re-reading the object. The last measured run filed nine tests here, including multipart
-  CRC32C which is checked now; the count stays until the suite is re-run. What remains unread is
-  SHA-256, CRC64NVME, COMPOSITE, and every checksum other than CRC32C on a multipart upload. Chunks
-  were already CRC32C-checksummed on disk; what was missing was the S3 header naming the *object*.
+  CRC32C and CRC64NVME which are checked now; the count stays until the suite is re-run. What remains
+  unread is SHA-256, COMPOSITE, and every checksum other than CRC32C and CRC64NVME on a multipart
+  upload. Chunks were already CRC32C-checksummed on disk; what was missing was the S3 header naming
+  the *object*.
 - **Error codes for malformed authorization and date headers**, where kavo answers a plausible
   refusal with the wrong code — a client is told `AccessDenied` where S3 says
   `MissingSecurityHeader`. Both refuse, so nothing is stored on a bad signature; a client
