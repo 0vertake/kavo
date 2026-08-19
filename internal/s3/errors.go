@@ -60,6 +60,8 @@ var (
 		"The difference between the request time and the server's time is too large."}
 	errMalformedAuth = apiError{"AuthorizationHeaderMalformed", http.StatusBadRequest,
 		"The authorization header is malformed."}
+	errMissingSecurityHeader = apiError{"MissingSecurityHeader", http.StatusBadRequest,
+		"Your request was missing a required header."}
 	errBadDigest = apiError{"XAmzContentSHA256Mismatch", http.StatusBadRequest,
 		"The body does not match the checksum the request declared."}
 	errBadContentMD5 = apiError{"BadDigest", http.StatusBadRequest,
@@ -95,6 +97,8 @@ func authError(err error) apiError {
 	switch {
 	case errors.Is(err, sigv4.ErrMissingSignature):
 		return errAccessDenied
+	case errors.Is(err, sigv4.ErrMissingDate):
+		return errMissingSecurityHeader
 	case errors.Is(err, sigv4.ErrUnknownKey):
 		return errInvalidKey
 	case errors.Is(err, sigv4.ErrMismatch):

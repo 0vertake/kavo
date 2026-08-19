@@ -196,7 +196,23 @@ func TestRejections(t *testing.T) {
 		{
 			name:   "no date at all",
 			tamper: func(r *http.Request) { r.Header.Del("X-Amz-Date") },
-			want:   sigv4.ErrMalformed,
+			want:   sigv4.ErrMissingDate,
+		},
+		{
+			name: "x-amz-date is HTTP-date",
+			tamper: func(r *http.Request) {
+				r.Header.Set("X-Amz-Date", signedAt.UTC().Format(http.TimeFormat))
+			},
+			// Parsed, so this is a signature over a different header value rather
+			// than a missing timestamp.
+			want: sigv4.ErrMismatch,
+		},
+		{
+			name: "x-amz-date is RFC822 with -0000",
+			tamper: func(r *http.Request) {
+				r.Header.Set("X-Amz-Date", "Tue, 11 Aug 2026 12:00:00 -0000")
+			},
+			want: sigv4.ErrMismatch,
 		},
 		{
 			name:   "unparseable date",

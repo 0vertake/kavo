@@ -545,6 +545,39 @@ func TestUnauthenticatedRequestsAreRefused(t *testing.T) {
 	}
 }
 
+// A signed request still has to name when it was signed. S3 answers
+// MissingSecurityHeader for that, not AccessDenied: the client held the key and
+// the signature may even match, it just omitted a required header.
+func TestMissingDateHeaderIsRefused(t *testing.T) {
+	client := newGateway(t)
+	if _, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String("bucket"),
+		Key:    aws.String("guarded"),
+		Body:   bytes.NewReader([]byte("x")),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodGet, *client.Options().BaseEndpoint+"/bucket/guarded", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signS3(t, req, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+	req.Header.Del("X-Amz-Date")
+	req.Header.Del("Date")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("a request without a date was served: %q", body)
+	}
+	if !strings.Contains(string(body), "<Code>MissingSecurityHeader</Code>") {
+		t.Errorf("status %d, body %s; want MissingSecurityHeader", resp.StatusCode, body)
+	}
+}
+
 // An overwrite must replace the object rather than blend with it: the manifest is
 // the object, so the new one has to name only the new bytes.
 func TestOverwriteReplacesTheObject(t *testing.T) {
