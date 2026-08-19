@@ -782,6 +782,7 @@ func (h *handler) getObject(w http.ResponseWriter, r *http.Request) {
 		if m.CRC64NVME != nil {
 			header.Set("X-Amz-Checksum-Crc64nvme", encodeCRC64NVME(*m.CRC64NVME))
 		}
+		header.Set("x-amz-checksum-type", "FULL_OBJECT")
 	}
 	if partsCount > 0 {
 		header.Set("X-Amz-Mp-Parts-Count", strconv.Itoa(partsCount))
