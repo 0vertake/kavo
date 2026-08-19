@@ -4,7 +4,7 @@ Ceph's [`s3-tests`](https://github.com/ceph/s3-tests) is the suite S3 implementa
 against. It is an independent oracle in the strongest sense available: nobody involved in kavo chose
 what it asserts, and it encodes S3's behaviour as observed by people who had to match it.
 
-**179 of 886 pass. 613 fail, 94 the suite skips itself, and nothing errors** — every test reaches a
+**180 of 886 pass. 612 fail, 94 the suite skips itself, and nothing errors** — every test reaches a
 verdict rather than dying in setup. The pass count is not the interesting number on its own, because
 most of what the suite covers is deliberately absent here (see the locked subset in
 `docs/design.md`). What is interesting is the classification below: what fails because of an
@@ -24,6 +24,7 @@ The count has moved eight times, and three of those moves were downward on purpo
 | 176 | `UploadPartCopy`, and answering a read of an object's tags with none |
 | 178 | RFC 822 `Date` / `x-amz-date` (boto3 writes UTC as `-0000`, which `http.ParseTime` rejects) |
 | 179 | a CRC64NVME of `bad` is `BadDigest` rather than `InvalidDigest` |
+| 180 | HTTP `Transfer-Encoding: chunked` PUT without a `Content-Length` |
 
 The last line is the one that matters, and it is covered in "What the suite did not find" below:
 `PUT /key?tagging` was reaching the handler that writes an object and replacing the object with the
@@ -201,8 +202,8 @@ died on: many of these never reach their assertion because a `ListObjects` v1 ca
 | 9 | multipart upload edge cases | mixed, see below |
 | 8 | non-MD5 checksum algorithms (SHA-256, SHA-1, COMPOSITE) | gap |
 | 8 | anonymous and unsigned access | anti-goal: one key pair, everything signed |
-| 4 | error codes for malformed authorization and date headers | gap |
-| 3 | `100-continue` and `Expect` | gap |
+| 2 | error codes for malformed authorization and date headers | gap |
+| 3 | `100-continue` and `Expect` | anti-goal / buckets-as-prefixes, see below |
 | 2 | bulk delete, both failing in setup on a v1 listing | deliberate: v2 only |
 | 2 | request id and usage reporting | anti-goal |
 | 1 | `GetObjectAttributes` | anti-goal |
@@ -216,13 +217,13 @@ that catches encryption tests was found to match `enc_` and not `enc[`, so the p
 requests it had been ignoring, which moved tests that had been passing into this row. A classifier is
 only worth the numbers it produces, so both are filed here rather than quietly fixed.
 
-By verdict: **488 anti-goals, 47 v1 `ListObjects`, 28 consequences of buckets being prefixes, 24
-conditional writes, 24 named gaps, and 2 artifacts of the suite's own environment.** The gap column
+By verdict: **491 anti-goals / structural, 47 v1 `ListObjects`, 28 consequences of buckets being prefixes, 24
+conditional writes, 20 named gaps, and 2 artifacts of the suite's own environment.** The gap column
 is the one to read — it is the list of things a client might reasonably expect and not get. With
 `UploadPartCopy` implemented it is led by non-MD5 checksums (8) and the multipart edge cases (9, of
 which 3 are `?partNumber` reads that still fail: an out-of-range part is 416 `InvalidPartNumber`
-where the suite wants 400 `InvalidPart`). Then the remaining authorization/length header cases (4)
-and `100-continue` (3). Nothing in the copy family is a gap any more.
+where the suite wants 400 `InvalidPart`). Then the remaining authorization/length header cases (2)
+Nothing in the copy family or the `100-continue` family is a gap any more.
 
 Not one conditional *read* fails. The 24 in the row above are all `If-Match` on a `PUT` or a
 `DELETE`, and they are an exclusion rather than an oversight: a conditional write makes the commit a
@@ -253,11 +254,17 @@ kavo does not do yet, and they are worth naming honestly:
   algorithm was checked).
 - **Malformed authorization and date headers.** A signed request with neither `x-amz-date` nor
   `Date` is `MissingSecurityHeader`. RFC 822 dates, including boto3's `-0000` UTC, are accepted.
-  The three that remain are not wrong codes for a bad signature: stripping
-  `Content-Length` is accepted where the suite wants 411; emptying or removing `Authorization` in
-  boto3's `before-call` hook is overwritten by the signer, so the PUT succeeds where the suite
-  wants 403. HTTP `Transfer-Encoding: chunked` without a declared length is accepted: the last
-  zero-size chunk is a defined end.
+  HTTP `Transfer-Encoding: chunked` without a declared `Content-Length` is accepted: the last
+  zero-size chunk is a defined end, and refusing it would break any HTTP/1.1 client that
+  falls back to chunked encoding when it cannot know the length up front.
+  Two remain: stripping `Content-Length` at the Python layer causes urllib3 to fall back to
+  chunked encoding, so the request arrives on the wire as valid chunked and is accepted rather
+  than returning 411; emptying or removing `Authorization` in boto3's `before-call` hook is
+  overwritten by the signer, so the PUT succeeds where the suite wants 403.
+- **`100-continue` and `Expect`.** `test_bucket_create_bad_contentlength_none` passes. The other
+  two are structural: `test_100_continue` requires `PutBucketAcl` with `public-read-write`
+  (anti-goal); `test_100_continue_error_retry` expects a PUT to a non-existent bucket to return
+  404, but kavo treats buckets as prefixes so the write succeeds.
 
 Three failures are deliberate rather than missing, and each is a case where the suite asks kavo to
 be more forgiving than it is willing to be:

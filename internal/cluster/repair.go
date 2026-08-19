@@ -152,23 +152,26 @@ func (c *Coordinator) repairObject(ctx context.Context, o meta.Object, st *Stats
 		return c.repairShards(ctx, o, st, pace, live)
 	}
 
+	// Survey all chunk IDs this object needs from each node in one call rather
+	// than one HEAD per chunk. For a multi-chunk object the batched path sends
+	// one request per live node instead of nodes×chunks requests.
+	ids := make([]string, len(o.Manifest.Chunks))
+	for i, ref := range o.Manifest.Chunks {
+		ids[i] = ref.ID
+	}
+	held, err := c.surveyNodes(ctx, o.Manifest.Nodes, ids, live)
+	if err != nil {
+		return err
+	}
+
 	var errs []error
 	for _, ref := range o.Manifest.Chunks {
 		for _, node := range o.Manifest.Nodes {
-			// A node the manifest names but the cluster has lost cannot be
-			// given anything. Putting the copy somewhere else instead would mean
-			// rewriting the manifest, which is rebalancing, not repair.
 			if _, member := live.peers[node]; !member {
 				continue
 			}
 			st.CopiesChecked++
-
-			held, err := c.holds(ctx, node, ref, live)
-			if err != nil {
-				errs = append(errs, err)
-				continue
-			}
-			if held {
+			if held[node][ref.ID] {
 				continue
 			}
 			if err := c.restore(ctx, node, ref, o.Manifest.Nodes, live, pace); err != nil {
@@ -183,6 +186,40 @@ func (c *Coordinator) repairObject(ctx context.Context, o meta.Object, st *Stats
 	return errors.Join(errs...)
 }
 
+// surveyNodes asks each live node in nodes which of ids it holds, returning a
+// map of node → set of held IDs. A survey error on one node is non-fatal: the
+// repair loop treats unknown presence as missing and attempts a restore.
+func (c *Coordinator) surveyNodes(ctx context.Context, nodes, ids []string, live *membership) (map[string]map[string]bool, error) {
+	result := make(map[string]map[string]bool, len(nodes))
+	for _, node := range nodes {
+		if _, member := live.peers[node]; !member {
+			continue
+		}
+		if node == c.self {
+			have, err := c.store.HasChunks(ids)
+			if err != nil {
+				return nil, fmt.Errorf("repair: survey self: %w", err)
+			}
+			m := make(map[string]bool, len(have))
+			for _, id := range have {
+				m[id] = true
+			}
+			result[node] = m
+		} else {
+			have, err := peer.HasChunks(ctx, live.peers[node], ids)
+			if err != nil {
+				// Treat a survey error as nothing held: repair will
+				// attempt to restore and fail fast if the node is gone.
+				log.Printf("repair: survey %s: %v", node, err)
+				result[node] = map[string]bool{}
+			} else {
+				result[node] = have
+			}
+		}
+	}
+	return result, nil
+}
+
 // repairShards restores the shards of an erasure-coded object that their nodes no
 // longer have.
 //
@@ -191,6 +228,44 @@ func (c *Coordinator) repairObject(ctx context.Context, o meta.Object, st *Stats
 // costs the same as finding one.
 func (c *Coordinator) repairShards(ctx context.Context, o meta.Object, st *Stats, pace *pacer, live *membership) error {
 	nodes := o.Manifest.Nodes
+
+	// Collect all shard IDs each node is responsible for and ask in one call.
+	// node index i holds ref.ShardID(i) for each chunk.
+	nodeShards := make([][]string, len(nodes))
+	for _, ref := range o.Manifest.Chunks {
+		for i := range nodes {
+			nodeShards[i] = append(nodeShards[i], ref.ShardID(i))
+		}
+	}
+	held := make([]map[string]bool, len(nodes))
+	for i, node := range nodes {
+		if _, member := live.peers[node]; !member {
+			held[i] = map[string]bool{}
+			continue
+		}
+		if node == c.self {
+			have, err := c.store.HasChunks(nodeShards[i])
+			if err != nil {
+				held[i] = map[string]bool{}
+				log.Printf("repair: survey self shards: %v", err)
+				continue
+			}
+			m := make(map[string]bool, len(have))
+			for _, id := range have {
+				m[id] = true
+			}
+			held[i] = m
+		} else {
+			m, err := peer.HasChunks(ctx, live.peers[node], nodeShards[i])
+			if err != nil {
+				log.Printf("repair: survey %s shards: %v", node, err)
+				held[i] = map[string]bool{}
+			} else {
+				held[i] = m
+			}
+		}
+	}
+
 	var errs []error
 	for _, ref := range o.Manifest.Chunks {
 		var missing []int
@@ -203,12 +278,7 @@ func (c *Coordinator) repairShards(ctx context.Context, o meta.Object, st *Stats
 			}
 			st.CopiesChecked++
 
-			held, err := c.holdsShard(ctx, node, ref, i, live)
-			if err != nil {
-				errs = append(errs, err)
-				continue
-			}
-			if !held {
+			if !held[i][ref.ShardID(i)] {
 				missing = append(missing, i)
 			}
 		}
@@ -224,14 +294,6 @@ func (c *Coordinator) repairShards(ctx context.Context, o meta.Object, st *Stats
 		st.BytesRestored += int64(len(missing)) * shardSize(ref.Size, o.Manifest.Coding)
 	}
 	return errors.Join(errs...)
-}
-
-// holds reports whether a node still has its copy of a chunk.
-func (c *Coordinator) holds(ctx context.Context, node string, ref object.ChunkRef, live *membership) (bool, error) {
-	if node == c.self {
-		return c.store.HasChunk(ref.ID)
-	}
-	return peer.HasChunk(ctx, live.peers[node], ref.ID)
 }
 
 // restore rebuilds one missing copy by streaming it from a node that still has

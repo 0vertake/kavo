@@ -8,7 +8,9 @@
 package peer
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -103,30 +105,38 @@ func FetchChunk(ctx context.Context, addr, id string, crc uint32) (io.ReadCloser
 	}
 }
 
-// HasChunk asks whether the node at addr holds chunk id, without transferring
-// it. Repair needs to survey every copy of every chunk, and doing that by
-// fetching them would move the whole cluster's data to ask a yes-or-no question.
-//
-// Presence, not integrity: a rotted chunk answers yes. Finding missing copies and
-// finding bad ones are different jobs.
-func HasChunk(ctx context.Context, addr, id string) (bool, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, chunkURL(addr, id), nil)
+// HasChunks asks which of the given IDs the node at addr holds, in one round
+// trip. It returns a set of the present IDs. Repair uses this to survey a whole
+// object page per node instead of one request per chunk copy.
+func HasChunks(ctx context.Context, addr string, ids []string) (map[string]bool, error) {
+	body, err := json.Marshal(ids)
 	if err != nil {
-		return false, fmt.Errorf("peer: probe chunk %s on %s: %w", id, addr, err)
+		return nil, fmt.Errorf("peer: check chunks on %s: %w", addr, err)
 	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"http://"+addr+"/peer/chunks/check", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("peer: check chunks on %s: %w", addr, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
-		return false, fmt.Errorf("peer: probe chunk %s on %s: %w", id, addr, err)
+		return nil, fmt.Errorf("peer: check chunks on %s: %w", addr, err)
 	}
-	resp.Body.Close()
-	switch resp.StatusCode {
-	case http.StatusOK:
-		return true, nil
-	case http.StatusNotFound:
-		return false, nil
-	default:
-		return false, fmt.Errorf("peer: probe chunk %s on %s: %s", id, addr, resp.Status)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("peer: check chunks on %s: %s: %s", addr, resp.Status, detail)
 	}
+	var have []string
+	if err := json.NewDecoder(resp.Body).Decode(&have); err != nil {
+		return nil, fmt.Errorf("peer: check chunks on %s: decode: %w", addr, err)
+	}
+	result := make(map[string]bool, len(have))
+	for _, id := range have {
+		result[id] = true
+	}
+	return result, nil
 }
 
 func chunkURL(addr, id string) string {

@@ -29,6 +29,7 @@ func New(c *cluster.Coordinator, s *store.Store) http.Handler {
 	mux.HandleFunc("PUT /peer/chunks/{id}", h.putChunk)
 	mux.HandleFunc("GET /peer/chunks/{id}", h.getChunk)
 	mux.HandleFunc("HEAD /peer/chunks/{id}", h.headChunk)
+	mux.HandleFunc("POST /peer/chunks/check", h.checkChunks)
 	mux.HandleFunc("GET /cluster/members", h.members)
 	return mux
 }
@@ -155,6 +156,27 @@ func (h *handler) headChunk(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "chunk probe failed", http.StatusInternalServerError)
 	case !held:
 		http.Error(w, "not found", http.StatusNotFound)
+	}
+}
+
+// checkChunks answers which of a JSON-encoded list of chunk IDs this node holds.
+// Repair batches its survey through this endpoint rather than issuing one HEAD
+// per chunk, which cuts the round-trip count from O(N×chunks) to O(N×pages).
+func (h *handler) checkChunks(w http.ResponseWriter, r *http.Request) {
+	var ids []string
+	if err := json.NewDecoder(r.Body).Decode(&ids); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	have, err := h.store.HasChunks(ids)
+	if err != nil {
+		log.Printf("peer check chunks: %v", err)
+		http.Error(w, "check failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(have); err != nil {
+		log.Printf("peer check chunks: encode: %v", err)
 	}
 }
 
