@@ -7,11 +7,16 @@ package s3_test
 import (
 	"bytes"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
@@ -629,5 +634,34 @@ func TestEmptyContinuationTokenIsEchoed(t *testing.T) {
 	}
 	if got := aws.ToString(page.ContinuationToken); got != "" {
 		t.Errorf("ContinuationToken = %q, want empty string", got)
+	}
+}
+
+// Ceph's allow-unordered extension is a v1 ListObjects parameter. kavo does not
+// implement v1, but this invalid parameter combination still has to answer the
+// status/code clients see on S3.
+func TestListObjectsV1AllowUnorderedWithDelimiterIsInvalidArgument(t *testing.T) {
+	_, endpoint := newGatewayURL(t, 3, testChunkSize)
+	req, err := http.NewRequest(http.MethodGet, endpoint+"/bucket?allow-unordered=true&delimiter=%2F", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+	c, err := credentials.NewStaticCredentialsProvider(creds.AccessKey, creds.SecretKey, "").Retrieve(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer := v4.NewSigner(func(o *v4.SignerOptions) { o.DisableURIPathEscaping = true })
+	if err := signer.SignHTTP(t.Context(), c, req, "UNSIGNED-PAYLOAD", "s3", "us-east-1", time.Now()); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d: %s, want 400", resp.StatusCode, body)
 	}
 }

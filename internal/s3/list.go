@@ -77,6 +77,14 @@ func (h *handler) listObjects(w http.ResponseWriter, r *http.Request) {
 		h.bucketLocation(w, r)
 		return
 	}
+	// Ceph's allow-unordered extension lives on ListObjects v1 and is unsupported
+	// here. The one invalid combination the suite checks is with a delimiter,
+	// which S3 answers as InvalidArgument rather than NotImplemented.
+	if q.Get("list-type") != "2" && q.Get("allow-unordered") == "true" && q.Get("delimiter") != "" {
+		fail(w, r, apiError{"InvalidArgument", http.StatusBadRequest,
+			"allow-unordered may not be combined with delimiter."}, nil)
+		return
+	}
 	if q.Get("list-type") != "2" {
 		fail(w, r, errNotImplemented, nil)
 		return
