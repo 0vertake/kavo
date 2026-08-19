@@ -221,6 +221,18 @@ func writesObjectBytes(r *http.Request) bool {
 	return false
 }
 
+// httpChunked reports whether the body is framed by Transfer-Encoding: chunked.
+// Go dechunks it before the handler and leaves ContentLength at -1, but the
+// last zero-size chunk is a defined end — unlike a connection that just stops.
+func httpChunked(r *http.Request) bool {
+	for _, te := range r.TransferEncoding {
+		if strings.EqualFold(te, "chunked") {
+			return true
+		}
+	}
+	return false
+}
+
 func checksumHeaders(header http.Header) (algo string, extras bool) {
 	if v := header.Get("X-Amz-Checksum-Type"); v != "" && !strings.EqualFold(v, "FULL_OBJECT") {
 		return "", true
@@ -503,9 +515,10 @@ func (h *handler) putObject(w http.ResponseWriter, r *http.Request) {
 		h.copyObject(w, r, key, source)
 		return
 	}
-	// Without a length there is no way to tell a complete upload from a
-	// connection that died halfway, and S3 requires one.
-	if r.ContentLength < 0 {
+	// HTTP chunked framing ends with a zero-size chunk, so a complete upload is
+	// distinguishable from a connection that died. A body with neither a length
+	// nor that framing is not.
+	if r.ContentLength < 0 && !httpChunked(r) {
 		fail(w, r, errMissingLength, nil)
 		return
 	}

@@ -1738,6 +1738,48 @@ func TestTrailingCRC64NVMEOnAPutIsVerified(t *testing.T) {
 	}
 }
 
+// HTTP chunked framing ends the body with a zero-size chunk, so a PUT that
+// names no Content-Length is still a complete upload. Refusing it as
+// MissingContentLength was treating a defined encoding as an unknown length.
+func TestHTTPChunkedPUTWithoutContentLengthIsStored(t *testing.T) {
+	client, endpoint := newGatewayURL(t, 3, testChunkSize)
+	body := []byte("bar")
+	req, err := http.NewRequest(http.MethodPut, endpoint+"/bucket/chunked.bin", io.NopCloser(bytes.NewReader(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.ContentLength = -1
+	req.Header.Del("Content-Length")
+	signS3(t, req, "UNSIGNED-PAYLOAD")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("chunked PUT = %d: %s", resp.StatusCode, got)
+	}
+
+	get, err := client.GetObject(t.Context(), &awss3.GetObjectInput{
+		Bucket: aws.String("bucket"), Key: aws.String("chunked.bin"),
+	})
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer get.Body.Close()
+	stored, err := io.ReadAll(get.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(stored, body) {
+		t.Errorf("got %q, want %q", stored, body)
+	}
+}
+
 func putUnsignedTrailer(t *testing.T, endpoint, key string, data []byte, checksum, trailer, algo string) *http.Response {
 	t.Helper()
 	var framed bytes.Buffer

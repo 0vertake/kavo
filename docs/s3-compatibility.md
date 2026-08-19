@@ -253,11 +253,11 @@ kavo does not do yet, and they are worth naming honestly:
   algorithm was checked).
 - **Malformed authorization and date headers.** A signed request with neither `x-amz-date` nor
   `Date` is `MissingSecurityHeader`. RFC 822 dates, including boto3's `-0000` UTC, are accepted.
-  The four that remain are not wrong codes for a bad signature: `Transfer-Encoding: chunked` without
-  a length is `MissingContentLength` where the suite wants the PUT to succeed; stripping
+  The three that remain are not wrong codes for a bad signature: stripping
   `Content-Length` is accepted where the suite wants 411; emptying or removing `Authorization` in
   boto3's `before-call` hook is overwritten by the signer, so the PUT succeeds where the suite
-  wants 403.
+  wants 403. HTTP `Transfer-Encoding: chunked` without a declared length is accepted: the last
+  zero-size chunk is a defined end.
 
 Three failures are deliberate rather than missing, and each is a case where the suite asks kavo to
 be more forgiving than it is willing to be:
