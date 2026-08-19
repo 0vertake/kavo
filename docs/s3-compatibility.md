@@ -4,13 +4,13 @@ Ceph's [`s3-tests`](https://github.com/ceph/s3-tests) is the suite S3 implementa
 against. It is an independent oracle in the strongest sense available: nobody involved in kavo chose
 what it asserts, and it encodes S3's behaviour as observed by people who had to match it.
 
-**180 of 886 pass. 612 fail, 94 the suite skips itself, and nothing errors** — every test reaches a
+**182 of 886 pass. 610 fail, 94 the suite skips itself, and nothing errors** — every test reaches a
 verdict rather than dying in setup. The pass count is not the interesting number on its own, because
 most of what the suite covers is deliberately absent here (see the locked subset in
 `docs/design.md`). What is interesting is the classification below: what fails because of an
 anti-goal, and what fails because of a gap.
 
-The count has moved eight times, and three of those moves were downward on purpose:
+The count has moved ten times, and three of those moves were downward on purpose:
 
 | count | what changed |
 | --- | --- |
@@ -25,6 +25,8 @@ The count has moved eight times, and three of those moves were downward on purpo
 | 178 | RFC 822 `Date` / `x-amz-date` (boto3 writes UTC as `-0000`, which `http.ParseTime` rejects) |
 | 179 | a CRC64NVME of `bad` is `BadDigest` rather than `InvalidDigest` |
 | 180 | HTTP `Transfer-Encoding: chunked` PUT without a `Content-Length` |
+| 181 | explicit empty `continuation-token` is echoed on ListObjectsV2 |
+| 182 | `allow-unordered` with `delimiter` returns `InvalidArgument` |
 
 The last line is the one that matters, and it is covered in "What the suite did not find" below:
 `PUT /key?tagging` was reaching the handler that writes an object and replacing the object with the
@@ -91,7 +93,7 @@ rather than on a missing config.
 
 The two `AWS_*_CHECKSUM_*` variables are load-bearing. botocore 1.43's default is
 `request_checksum_calculation=when_supported`, which attaches CRC32 to every PUT.
-Pinned (`when_required`) is **179 pass, 613 fail, 94 skip**. Unpinned boto3, which attaches CRC32
+Pinned (`when_required`) is **182 pass, 610 fail, 94 skip**. Unpinned boto3, which attaches CRC32
 to every PUT, matched the pinned count after CRC32 was checked (it was 39 before).
 The unpinned run was **39 pass, 753 fail** before CRC32 was checked; default boto3
 PUTs no longer fail for naming an algorithm this store verifies.
@@ -174,10 +176,10 @@ The one query whose *value* decides is `?versionId`, which is honoured for `null
 ListObjectVersions reports for everything, and how a client empties a bucket — and refused for any
 other id, since answering an invented version with the live object deletes the wrong thing.
 
-## Why the 613 fail
+## Why the 610 fail
 
 `docs/classify.py` produces this table from the suite's own failure list. Each test lands in exactly
-one family — the first that matches its name, in the order shown — so the counts sum to 613 rather
+one family — the first that matches its name, in the order shown — so the counts sum to 610 rather
 than counting an SSE copy twice. A test is filed under what it is about, which is not always what it
 died on: many of these never reach their assertion because a `ListObjects` v1 call or a
 `GetBucketVersioning` in their setup is refused first.
@@ -202,7 +204,7 @@ died on: many of these never reach their assertion because a `ListObjects` v1 ca
 | 9 | multipart upload edge cases | mixed, see below |
 | 8 | non-MD5 checksum algorithms (SHA-256, SHA-1, COMPOSITE) | gap |
 | 8 | anonymous and unsigned access | anti-goal: one key pair, everything signed |
-| 2 | error codes for malformed authorization and date headers | gap |
+| 3 | error codes for malformed authorization and date headers | gap |
 | 3 | `100-continue` and `Expect` | anti-goal / buckets-as-prefixes, see below |
 | 2 | bulk delete, both failing in setup on a v1 listing | deliberate: v2 only |
 | 2 | request id and usage reporting | anti-goal |
@@ -321,15 +323,14 @@ kavo claims:
 
 | family | passing |
 | --- | --- |
-| `ListObjectsV2`, all shapes | 37 of 40 |
+| `ListObjectsV2`, all shapes | 39 of 40 |
 | server-side copy of a multipart-sized object | 6 of 7 |
 | multipart upload, end to end | 14 of 25 |
 | single-object `CopyObject` | 15 of 23 |
 | conditional reads: 8 on `GET`, 4 on a copy source | 12 of 12 |
 | user metadata and header passthrough | 6 of 7 |
 
-The three listing failures are anonymous access, the `allow-unordered` extension, and an empty
-`continuation-token` echoed back as an absent field rather than an empty one.
+The one listing failure is anonymous access.
 
 The multipart row counts the 25 multipart tests that are not encryption, ACL, versioning, lock,
 policy, logging, tagging, attributes or copy variants. It was 9 of 25 before this round. Its 11
