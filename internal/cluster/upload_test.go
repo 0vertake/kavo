@@ -55,7 +55,7 @@ func TestACompletionIsRefusedWhenPlacementMovedMidUpload(t *testing.T) {
 
 	_, err = driver.c.CompleteUpload(ctx, id, []cluster.CompletedPart{
 		{Number: 1, ETag: first.ETag}, {Number: 2, ETag: second.ETag},
-	}, nil)
+	}, nil, nil)
 	if err == nil {
 		t.Fatal("completed an upload whose parts are on different nodes than the manifest would name")
 	}
@@ -166,7 +166,7 @@ func TestCompleteUploadStoresTheObjectsCRC32C(t *testing.T) {
 	parts := []cluster.CompletedPart{
 		{Number: 1, ETag: first.ETag}, {Number: 2, ETag: second.ETag},
 	}
-	if _, err := driver.c.CompleteUpload(ctx, id, parts, &wrong); !errors.Is(err, cluster.ErrBadDigest) {
+	if _, err := driver.c.CompleteUpload(ctx, id, parts, &wrong, nil); !errors.Is(err, cluster.ErrBadDigest) {
 		t.Fatalf("wrong object CRC32C = %v, want ErrBadDigest", err)
 	}
 	if _, err := driver.c.Resolve(ctx, key); !errors.Is(err, meta.ErrNotFound) {
@@ -174,12 +174,16 @@ func TestCompleteUploadStoresTheObjectsCRC32C(t *testing.T) {
 	}
 
 	want := crc32.Checksum(append(append([]byte{}, p1...), p2...), crc32.MakeTable(crc32.Castagnoli))
-	m, err := driver.c.CompleteUpload(ctx, id, parts, &want)
+	m, err := driver.c.CompleteUpload(ctx, id, parts, &want, nil)
 	if err != nil {
 		t.Fatalf("complete: %v", err)
 	}
 	if m.CRC32C == nil || *m.CRC32C != want {
 		t.Errorf("completed CRC32C = %v, want %08x", m.CRC32C, want)
+	}
+	want64 := object.CRC64NVME(append(append([]byte{}, p1...), p2...))
+	if m.CRC64NVME == nil || *m.CRC64NVME != want64 {
+		t.Errorf("completed CRC64NVME = %v, want %016x", m.CRC64NVME, want64)
 	}
 	wantParts := []object.Part{{Number: 1, Size: int64(len(p1))}, {Number: 2, Size: int64(len(p2))}}
 	if !slices.Equal(m.Parts, wantParts) {

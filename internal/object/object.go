@@ -101,6 +101,10 @@ type Manifest struct {
 	// A pointer because 0 is a real checksum (the empty object) and a missing
 	// value is an object written before this was stored.
 	CRC32C *uint32 `json:",omitempty"`
+	// CRC64NVME is the CRC-64/NVME of the object's bytes, stored the same way
+	// and for the same reason: a client that names it is checked, and a HEAD
+	// that asks gets it back. Default `aws s3 cp` sends this algorithm.
+	CRC64NVME *uint64 `json:",omitempty"`
 	// Parts is the completed multipart parts in assembly order, so a GET with
 	// partNumber can return one of them. Empty for a single PUT, and for objects
 	// completed before this was stored — those have no recoverable boundaries.

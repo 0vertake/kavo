@@ -36,14 +36,15 @@ type completeRequest struct {
 }
 
 type completeResult struct {
-	XMLName        xml.Name `xml:"CompleteMultipartUploadResult"`
-	XMLNS          string   `xml:"xmlns,attr"`
-	Location       string   `xml:"Location"`
-	Bucket         string   `xml:"Bucket"`
-	Key            string   `xml:"Key"`
-	ETag           string   `xml:"ETag"`
-	ChecksumCRC32C string   `xml:"ChecksumCRC32C,omitempty"`
-	ChecksumType   string   `xml:"ChecksumType,omitempty"`
+	XMLName           xml.Name `xml:"CompleteMultipartUploadResult"`
+	XMLNS             string   `xml:"xmlns,attr"`
+	Location          string   `xml:"Location"`
+	Bucket            string   `xml:"Bucket"`
+	Key               string   `xml:"Key"`
+	ETag              string   `xml:"ETag"`
+	ChecksumCRC32C    string   `xml:"ChecksumCRC32C,omitempty"`
+	ChecksumCRC64NVME string   `xml:"ChecksumCRC64NVME,omitempty"`
+	ChecksumType      string   `xml:"ChecksumType,omitempty"`
 }
 
 // maxCompleteRequest bounds the completion body. 10,000 parts of roughly 60 bytes
@@ -268,13 +269,13 @@ func (h *handler) uploadPart(w http.ResponseWriter, r *http.Request, id string) 
 		fail(w, r, errInvalidDigest, err)
 		return
 	}
-	opts := cluster.PutOptions{Size: r.ContentLength, CRC32C: crc32c}
-	if len(announcedTrailers(r.Header)) > 0 {
-		body := r.Body
-		opts.TrailingCRC32C = func() (*uint32, error) {
-			return declaredTrailingCRC32C(body)
-		}
+	crc64nvme, err := declaredCRC64NVME(r.Header)
+	if err != nil {
+		fail(w, r, errInvalidDigest, err)
+		return
 	}
+	opts := cluster.PutOptions{Size: r.ContentLength, CRC32C: crc32c, CRC64NVME: crc64nvme}
+	attachTrailingChecksums(&opts, r)
 
 	m, err := h.cluster.UploadPart(r.Context(), id, number, r.Body, opts)
 	if err != nil {
@@ -287,6 +288,9 @@ func (h *handler) uploadPart(w http.ResponseWriter, r *http.Request, id string) 
 	if m.CRC32C != nil && (crc32c != nil || requestedCRC32C(r.Header)) {
 		w.Header().Set("X-Amz-Checksum-Crc32c", encodeCRC32C(*m.CRC32C))
 	}
+	if m.CRC64NVME != nil && (crc64nvme != nil || requestedCRC64NVME(r.Header)) {
+		w.Header().Set("X-Amz-Checksum-Crc64nvme", encodeCRC64NVME(*m.CRC64NVME))
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -295,11 +299,12 @@ func (h *handler) uploadPart(w http.ResponseWriter, r *http.Request, id string) 
 // wrong one back cannot complete its upload — so an empty body here is a copy that
 // can never be finished, which is what an ignored copy source produced.
 type copyPartResult struct {
-	XMLName        xml.Name `xml:"CopyPartResult"`
-	XMLNS          string   `xml:"xmlns,attr"`
-	ETag           string   `xml:"ETag"`
-	LastModified   string   `xml:"LastModified"`
-	ChecksumCRC32C string   `xml:"ChecksumCRC32C,omitempty"`
+	XMLName           xml.Name `xml:"CopyPartResult"`
+	XMLNS             string   `xml:"xmlns,attr"`
+	ETag              string   `xml:"ETag"`
+	LastModified      string   `xml:"LastModified"`
+	ChecksumCRC32C    string   `xml:"ChecksumCRC32C,omitempty"`
+	ChecksumCRC64NVME string   `xml:"ChecksumCRC64NVME,omitempty"`
 }
 
 // copyPart stores a part copied from a range of another object.
@@ -337,8 +342,13 @@ func (h *handler) copyPart(w http.ResponseWriter, r *http.Request, id string, nu
 		fail(w, r, errInvalidDigest, err)
 		return
 	}
+	crc64nvme, err := declaredCRC64NVME(r.Header)
+	if err != nil {
+		fail(w, r, errInvalidDigest, err)
+		return
+	}
 
-	m, err := h.cluster.CopyPart(r.Context(), id, number, src, off, length, cluster.PutOptions{CRC32C: crc32c})
+	m, err := h.cluster.CopyPart(r.Context(), id, number, src, off, length, cluster.PutOptions{CRC32C: crc32c, CRC64NVME: crc64nvme})
 	if err != nil {
 		fail(w, r, uploadError(err), err)
 		return
@@ -350,6 +360,9 @@ func (h *handler) copyPart(w http.ResponseWriter, r *http.Request, id string, nu
 	}
 	if m.CRC32C != nil && (crc32c != nil || requestedCRC32C(r.Header)) {
 		result.ChecksumCRC32C = encodeCRC32C(*m.CRC32C)
+	}
+	if m.CRC64NVME != nil && (crc64nvme != nil || requestedCRC64NVME(r.Header)) {
+		result.ChecksumCRC64NVME = encodeCRC64NVME(*m.CRC64NVME)
 	}
 	writeXML(w, r, result)
 }
@@ -419,12 +432,17 @@ func (h *handler) completeUpload(w http.ResponseWriter, r *http.Request, key, id
 		fail(w, r, errInvalidDigest, err)
 		return
 	}
+	crc64nvme, err := declaredCRC64NVME(r.Header)
+	if err != nil {
+		fail(w, r, errInvalidDigest, err)
+		return
+	}
 
 	// A completion can take a while — it reads every part's manifest — and S3
 	// clients tolerate that. What they do not tolerate is a 200 with an error in
 	// the body, which S3 itself does and which is a well-known trap; kavo answers
 	// with a status that means what it says.
-	m, err := h.cluster.CompleteUpload(r.Context(), id, parts, crc32c)
+	m, err := h.cluster.CompleteUpload(r.Context(), id, parts, crc32c, crc64nvme)
 	if err != nil {
 		fail(w, r, uploadError(err), err)
 		return
@@ -438,6 +456,10 @@ func (h *handler) completeUpload(w http.ResponseWriter, r *http.Request, key, id
 	}
 	if m.CRC32C != nil && (crc32c != nil || requestedCRC32C(r.Header)) {
 		result.ChecksumCRC32C = encodeCRC32C(*m.CRC32C)
+		result.ChecksumType = "FULL_OBJECT"
+	}
+	if m.CRC64NVME != nil && (crc64nvme != nil || requestedCRC64NVME(r.Header)) {
+		result.ChecksumCRC64NVME = encodeCRC64NVME(*m.CRC64NVME)
 		result.ChecksumType = "FULL_OBJECT"
 	}
 	writeXML(w, r, result)

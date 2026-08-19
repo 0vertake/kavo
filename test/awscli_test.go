@@ -25,18 +25,12 @@ func (n *node) aws(t *testing.T, args ...string) (string, error) {
 }
 
 // awsTuned is aws with extra settings in the CLI's own config file, which is the
-// only way to change how it splits a transfer.
+// only way to change how it splits a transfer. The developer's own config is
+// bypassed: it can point at a real account.
 func (n *node) awsTuned(t *testing.T, s3Config string, args ...string) (string, error) {
 	t.Helper()
-	// The developer's own config is bypassed: it can point at a real account.
-	// Request checksums are pinned to when_required at both the profile and the
-	// process: recent CLIs default to when_supported and send CRC64NVME, which
-	// this server 501s rather than store unread. CRC32C on a multipart upload is
-	// checked; the pin is the other algorithms. The setting lives on the
-	// profile, not under `s3 =` — that is the shared AWS config key, and putting
-	// it in the s3 subsection was a no-op.
 	config := filepath.Join(t.TempDir(), "config")
-	settings := "[default]\nrequest_checksum_calculation = when_required\n"
+	settings := "[default]\n"
 	if s3Config != "" {
 		settings += "s3 =\n" + s3Config + "\n"
 	}
@@ -51,8 +45,6 @@ func (n *node) awsTuned(t *testing.T, s3Config string, args ...string) (string, 
 		"AWS_CONFIG_FILE="+config,
 		"AWS_SHARED_CREDENTIALS_FILE="+filepath.Join(t.TempDir(), "credentials"),
 		"AWS_EC2_METADATA_DISABLED=true",
-		"AWS_REQUEST_CHECKSUM_CALCULATION=WHEN_REQUIRED",
-		"AWS_RESPONSE_CHECKSUM_VALIDATION=WHEN_REQUIRED",
 	)
 	out, err := cmd.CombinedOutput()
 	return string(out), err

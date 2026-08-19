@@ -174,7 +174,7 @@ func TestChunksOfAnUploadInProgressAreKept(t *testing.T) {
 
 	// And once the upload becomes an object, the same chunks are still referenced —
 	// by the object now, not the part.
-	if _, err := outsider.c.CompleteUpload(context.Background(), id, []cluster.CompletedPart{{Number: 1, ETag: ""}}, nil); err != nil {
+	if _, err := outsider.c.CompleteUpload(context.Background(), id, []cluster.CompletedPart{{Number: 1, ETag: ""}}, nil, nil); err != nil {
 		t.Fatalf("complete upload: %v", err)
 	}
 	if st := collectEverywhere(t, tc, 0); st.Collected != 0 {

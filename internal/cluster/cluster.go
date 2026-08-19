@@ -223,6 +223,10 @@ type PutOptions struct {
 	// arrived in a trailer rather than a header. The comparison is the same;
 	// only the moment it can run differs.
 	TrailingCRC32C func() (*uint32, error)
+	// CRC64NVME is the CRC-64/NVME the client declared, or nil if it did not.
+	CRC64NVME *uint64
+	// TrailingCRC64NVME is the trailer form, same split as CRC32C.
+	TrailingCRC64NVME func() (*uint64, error)
 }
 
 // Put streams an object into the cluster and returns its committed manifest.
@@ -247,6 +251,10 @@ func (c *Coordinator) Put(ctx context.Context, key string, body io.Reader, opts 
 		return object.Manifest{}, fmt.Errorf("%w: declared %s, received %s", ErrBadDigest, opts.MD5, m.ETag)
 	}
 	if err := checkCRC32C(m, opts); err != nil {
+		c.stopWriting(ctx, writing)
+		return object.Manifest{}, err
+	}
+	if err := checkCRC64NVME(m, opts); err != nil {
 		c.stopWriting(ctx, writing)
 		return object.Manifest{}, err
 	}
@@ -331,6 +339,7 @@ func (c *Coordinator) write(ctx context.Context, key string, body io.Reader, exp
 	// hashed in the order they are cut, which is what keeps the sum the object's.
 	sum := md5.New()
 	crc := crc32.New(crc32.MakeTable(crc32.Castagnoli))
+	crc64 := object.NewCRC64NVME()
 	var writing string
 	m, err := object.Write(body, c.chunkSize, expect, func(ref *object.ChunkRef, data []byte) error {
 		// A write whose chunks will outlive the sweep's patience says so before it
@@ -351,6 +360,7 @@ func (c *Coordinator) write(ctx context.Context, key string, body io.Reader, exp
 			defer close(hashed)
 			sum.Write(data)
 			crc.Write(data)
+			crc64.Write(data)
 		}()
 		// Before returning on any path: the next chunk overwrites this buffer.
 		defer func() { <-hashed }()
@@ -375,6 +385,8 @@ func (c *Coordinator) write(ctx context.Context, key string, body io.Reader, exp
 	m.ETag = hex.EncodeToString(sum.Sum(nil))
 	crc32c := crc.Sum32()
 	m.CRC32C = &crc32c
+	nvme := crc64.Sum64()
+	m.CRC64NVME = &nvme
 	// Truncated to the second, because that is all the Last-Modified header can
 	// carry. A listing reports the same field to the millisecond, so keeping any
 	// finer resolution would have a HEAD and a listing disagree about when the same
@@ -401,6 +413,25 @@ func checkCRC32C(m object.Manifest, opts PutOptions) error {
 	}
 	if declared != nil && m.CRC32C != nil && *declared != *m.CRC32C {
 		return fmt.Errorf("%w: declared CRC32C %08x, received %08x", ErrBadDigest, *declared, *m.CRC32C)
+	}
+	return nil
+}
+
+func checkCRC64NVME(m object.Manifest, opts PutOptions) error {
+	declared := opts.CRC64NVME
+	if opts.TrailingCRC64NVME != nil {
+		v, err := opts.TrailingCRC64NVME()
+		if err != nil {
+			return err
+		}
+		if declared == nil {
+			declared = v
+		} else if v != nil && *v != *declared {
+			return fmt.Errorf("%w: header CRC64NVME %016x, trailer %016x", ErrBadDigest, *declared, *v)
+		}
+	}
+	if declared != nil && m.CRC64NVME != nil && *declared != *m.CRC64NVME {
+		return fmt.Errorf("%w: declared CRC64NVME %016x, received %016x", ErrBadDigest, *declared, *m.CRC64NVME)
 	}
 	return nil
 }
