@@ -609,3 +609,25 @@ func TestAnEncodedListingEchoesWhatTheClientSent(t *testing.T) {
 		t.Error("an owner came back for a listing that did not ask for one")
 	}
 }
+
+// An explicitly empty continuation token is still an explicit value and must be
+// echoed as such. Omitting it turns an empty token into "not provided", which is
+// what Ceph's test catches as a missing field.
+func TestEmptyContinuationTokenIsEchoed(t *testing.T) {
+	client := newGateway(t)
+	put(t, client, "bucket", "a.txt", []byte("x"))
+
+	page, err := client.ListObjectsV2(t.Context(), &awss3.ListObjectsV2Input{
+		Bucket:            aws.String("bucket"),
+		ContinuationToken: aws.String(""),
+	})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if page.ContinuationToken == nil {
+		t.Fatal("an explicit empty continuation token was omitted")
+	}
+	if got := aws.ToString(page.ContinuationToken); got != "" {
+		t.Errorf("ContinuationToken = %q, want empty string", got)
+	}
+}
