@@ -189,8 +189,31 @@ func TestCompleteUploadStoresTheObjectsCRC32C(t *testing.T) {
 	if m.CRC64NVME == nil || *m.CRC64NVME != want64 {
 		t.Errorf("completed CRC64NVME = %v, want %016x", m.CRC64NVME, want64)
 	}
-	wantParts := []object.Part{{Number: 1, Size: int64(len(p1))}, {Number: 2, Size: int64(len(p2))}}
-	if !slices.Equal(m.Parts, wantParts) {
-		t.Errorf("completed Parts = %+v, want %+v", m.Parts, wantParts)
+	if len(m.Parts) != 2 {
+		t.Fatalf("completed Parts = %+v, want 2 entries", m.Parts)
+	}
+	for i, got := range m.Parts {
+		var want object.Part
+		var src object.Manifest
+		switch i {
+		case 0:
+			want = object.Part{Number: 1, Size: int64(len(p1))}
+			src = first
+		case 1:
+			want = object.Part{Number: 2, Size: int64(len(p2))}
+			src = second
+		}
+		if got.Number != want.Number || got.Size != want.Size {
+			t.Errorf("part %d = %+v, want number %d size %d", i, got, want.Number, want.Size)
+		}
+		if got.CRC32C == nil || src.CRC32C == nil || *got.CRC32C != *src.CRC32C {
+			t.Errorf("part %d CRC32C = %v, want %v", i, got.CRC32C, src.CRC32C)
+		}
+		if got.CRC32 == nil || src.CRC32 == nil || *got.CRC32 != *src.CRC32 {
+			t.Errorf("part %d CRC32 = %v, want %v", i, got.CRC32, src.CRC32)
+		}
+		if got.CRC64NVME == nil || src.CRC64NVME == nil || *got.CRC64NVME != *src.CRC64NVME {
+			t.Errorf("part %d CRC64NVME = %v, want %v", i, got.CRC64NVME, src.CRC64NVME)
+		}
 	}
 }

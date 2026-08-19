@@ -121,6 +121,12 @@ type Manifest struct {
 type Part struct {
 	Number int
 	Size   int64
+	// Per-part checksums are stored at complete time so a GET with partNumber
+	// can return the checksum of that part's bytes without re-reading them.
+	// Objects completed before this was stored have no recoverable values.
+	CRC32C    *uint32 `json:",omitempty"`
+	CRC32     *uint32 `json:",omitempty"`
+	CRC64NVME *uint64 `json:",omitempty"`
 }
 
 // Write splits r into chunks of at most chunkSize, hands each to commit, and

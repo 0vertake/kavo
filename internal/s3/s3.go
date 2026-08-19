@@ -742,18 +742,20 @@ func (h *handler) getObject(w http.ResponseWriter, r *http.Request) {
 
 	baseOff, baseLen := int64(0), m.Size
 	var partsCount int
+	var selectedPart *object.Part
 	if r.URL.Query().Has("partNumber") {
 		n, err := strconv.Atoi(r.URL.Query().Get("partNumber"))
 		if err != nil || n < 1 || n > cluster.MaxParts {
 			fail(w, r, errBadPartNumber, err)
 			return
 		}
-		off, size, multipart, ok := partWindow(m, n)
+		off, size, part, multipart, ok := partWindow(m, n)
 		if !ok {
 			fail(w, r, errInvalidPartNumber, nil)
 			return
 		}
 		baseOff, baseLen = off, size
+		selectedPart = part
 		if multipart {
 			partsCount = len(m.Parts)
 		}
@@ -782,7 +784,21 @@ func (h *handler) getObject(w http.ResponseWriter, r *http.Request) {
 	if m.ContentType != "" {
 		header.Set("Content-Type", m.ContentType)
 	}
-	if checksumModeEnabled(r.Header) && length == m.Size {
+	if selectedPart != nil && length == baseLen {
+		// A part read returns that part's checksum, not the object's combined one.
+		if selectedPart.CRC32C != nil {
+			header.Set("X-Amz-Checksum-Crc32c", encodeCRC32C(*selectedPart.CRC32C))
+		}
+		if selectedPart.CRC32 != nil {
+			header.Set("X-Amz-Checksum-Crc32", encodeCRC32(*selectedPart.CRC32))
+		}
+		if selectedPart.CRC64NVME != nil {
+			header.Set("X-Amz-Checksum-Crc64nvme", encodeCRC64NVME(*selectedPart.CRC64NVME))
+		}
+		if selectedPart.CRC32C != nil || selectedPart.CRC32 != nil || selectedPart.CRC64NVME != nil {
+			header.Set("x-amz-checksum-type", "FULL_OBJECT")
+		}
+	} else if checksumModeEnabled(r.Header) && length == m.Size {
 		// Only the whole object: a range carrying the object's checksum is a
 		// number that does not describe the bytes in this body, and the aws CLI
 		// will reject the download.
@@ -1041,17 +1057,17 @@ func contentMD5(values []string) (string, error) {
 // number does not exist. A completed multipart upload looks the part up by the
 // number the client uploaded, which is not necessarily 1..N, and the offset is
 // the sizes of the parts assembled before it.
-func partWindow(m object.Manifest, n int) (off, size int64, multipart bool, ok bool) {
+func partWindow(m object.Manifest, n int) (off, size int64, part *object.Part, multipart, ok bool) {
 	if len(m.Parts) == 0 {
-		return 0, m.Size, false, n == 1
+		return 0, m.Size, nil, false, n == 1
 	}
-	for _, p := range m.Parts {
-		if p.Number == n {
-			return off, p.Size, true, true
+	for i := range m.Parts {
+		if m.Parts[i].Number == n {
+			return off, m.Parts[i].Size, &m.Parts[i], true, true
 		}
-		off += p.Size
+		off += m.Parts[i].Size
 	}
-	return 0, 0, true, false
+	return 0, 0, nil, true, false
 }
 
 // parseRange reads a Range header and returns the window it asks for, defaulting
