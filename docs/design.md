@@ -937,9 +937,8 @@ implementation disagreeing is the only thing that catches a misreading.
 - **Repair sees presence, not integrity**: a chunk that has rotted still answers repair's survey
   as present. The scrubber is what finds it, on a much slower cycle, so rot can sit undetected for
   up to one scrub interval.
-- **Surveying costs a round trip per copy**: one `HEAD` per chunk per owner, so a pass over a
-  large cluster is many small requests. Batching the question ("which of these ids do you have?")
-  is the obvious fix, and waits for a benchmark that shows it matters.
+- **Surveying was a round trip per copy**: batched to one POST per node per object — see
+  `docs/benchmarks.md` — which cut the capped heal time by 65%.
 - **A node that cannot reach etcd is out, even if it is healthy**: it cannot renew its lease, so
   the cluster drops it, and it cannot commit manifests anyway. This makes etcd a hard dependency
   for availability, which is the deliberate trade for having one place that decides what is true.
@@ -1004,7 +1003,7 @@ implementation disagreeing is the only thing that catches a misreading.
 4. Replication + quorum (read with node down; overhead measured)
 5. Membership + failure detection (etcd leases; bounded detection time)
 6. Automatic repair (rate-limited, resumable). Heal time measured: a node that loses its whole disk
-   is back to full redundancy in 9.2 s at the default 32 MB/s cap, 1.1 s uncapped. The cap is per
+   is back to full redundancy in 3.19 s at the default 32 MB/s cap, 560 ms uncapped. The cap is per
    node, so cluster heal bandwidth grows with the cluster while the disturbance per node does not.
 7. Erasure coding as second mode (both modes measured side by side)
 8. Rebalance on join/leave. Measured: a seventh node is seen in 40 ms and converged in 4.6 s, and
