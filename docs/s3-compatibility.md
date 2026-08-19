@@ -4,13 +4,13 @@ Ceph's [`s3-tests`](https://github.com/ceph/s3-tests) is the suite S3 implementa
 against. It is an independent oracle in the strongest sense available: nobody involved in kavo chose
 what it asserts, and it encodes S3's behaviour as observed by people who had to match it.
 
-**176 of 886 pass. 616 fail, 94 the suite skips itself, and nothing errors** — every test reaches a
+**178 of 886 pass. 614 fail, 94 the suite skips itself, and nothing errors** — every test reaches a
 verdict rather than dying in setup. The pass count is not the interesting number on its own, because
 most of what the suite covers is deliberately absent here (see the locked subset in
 `docs/design.md`). What is interesting is the classification below: what fails because of an
 anti-goal, and what fails because of a gap.
 
-The count has moved seven times, and three of those moves were downward on purpose:
+The count has moved eight times, and three of those moves were downward on purpose:
 
 | count | what changed |
 | --- | --- |
@@ -22,6 +22,7 @@ The count has moved seven times, and three of those moves were downward on purpo
 | 177 | refusing requests for encryption instead of ignoring them |
 | 169 | refusing an object's subresources, which had been answered by overwriting the object |
 | 176 | `UploadPartCopy`, and answering a read of an object's tags with none |
+| 178 | RFC 822 `Date` / `x-amz-date` (boto3 writes UTC as `-0000`, which `http.ParseTime` rejects) |
 
 The last line is the one that matters, and it is covered in "What the suite did not find" below:
 `PUT /key?tagging` was reaching the handler that writes an object and replacing the object with the
@@ -73,6 +74,8 @@ refused now, and the number is 18 lower and honest.
 git clone https://github.com/ceph/s3-tests && cd s3-tests
 python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
 make -C /path/to/kavo up                       # six nodes on 9001–9006
+AWS_REQUEST_CHECKSUM_CALCULATION=when_required \
+AWS_RESPONSE_CHECKSUM_VALIDATION=when_required \
 S3TEST_CONF=kavo.conf ./.venv/bin/python -m pytest \
     s3tests/functional/test_s3.py s3tests/functional/test_headers.py -q --tb=no \
     | rg '^FAILED' | sed 's/^FAILED //' > failed.txt
@@ -83,6 +86,13 @@ python3 /path/to/kavo/docs/classify.py failed.txt
 the credentials in every user section. The `[s3 alt]` and `[s3 tenant]` users point at the same key
 pair, because kavo authenticates exactly one — so the multi-user tests fail on kavo's behaviour
 rather than on a missing config.
+
+The two `AWS_*_CHECKSUM_*` variables are load-bearing. botocore 1.43's default is
+`request_checksum_calculation=when_supported`, which attaches CRC32 to every PUT. kavo refuses a
+checksum it would not verify, so an unpinned run against that boto3 scores **39 pass, 753 fail** —
+the same tests, a different client. The comparable measurement asks for a checksum only when a test
+names one. CRC32 on a default SDK PUT is why that algorithm is a named gap rather than nine tests
+that mention it.
 
 The other five test files are not run: `test_iam.py`, `test_sts.py`, `test_sns.py`,
 `test_s3control.py` and `test_s3select.py` target IAM, STS, SNS, S3 Control and S3 Select, which are
@@ -162,10 +172,10 @@ The one query whose *value* decides is `?versionId`, which is honoured for `null
 ListObjectVersions reports for everything, and how a client empties a bucket — and refused for any
 other id, since answering an invented version with the live object deletes the wrong thing.
 
-## Why the 616 fail
+## Why the 614 fail
 
 `docs/classify.py` produces this table from the suite's own failure list. Each test lands in exactly
-one family — the first that matches its name, in the order shown — so the counts sum to 616 rather
+one family — the first that matches its name, in the order shown — so the counts sum to 614 rather
 than counting an SSE copy twice. A test is filed under what it is about, which is not always what it
 died on: many of these never reach their assertion because a `ListObjects` v1 call or a
 `GetBucketVersioning` in their setup is refused first.
@@ -190,7 +200,7 @@ died on: many of these never reach their assertion because a `ListObjects` v1 ca
 | 9 | multipart upload edge cases | mixed, see below |
 | 9 | non-MD5 checksum algorithms (CRC32, SHA-256, CRC64NVME, COMPOSITE) | gap |
 | 8 | anonymous and unsigned access | anti-goal: one key pair, everything signed |
-| 6 | error codes for malformed authorization and date headers | gap |
+| 4 | error codes for malformed authorization and date headers | gap |
 | 3 | `100-continue` and `Expect` | gap |
 | 2 | bulk delete, both failing in setup on a v1 listing | deliberate: v2 only |
 | 2 | request id and usage reporting | anti-goal |
@@ -206,12 +216,12 @@ requests it had been ignoring, which moved tests that had been passing into this
 only worth the numbers it produces, so both are filed here rather than quietly fixed.
 
 By verdict: **488 anti-goals, 47 v1 `ListObjects`, 28 consequences of buckets being prefixes, 24
-conditional writes, 27 named gaps, and 2 artifacts of the suite's own environment.** The gap column
+conditional writes, 25 named gaps, and 2 artifacts of the suite's own environment.** The gap column
 is the one to read — it is the list of things a client might reasonably expect and not get. With
 `UploadPartCopy` implemented it is led by non-MD5 checksums (9) and the multipart edge cases (9, of
-which 3 are `?partNumber` reads). Those three are implemented now; the count stays until the suite is
-re-run. Then the error codes for malformed authorization headers (6) and
-`100-continue` (3). Nothing in the copy family is a gap any more.
+which 3 are `?partNumber` reads that still fail: an out-of-range part is 416 `InvalidPartNumber`
+where the suite wants 400 `InvalidPart`). Then the remaining authorization/length header cases (4)
+and `100-continue` (3). Nothing in the copy family is a gap any more.
 
 Not one conditional *read* fails. The 24 in the row above are all `If-Match` on a `PUT` or a
 `DELETE`, and they are an exclusion rather than an oversight: a conditional write makes the commit a
@@ -226,23 +236,25 @@ kavo does not do yet, and they are worth naming honestly:
 
 - **`?partNumber` on a read**, which returns one part of a multipart object and the `PartsCount` of
   the whole. Completion records each part's number and size on the manifest, so a GET or HEAD that
-  names one is a range of that window rather than the whole object. The last measured run filed 3
-  tests here; the count stays until the suite is re-run. Objects completed before this was stored
-  have no recoverable boundaries, and are treated as a single PUT: part 1 is the object, any other
-  number is `InvalidPartNumber`.
+  names one is a range of that window rather than the whole object. The three tests still fail on
+  the out-of-range case: part 5 of a 4-part object is 416 `InvalidPartNumber` where the suite wants
+  400 `InvalidPart`. Objects completed before parts were stored have no recoverable boundaries, and
+  are treated as a single PUT: part 1 is the object, any other number is `InvalidPartNumber`.
 - **Non-MD5 checksums** (`x-amz-checksum-crc32`, `-sha1`, `-sha256`, COMPOSITE). CRC32C and CRC64NVME
   on a whole-object PUT and on a multipart upload (FULL_OBJECT) are checked and stored, whether the
   client names them in a header or in an aws-chunked trailer, and a HEAD/GET with
   `x-amz-checksum-mode: ENABLED` returns them. Completing an upload combines the parts' hashes rather
-  than re-reading the object. The last measured run filed nine tests here, including multipart
-  CRC32C and CRC64NVME which are checked now; the count stays until the suite is re-run. What remains
-  unread is SHA-256, COMPOSITE, and every checksum other than CRC32C and CRC64NVME on a multipart
-  upload. Chunks were already CRC32C-checksummed on disk; what was missing was the S3 header naming
-  the *object*.
-- **Error codes for malformed authorization and date headers**, where kavo answers a plausible
-  refusal with the wrong code — a client is told `AccessDenied` where S3 says
-  `MissingSecurityHeader`. Both refuse, so nothing is stored on a bad signature; a client
-  distinguishing the two programmatically gets the wrong answer.
+  than re-reading the object. The nine tests still fail: a PUT of CRC64NVME with the value `bad` is
+  `InvalidDigest` where S3 says `BadDigest`; a multipart complete does not echo `ChecksumAlgorithm`;
+  SHA-256, CRC32, SHA-1 and COMPOSITE are refused. botocore's default CRC32 on every PUT is the
+  same refusal at the scale of a current Python SDK, which is why an unpinned suite run scores 39.
+- **Malformed authorization and date headers.** A signed request with neither `x-amz-date` nor
+  `Date` is `MissingSecurityHeader`. RFC 822 dates, including boto3's `-0000` UTC, are accepted.
+  The four that remain are not wrong codes for a bad signature: `Transfer-Encoding: chunked` without
+  a length is `MissingContentLength` where the suite wants the PUT to succeed; stripping
+  `Content-Length` is accepted where the suite wants 411; emptying or removing `Authorization` in
+  boto3's `before-call` hook is overwritten by the signer, so the PUT succeeds where the suite
+  wants 403.
 
 Three failures are deliberate rather than missing, and each is a case where the suite asks kavo to
 be more forgiving than it is willing to be:
@@ -311,7 +323,8 @@ The three listing failures are anonymous access, the `allow-unordered` extension
 
 The multipart row counts the 25 multipart tests that are not encryption, ACL, versioning, lock,
 policy, logging, tagging, attributes or copy variants. It was 9 of 25 before this round. Its 11
-remaining failures on the last measured run are the 3 `?partNumber` reads (implemented now), 3
+remaining failures are the 3 `?partNumber` reads (416 `InvalidPartNumber` where the suite wants 400
+`InvalidPart`), 3
 conditional writes, 2 lifecycle expiry of an
 abandoned upload, 1 owner reporting, and the 2 deliberate refusals above.
 

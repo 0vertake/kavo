@@ -557,7 +557,7 @@ is encrypted while anyone can read it back without the key. That is the one fail
 cannot detect for itself, and it is worth being explicit that this rule *cost* pass count rather than
 earning it.
 
-External validation: Ceph `s3-tests`. **176 of 886 pass, nothing errors**, and every failure is
+External validation: Ceph `s3-tests`. **178 of 886 pass, nothing errors**, and every failure is
 classified in `docs/s3-compatibility.md` — as an anti-goal, a consequence of buckets being prefixes,
 or a named gap. The suite found four real defects, three of which kavo's own tests could not see;
 they are listed there too. It also found two sets of passes that were not real. Eighteen came from a
@@ -569,7 +569,8 @@ it to 196; refusing the second set brought it back to 177, and refusing an objec
 which had been answered by overwriting the object — brought it to 169. That this is the number the
 measurement opened with is a coincidence: the same count covered `CopyObject`, conditional reads,
 `Content-MD5`, user metadata and three multipart calls that did not exist at the outset.
-`UploadPartCopy` then took it to **176**, which is the honest figure.
+`UploadPartCopy` then took it to **176**. Accepting RFC 822 `Date` / `x-amz-date` — boto3 writes UTC
+as `-0000`, which Go's `http.ParseTime` rejects — took it to **178**, which is the honest figure.
 
 The third set was the serious one, and the suite did not find it — it was found by copying a 20 MB
 object with the `aws` CLI, which above 8 MB copies by multipart and begins by reading the source's
