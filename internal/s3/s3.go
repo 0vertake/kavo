@@ -118,10 +118,10 @@ func knownObjectQuery(method, name, value string) bool {
 	case "uploadId": // Every multipart call names one, on all four methods.
 		return true
 	case "partNumber":
-		// On a PUT it numbers the part being uploaded. On a GET it asks for one
-		// part of a completed object, which is not implemented — and answering
-		// that with the whole object is the same class of mistake as the above.
-		return method == http.MethodPut
+		// PUT numbers the part being uploaded. GET and HEAD name one part of a
+		// completed object. Answering a read of that with the whole object is
+		// the same class of mistake as the above.
+		return method == http.MethodPut || method == http.MethodGet || method == http.MethodHead
 	case "uploads":
 		return method == http.MethodPost
 	case "max-parts", "part-number-marker":
@@ -554,12 +554,32 @@ func (h *handler) getObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	off, length, err := parseRange(r.Header.Get("Range"), m.Size)
+	baseOff, baseLen := int64(0), m.Size
+	var partsCount int
+	if r.URL.Query().Has("partNumber") {
+		n, err := strconv.Atoi(r.URL.Query().Get("partNumber"))
+		if err != nil || n < 1 || n > cluster.MaxParts {
+			fail(w, r, errBadPartNumber, err)
+			return
+		}
+		off, size, multipart, ok := partWindow(m, n)
+		if !ok {
+			fail(w, r, errInvalidPartNumber, nil)
+			return
+		}
+		baseOff, baseLen = off, size
+		if multipart {
+			partsCount = len(m.Parts)
+		}
+	}
+
+	rel, length, err := parseRange(r.Header.Get("Range"), baseLen)
 	if err != nil {
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", m.Size))
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", baseLen))
 		fail(w, r, errInvalidRange, err)
 		return
 	}
+	off := baseOff + rel
 
 	header := w.Header()
 	validators(header, m)
@@ -578,6 +598,9 @@ func (h *handler) getObject(w http.ResponseWriter, r *http.Request) {
 	}
 	if checksumModeEnabled(r.Header) && m.CRC32C != nil {
 		header.Set("X-Amz-Checksum-Crc32c", encodeCRC32C(*m.CRC32C))
+	}
+	if partsCount > 0 {
+		header.Set("X-Amz-Mp-Parts-Count", strconv.Itoa(partsCount))
 	}
 	status := http.StatusOK
 	if length != m.Size {
@@ -812,6 +835,25 @@ func contentMD5(values []string) (string, error) {
 		return "", fmt.Errorf("s3: Content-MD5 %q decodes to %d bytes, want %d", header, len(sum), md5.Size)
 	}
 	return hex.EncodeToString(sum), nil
+}
+
+// partWindow maps a GET/HEAD partNumber onto a byte range of m.
+//
+// A single PUT has no recorded parts: part 1 is the whole object and any other
+// number does not exist. A completed multipart upload looks the part up by the
+// number the client uploaded, which is not necessarily 1..N, and the offset is
+// the sizes of the parts assembled before it.
+func partWindow(m object.Manifest, n int) (off, size int64, multipart bool, ok bool) {
+	if len(m.Parts) == 0 {
+		return 0, m.Size, false, n == 1
+	}
+	for _, p := range m.Parts {
+		if p.Number == n {
+			return off, p.Size, true, true
+		}
+		off += p.Size
+	}
+	return 0, 0, true, false
 }
 
 // parseRange reads a Range header and returns the window it asks for, defaulting

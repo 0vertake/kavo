@@ -138,7 +138,9 @@ Rules that make these structural:
   `x-amz-checksum-mode: ENABLED`), and user metadata
   (`x-amz-meta-*`, `Cache-Control`, `Content-Disposition`, `Content-Encoding`, `Content-Language`,
   `Expires`, and `x-amz-metadata-directive` on a copy) are in too, being headers on calls that already
-  exist rather than new surface. `ListParts` and `ListMultipartUploads` are in because they are part of
+  exist rather than new surface. GET and HEAD `?partNumber` return one part of a completed multipart
+  object (and `x-amz-mp-parts-count` when it was one), because answering that query with the whole
+  object is the same class of mistake as ignoring `?tagging`. `ListParts` and `ListMultipartUploads` are in because they are part of
   multipart upload, and because both are a `GET` that was being answered by the object handler — a
   client asking which parts had arrived was told `NoSuchKey`. `UploadPartCopy` is in for the same
   reason: above 8 MB the `aws` CLI performs every server-side copy that way, so without it

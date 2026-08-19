@@ -38,6 +38,10 @@ var (
 		"The specified key does not exist."}
 	errInvalidRange = apiError{"InvalidRange", http.StatusRequestedRangeNotSatisfiable,
 		"The requested range is not satisfiable."}
+	errInvalidPartNumber = apiError{"InvalidPartNumber", http.StatusRequestedRangeNotSatisfiable,
+		"The requested part number is not satisfiable."}
+	errBadPartNumber = apiError{"InvalidArgument", http.StatusBadRequest,
+		"partNumber must be an integer between 1 and 10000."}
 	errMalformedRange = apiError{"InvalidArgument", http.StatusBadRequest,
 		"The copy source range is not a byte range this server can read."}
 	errMissingLength = apiError{"MissingContentLength", http.StatusLengthRequired,

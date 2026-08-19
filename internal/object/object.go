@@ -101,6 +101,18 @@ type Manifest struct {
 	// A pointer because 0 is a real checksum (the empty object) and a missing
 	// value is an object written before this was stored.
 	CRC32C *uint32 `json:",omitempty"`
+	// Parts is the completed multipart parts in assembly order, so a GET with
+	// partNumber can return one of them. Empty for a single PUT, and for objects
+	// completed before this was stored — those have no recoverable boundaries.
+	Parts []Part `json:",omitempty"`
+}
+
+// Part is one completed multipart part as stored on the object. Number is the
+// part number the client uploaded, which is not necessarily 1..N, so a GET that
+// names a number has to look it up rather than treat it as an index.
+type Part struct {
+	Number int
+	Size   int64
 }
 
 // Write splits r into chunks of at most chunkSize, hands each to commit, and

@@ -128,6 +128,179 @@ func TestMultipartUploadAssemblesTheObject(t *testing.T) {
 	}
 }
 
+// GET ?partNumber is a ranged read of one completed part, not of the whole object.
+// Answering it with the whole object is the same class of mistake as ignoring
+// ?tagging: the client asked for a piece and was given something else.
+func TestGetObjectByPartNumber(t *testing.T) {
+	client := newGateway(t)
+	const bucket, key, dest = "bucket", "parts.bin", "parts-copy.bin"
+
+	create, err := client.CreateMultipartUpload(t.Context(), &awss3.CreateMultipartUploadInput{
+		Bucket: aws.String(bucket), Key: aws.String(key),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Sparse numbers on purpose: partNumber names the number the client uploaded,
+	// not the index in the assembled object. Completing 1, 3, 7 and then serving
+	// "part 2" as the second body would be the wrong object.
+	type uploaded struct {
+		number int32
+		body   []byte
+	}
+	parts := []uploaded{
+		{1, randBytes(testChunkSize + 11)},
+		{3, randBytes(7)},
+		{7, randBytes(3 * testChunkSize)},
+	}
+	var completed []types.CompletedPart
+	for _, p := range parts {
+		up, err := client.UploadPart(t.Context(), &awss3.UploadPartInput{
+			Bucket:     aws.String(bucket),
+			Key:        aws.String(key),
+			UploadId:   create.UploadId,
+			PartNumber: aws.Int32(p.number),
+			Body:       bytes.NewReader(p.body),
+		})
+		if err != nil {
+			t.Fatalf("upload part %d: %v", p.number, err)
+		}
+		completed = append(completed, types.CompletedPart{ETag: up.ETag, PartNumber: aws.Int32(p.number)})
+	}
+	if _, err := client.CompleteMultipartUpload(t.Context(), &awss3.CompleteMultipartUploadInput{
+		Bucket:          aws.String(bucket),
+		Key:             aws.String(key),
+		UploadId:        create.UploadId,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: completed},
+	}); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	for _, p := range parts {
+		get, err := client.GetObject(t.Context(), &awss3.GetObjectInput{
+			Bucket: aws.String(bucket), Key: aws.String(key), PartNumber: aws.Int32(p.number),
+		})
+		if err != nil {
+			t.Fatalf("get part %d: %v", p.number, err)
+		}
+		got, err := io.ReadAll(get.Body)
+		get.Body.Close()
+		if err != nil {
+			t.Fatalf("read part %d: %v", p.number, err)
+		}
+		if !bytes.Equal(got, p.body) {
+			t.Errorf("part %d is %d bytes, want the %d uploaded", p.number, len(got), len(p.body))
+		}
+		if get.PartsCount == nil || *get.PartsCount != int32(len(parts)) {
+			t.Errorf("part %d PartsCount = %v, want %d", p.number, get.PartsCount, len(parts))
+		}
+		if aws.ToInt64(get.ContentLength) != int64(len(p.body)) {
+			t.Errorf("part %d ContentLength = %v, want %d", p.number, get.ContentLength, len(p.body))
+		}
+	}
+
+	head, err := client.HeadObject(t.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(key), PartNumber: aws.Int32(3),
+	})
+	if err != nil {
+		t.Fatalf("head part 3: %v", err)
+	}
+	if head.PartsCount == nil || *head.PartsCount != 3 {
+		t.Errorf("HEAD PartsCount = %v, want 3", head.PartsCount)
+	}
+	if aws.ToInt64(head.ContentLength) != 7 {
+		t.Errorf("HEAD ContentLength = %v, want the part's 7 bytes", head.ContentLength)
+	}
+
+	if _, err := client.GetObject(t.Context(), &awss3.GetObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(key), PartNumber: aws.Int32(2),
+	}); errorCode(err) != "InvalidPartNumber" {
+		t.Errorf("part 2 (never uploaded) = %v, want InvalidPartNumber", err)
+	}
+	if _, err := client.GetObject(t.Context(), &awss3.GetObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(key), PartNumber: aws.Int32(0),
+	}); errorCode(err) != "InvalidArgument" {
+		t.Errorf("part 0 = %v, want InvalidArgument", err)
+	}
+
+	// A range of a part is a range of that window, not of the object.
+	window, err := client.GetObject(t.Context(), &awss3.GetObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(key),
+		PartNumber: aws.Int32(7), Range: aws.String("bytes=0-2"),
+	})
+	if err != nil {
+		t.Fatalf("ranged part: %v", err)
+	}
+	got, err := io.ReadAll(window.Body)
+	window.Body.Close()
+	if err != nil {
+		t.Fatalf("read ranged part: %v", err)
+	}
+	if !bytes.Equal(got, parts[2].body[:3]) {
+		t.Error("a range of part 7 is not the start of that part")
+	}
+
+	if _, err := client.CopyObject(t.Context(), &awss3.CopyObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(dest),
+		CopySource: aws.String(bucket + "/" + key),
+	}); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	copied, err := client.GetObject(t.Context(), &awss3.GetObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(dest), PartNumber: aws.Int32(3),
+	})
+	if err != nil {
+		t.Fatalf("get copied part: %v", err)
+	}
+	got, err = io.ReadAll(copied.Body)
+	copied.Body.Close()
+	if err != nil {
+		t.Fatalf("read copied part: %v", err)
+	}
+	if !bytes.Equal(got, parts[1].body) {
+		t.Error("a copy did not keep the source's part boundaries")
+	}
+}
+
+// A single PUT is not a multipart object: part 1 is the whole body and there is
+// no PartsCount, because that header is how a client tells the two apart.
+func TestPartNumberOnASinglePut(t *testing.T) {
+	client := newGateway(t)
+	const bucket, key = "bucket", "one.bin"
+	data := randBytes(64)
+
+	if _, err := client.PutObject(t.Context(), &awss3.PutObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(key), Body: bytes.NewReader(data),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	get, err := client.GetObject(t.Context(), &awss3.GetObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(key), PartNumber: aws.Int32(1),
+	})
+	if err != nil {
+		t.Fatalf("part 1 of a PUT: %v", err)
+	}
+	got, err := io.ReadAll(get.Body)
+	get.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Error("part 1 of a single PUT is not the object")
+	}
+	if get.PartsCount != nil {
+		t.Errorf("PartsCount = %v, want absent on a non-multipart object", get.PartsCount)
+	}
+
+	if _, err := client.GetObject(t.Context(), &awss3.GetObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(key), PartNumber: aws.Int32(2),
+	}); errorCode(err) != "InvalidPartNumber" {
+		t.Errorf("part 2 of a PUT = %v, want InvalidPartNumber", err)
+	}
+}
+
 // Real clients send parts concurrently, so they arrive in no particular order and
 // several are in flight at once. The object still has to be the parts in the order
 // the completion names, which is the property a per-upload ordering bug hides

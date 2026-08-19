@@ -685,6 +685,12 @@ held the chunks. Tested by changing membership mid-upload.
 The ETag is the MD5 of the parts' MD5s with the part count after a dash, because that is the value
 clients recompute to check the upload.
 
+**GET `?partNumber` is a range of one completed part.** Completion records each part's number and
+size on the object manifest, because the chunk list does not say where a part ended, and answering
+that query with the whole object is the same class of mistake as ignoring `?tagging`. A HEAD of a
+part carries `x-amz-mp-parts-count`. A single PUT has no recorded parts: part 1 is the object and
+any other number is `InvalidPartNumber`.
+
 **The API answers all of its own calls.** `ListParts` and `ListMultipartUploads` used to be missing,
 which is worse than it sounds: both are a `GET`, so a client asking which parts had arrived was
 answered by the object read handler with `NoSuchKey` — telling a client whose parts are all safely
