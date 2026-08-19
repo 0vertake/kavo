@@ -271,7 +271,8 @@ func (h *handler) uploadPart(w http.ResponseWriter, r *http.Request, id string) 
 		h.copyPart(w, r, id, number, source)
 		return
 	}
-	if r.ContentLength < 0 {
+	// HTTP chunked framing ends with a zero-size chunk, same as object PUT.
+	if r.ContentLength < 0 && !httpChunked(r) {
 		fail(w, r, errMissingLength, nil)
 		return
 	}

@@ -183,8 +183,7 @@ only stays true because the write is refused rather than dropped.
 
 The gaps a client might actually notice are named in
 [`docs/s3-compatibility.md`](docs/s3-compatibility.md) rather than buried: SHA-256, COMPOSITE
-checksums, an out-of-range `?partNumber` answered 416 rather than 400, and HTTP
-`Transfer-Encoding: chunked` without a declared length. CRC32, CRC32C and CRC64NVME on a
+checksums, and an out-of-range `?partNumber` answered 416 rather than 400. CRC32, CRC32C and CRC64NVME on a
 whole-object PUT or a multipart upload are not among them — they are checked, stored, and returned
 on a HEAD/GET that asks. A GET of one completed part (`?partNumber`) works; only a number past the
 last part still fails, and only on the error code.
