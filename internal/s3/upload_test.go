@@ -1146,6 +1146,23 @@ func TestCRC32COnAMultipartUploadIsVerifiedAndReplayed(t *testing.T) {
 		t.Errorf("HEAD checksum type = %q, want FULL_OBJECT", head.ChecksumType)
 	}
 
+	for i, data := range [][]byte{p1, p2} {
+		part, err := client.GetObject(t.Context(), &awss3.GetObjectInput{
+			Bucket: aws.String(bucket), Key: aws.String(key),
+			PartNumber: aws.Int32(int32(i + 1)),
+		})
+		if err != nil {
+			t.Fatalf("get part %d: %v", i+1, err)
+		}
+		part.Body.Close()
+		if got := aws.ToString(part.ChecksumCRC32C); got != crc32cOf(data) {
+			t.Errorf("part %d checksum = %q, want %q", i+1, got, crc32cOf(data))
+		}
+		if part.ChecksumType != types.ChecksumTypeFullObject {
+			t.Errorf("part %d checksum type = %q, want FULL_OBJECT", i+1, part.ChecksumType)
+		}
+	}
+
 	get, err := client.GetObject(t.Context(), &awss3.GetObjectInput{
 		Bucket: aws.String(bucket), Key: aws.String(key),
 	})

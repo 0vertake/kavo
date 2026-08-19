@@ -221,7 +221,20 @@ func (c *Coordinator) CompleteUpload(ctx context.Context, id string, parts []Com
 		sums.Write(raw)
 		final.Chunks = append(final.Chunks, m.Chunks...)
 		final.Size += m.Size
-		final.Parts = append(final.Parts, object.Part{Number: p.Number, Size: m.Size})
+		part := object.Part{Number: p.Number, Size: m.Size}
+		if m.CRC32C != nil {
+			sum := *m.CRC32C
+			part.CRC32C = &sum
+		}
+		if m.CRC32 != nil {
+			sum := *m.CRC32
+			part.CRC32 = &sum
+		}
+		if m.CRC64NVME != nil {
+			sum := *m.CRC64NVME
+			part.CRC64NVME = &sum
+		}
+		final.Parts = append(final.Parts, part)
 		// The object's CRC32C is the concatenation of its parts', combined here
 		// so completion does not re-read the bytes. A part written before this
 		// was stored has none, and then neither does the object.
