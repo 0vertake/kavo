@@ -173,14 +173,6 @@ func (c *Coordinator) fetchShard(ctx context.Context, ref object.ChunkRef, i int
 	return shard, nil
 }
 
-// holdsShard reports whether a node still has its shard of a chunk.
-func (c *Coordinator) holdsShard(ctx context.Context, node string, ref object.ChunkRef, i int, live *membership) (bool, error) {
-	if node == c.self {
-		return c.store.HasChunk(ref.ShardID(i))
-	}
-	return peer.HasChunk(ctx, live.peers[node], ref.ShardID(i))
-}
-
 // restoreShards rebuilds the named shards of a chunk from the nodes that have it
 // and places each on the node that should. Repair and scrubbing pass the same
 // nodes for both, since they put a shard back where it belongs; a rebalance
