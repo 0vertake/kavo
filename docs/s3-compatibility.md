@@ -209,7 +209,8 @@ By verdict: **488 anti-goals, 47 v1 `ListObjects`, 28 consequences of buckets be
 conditional writes, 27 named gaps, and 2 artifacts of the suite's own environment.** The gap column
 is the one to read — it is the list of things a client might reasonably expect and not get. With
 `UploadPartCopy` implemented it is led by non-MD5 checksums (9) and the multipart edge cases (9, of
-which 3 are `?partNumber` reads), then the error codes for malformed authorization headers (6) and
+which 3 are `?partNumber` reads). Those three are implemented now; the count stays until the suite is
+re-run. Then the error codes for malformed authorization headers (6) and
 `100-continue` (3). Nothing in the copy family is a gap any more.
 
 Not one conditional *read* fails. The 24 in the row above are all `If-Match` on a `PUT` or a
@@ -224,10 +225,11 @@ S3 subset, not an S3 clone. The rows marked **gap** are things a client might re
 kavo does not do yet, and they are worth naming honestly:
 
 - **`?partNumber` on a read**, which returns one part of a multipart object and the `PartsCount` of
-  the whole, and the 3 tests that ask for it. The manifest records the object's chunks but not where
-  its parts ended, so answering this means recording part boundaries at completion — a change to what
-  a manifest is, for a feature whose only user is a client parallelising a download it could do with
-  ranges.
+  the whole. Completion records each part's number and size on the manifest, so a GET or HEAD that
+  names one is a range of that window rather than the whole object. The last measured run filed 3
+  tests here; the count stays until the suite is re-run. Objects completed before this was stored
+  have no recoverable boundaries, and are treated as a single PUT: part 1 is the object, any other
+  number is `InvalidPartNumber`.
 - **Non-MD5 checksums** (`x-amz-checksum-crc32`, `-sha1`, `-sha256`, CRC64NVME, COMPOSITE). CRC32C
   on a whole-object PUT and on a multipart upload (FULL_OBJECT) is checked and stored, whether the
   client names it in a header or in an aws-chunked trailer, and a HEAD/GET with
@@ -308,7 +310,8 @@ The three listing failures are anonymous access, the `allow-unordered` extension
 
 The multipart row counts the 25 multipart tests that are not encryption, ACL, versioning, lock,
 policy, logging, tagging, attributes or copy variants. It was 9 of 25 before this round. Its 11
-remaining failures are the 3 `?partNumber` reads, 3 conditional writes, 2 lifecycle expiry of an
+remaining failures on the last measured run are the 3 `?partNumber` reads (implemented now), 3
+conditional writes, 2 lifecycle expiry of an
 abandoned upload, 1 owner reporting, and the 2 deliberate refusals above.
 
 The copy row counts the 23 copy tests that are not encryption, ACL, versioning, tagging, lock,

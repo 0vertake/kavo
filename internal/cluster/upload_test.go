@@ -15,6 +15,7 @@ import (
 
 	"github.com/0vertake/kavo/internal/cluster"
 	"github.com/0vertake/kavo/internal/meta"
+	"github.com/0vertake/kavo/internal/object"
 	"github.com/0vertake/kavo/internal/ring"
 )
 
@@ -179,5 +180,9 @@ func TestCompleteUploadStoresTheObjectsCRC32C(t *testing.T) {
 	}
 	if m.CRC32C == nil || *m.CRC32C != want {
 		t.Errorf("completed CRC32C = %v, want %08x", m.CRC32C, want)
+	}
+	wantParts := []object.Part{{Number: 1, Size: int64(len(p1))}, {Number: 2, Size: int64(len(p2))}}
+	if !slices.Equal(m.Parts, wantParts) {
+		t.Errorf("completed Parts = %+v, want %+v", m.Parts, wantParts)
 	}
 }
