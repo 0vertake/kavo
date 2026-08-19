@@ -7,11 +7,16 @@ package s3_test
 import (
 	"bytes"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
@@ -607,5 +612,56 @@ func TestAnEncodedListingEchoesWhatTheClientSent(t *testing.T) {
 	}
 	if quiet.Contents[0].Owner != nil {
 		t.Error("an owner came back for a listing that did not ask for one")
+	}
+}
+
+// An explicitly empty continuation token is still an explicit value and must be
+// echoed as such. Omitting it turns an empty token into "not provided", which is
+// what Ceph's test catches as a missing field.
+func TestEmptyContinuationTokenIsEchoed(t *testing.T) {
+	client := newGateway(t)
+	put(t, client, "bucket", "a.txt", []byte("x"))
+
+	page, err := client.ListObjectsV2(t.Context(), &awss3.ListObjectsV2Input{
+		Bucket:            aws.String("bucket"),
+		ContinuationToken: aws.String(""),
+	})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if page.ContinuationToken == nil {
+		t.Fatal("an explicit empty continuation token was omitted")
+	}
+	if got := aws.ToString(page.ContinuationToken); got != "" {
+		t.Errorf("ContinuationToken = %q, want empty string", got)
+	}
+}
+
+// Ceph's allow-unordered extension is a v1 ListObjects parameter. kavo does not
+// implement v1, but this invalid parameter combination still has to answer the
+// status/code clients see on S3.
+func TestListObjectsV1AllowUnorderedWithDelimiterIsInvalidArgument(t *testing.T) {
+	_, endpoint := newGatewayURL(t, 3, testChunkSize)
+	req, err := http.NewRequest(http.MethodGet, endpoint+"/bucket?allow-unordered=true&delimiter=%2F", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+	c, err := credentials.NewStaticCredentialsProvider(creds.AccessKey, creds.SecretKey, "").Retrieve(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer := v4.NewSigner(func(o *v4.SignerOptions) { o.DisableURIPathEscaping = true })
+	if err := signer.SignHTTP(t.Context(), c, req, "UNSIGNED-PAYLOAD", "s3", "us-east-1", time.Now()); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d: %s, want 400", resp.StatusCode, body)
 	}
 }
