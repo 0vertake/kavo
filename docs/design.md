@@ -1003,7 +1003,7 @@ implementation disagreeing is the only thing that catches a misreading.
 4. Replication + quorum (read with node down; overhead measured)
 5. Membership + failure detection (etcd leases; bounded detection time)
 6. Automatic repair (rate-limited, resumable). Heal time measured: a node that loses its whole disk
-   is back to full redundancy in 3.19 s at the default 32 MB/s cap, 560 ms uncapped. The cap is per
+   is back to full redundancy in 3.36 s at the default 32 MB/s cap, 430 ms uncapped. The cap is per
    node, so cluster heal bandwidth grows with the cluster while the disturbance per node does not.
 7. Erasure coding as second mode (both modes measured side by side)
 8. Rebalance on join/leave. Measured: a seventh node is seen in 40 ms and converged in 4.6 s, and
