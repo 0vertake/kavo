@@ -1,0 +1,30 @@
+# systemd unit for one kavod node on a multi-host cluster.
+#
+#   sudo install -m755 kavod /usr/local/bin/kavod
+#   sudo cp cluster.env /etc/kavo/cluster.env
+#   sudo cp kavod.service /etc/systemd/system/kavo@.service
+#   sudo systemctl enable --now kavo@n1
+#
+# Set KAVO_NODE=n1 in /etc/kavo/cluster.env, or override:
+#   sudo systemctl edit kavo@n1
+# and set Environment=KAVO_NODE=n1
+
+[Unit]
+Description=kavo node %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/kavo/cluster.env
+Environment=KAVO_NODE=%i
+ExecStart=/usr/local/bin/kavod-node.sh %i /etc/kavo/cluster.env
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+# Chunks live on local disk; create the data dir before first start.
+# RuntimeDirectory is not used because KAVO_N*_DATA may be on a separate volume.
+
+[Install]
+WantedBy=multi-user.target

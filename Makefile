@@ -1,4 +1,4 @@
-.PHONY: build test bench measure demo lint up down etcd clean
+.PHONY: build test bench bench-remote measure demo lint up down etcd clean
 
 build:
 	go build ./...
@@ -14,6 +14,13 @@ test: etcd
 # and what they mean: docs/benchmarks.md.
 bench: etcd
 	go test ./internal/... -run XXX -bench . -timeout 1800s
+
+# Same S3 gateway benchmarks as `make bench`, against a cluster reachable over the
+# network. Set KAVO_BENCH_ENDPOINT (and optionally KAVO_BENCH_KEY/SECRET).
+# Runbook: deploy/README.md
+bench-remote:
+	@test -n "$$KAVO_BENCH_ENDPOINT" || (echo "set KAVO_BENCH_ENDPOINT; see deploy/README.md" && exit 1)
+	go test ./internal/s3 -run XXX -bench . -timeout 1800s
 
 # The cluster-level numbers a benchmark harness cannot express: how long a heal
 # takes, how much a join moves, and what a node's memory does under a

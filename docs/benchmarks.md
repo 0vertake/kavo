@@ -513,8 +513,9 @@ Every figure above was measured with six nodes on one host, so a chunk reaches i
 across a memory copy. The per-chunk round trip that dominates small writes on real hardware is
 missing from all of them, and nothing here should be read as a network measurement.
 
-What running it elsewhere needs is an address rather than a new harness. The S3 benchmarks drive
-whatever cluster `KAVO_BENCH_ENDPOINT` names:
+What running it elsewhere needs is an address rather than a new harness — see
+[`deploy/README.md`](../deploy/README.md) for standing up six nodes on separate hosts. The S3
+benchmarks drive whatever cluster `KAVO_BENCH_ENDPOINT` names:
 
 ```sh
 # On each host: same etcd, same cluster prefix, its own reachable address.
@@ -553,3 +554,19 @@ promised anything about. The large write got five times *slower*, because the sa
 filesystem and network cap bandwidth. Distortion in both directions, from the same layer — so these
 numbers are recorded here as a caution and are not the ones published above. An object store
 benchmarked in Docker Desktop is measuring Docker Desktop.
+
+## Multi-host results
+
+**Not measured yet.** When six nodes run on separate machines with real network between them, record
+a run here: machine types, link speed, `KAVO_BENCH_ENDPOINT`, and the S3 benchmark table (one client
+and eight clients at 4 KB / 1 MB / 64 MB), plus optional `warp` numbers. Use
+`./scripts/bench-remote.sh` or `make bench-remote` after following `deploy/README.md`.
+
+| | one client | 8 clients |
+| --- | --- | --- |
+| PUT 4 KB | — | — |
+| PUT 64 MB | — | — |
+| GET 4 KB | — | — |
+| GET 64 MB | — | — |
+
+Until this table is filled, every number above remains loopback on one host.

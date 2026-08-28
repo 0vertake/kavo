@@ -1,0 +1,24 @@
+# Optional: run etcd on a dedicated host without Docker.
+#
+#   sudo cp etcd.service /etc/systemd/system/kavo-etcd.service
+#   sudo systemctl enable --now kavo-etcd
+#
+# Set ETCD_ADVERTISE to an address every kavod node can reach.
+
+[Unit]
+Description=etcd for kavo
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=ETCD_NAME=kavo-etcd
+Environment=ETCD_DATA_DIR=/var/lib/kavo-etcd
+Environment=ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+Environment=ETCD_ADVERTISE_CLIENT_URLS=http://10.0.0.10:2379
+ExecStart=/usr/local/bin/etcd
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
