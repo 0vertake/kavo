@@ -27,6 +27,7 @@ The count has moved ten times, and three of those moves were downward on purpose
 | 180 | HTTP `Transfer-Encoding: chunked` PUT without a `Content-Length` |
 | 181 | explicit empty `continuation-token` is echoed on ListObjectsV2 |
 | 182 | `allow-unordered` with `delimiter` returns `InvalidArgument` |
+| 182 | confirmed unchanged after per-part checksum on `GET ?partNumber` (#46) |
 
 The last line is the one that matters, and it is covered in "What the suite did not find" below:
 `PUT /key?tagging` was reaching the handler that writes an object and replacing the object with the
@@ -35,12 +36,10 @@ tagging XML. Eight of the passes given back were tests doing exactly that — `t
 kavo succeeded by destroying the object each of them names.
 
 The row after it is the repair. `UploadPartCopy` exists now, so a server-side copy of an object too
-large for the CLI to copy in one call works rather than being refused. Six of the seven are the
-`multipart_copy` family; the seventh is `test_multipart_copy_improper_range`, which wanted a
-malformed range answered 400 where a range that merely does not fit the source is 416 — the first
-says the request cannot be read, the second says something true about the object, and only the
-second is worth retrying. The copy family is down to two failures, a versioned copy and a
-cross-account one, both anti-goals.
+large for the CLI to copy in one call works rather than being refused. Six of the seven in the
+`multipart_copy` family pass, including malformed-range refusal as `InvalidArgument`; the sole
+failure is `test_multipart_copy_versioned`, which needs bucket versioning. The copy family is down
+to two failures, a versioned copy and a cross-account one, both anti-goals.
 
 The line above the subresource row is the second-worst. kavo does not encrypt objects, and it used to *ignore* the
 headers asking it to: a client that sent a customer key was answered `200`, its object stored in
