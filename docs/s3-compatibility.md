@@ -203,7 +203,7 @@ died on: many of these never reach their assertion because a `ListObjects` v1 ca
 | 9 | multipart upload edge cases | mixed, see below |
 | 8 | non-MD5 checksum algorithms (SHA-256, SHA-1, COMPOSITE) | gap |
 | 8 | anonymous and unsigned access | anti-goal: one key pair, everything signed |
-| 3 | error codes for malformed authorization and date headers | gap |
+| 3 | error codes for malformed authorization and date headers | structural, see below |
 | 3 | `100-continue` and `Expect` | anti-goal / buckets-as-prefixes, see below |
 | 2 | bulk delete, both failing in setup on a v1 listing | deliberate: v2 only |
 | 2 | request id and usage reporting | anti-goal |
@@ -218,13 +218,13 @@ that catches encryption tests was found to match `enc_` and not `enc[`, so the p
 requests it had been ignoring, which moved tests that had been passing into this row. A classifier is
 only worth the numbers it produces, so both are filed here rather than quietly fixed.
 
-By verdict: **491 anti-goals / structural, 47 v1 `ListObjects`, 28 consequences of buckets being prefixes, 24
-conditional writes, 20 named gaps, and 2 artifacts of the suite's own environment.** The gap column
+By verdict: **494 anti-goals / structural, 47 v1 `ListObjects`, 28 consequences of buckets being prefixes, 24
+conditional writes, 17 named gaps, and 2 artifacts of the suite's own environment.** The gap column
 is the one to read — it is the list of things a client might reasonably expect and not get. With
 `UploadPartCopy` implemented it is led by non-MD5 checksums (8) and the multipart edge cases (9, of
 which 3 are `?partNumber` reads that still fail: an out-of-range part is 416 `InvalidPartNumber`
-where the suite wants 400 `InvalidPart`). Then the remaining authorization/length header cases (2)
-Nothing in the copy family or the `100-continue` family is a gap any more.
+where the suite wants 400 `InvalidPart`). The three authorization/length header cases below are
+structural too — boto3 or urllib3 rewrite the request before it reaches the wire.
 
 Not one conditional *read* fails. The 24 in the row above are all `If-Match` on a `PUT` or a
 `DELETE`, and they are an exclusion rather than an oversight: a conditional write makes the commit a
@@ -253,19 +253,17 @@ kavo does not do yet, and they are worth naming honestly:
   this row: SHA-256, SHA-1, COMPOSITE, and the CRC multipart helpers that then ask
   `GetObjectAttributes`. An unpinned boto3 PUT no longer fails for naming CRC32 (39 before that
   algorithm was checked).
-- **Malformed authorization and date headers.** A signed request with neither `x-amz-date` nor
-  `Date` is `MissingSecurityHeader`. RFC 822 dates, including boto3's `-0000` UTC, are accepted.
-  HTTP `Transfer-Encoding: chunked` without a declared `Content-Length` is accepted: the last
-  zero-size chunk is a defined end, and refusing it would break any HTTP/1.1 client that
-  falls back to chunked encoding when it cannot know the length up front.
-  Two remain: stripping `Content-Length` at the Python layer causes urllib3 to fall back to
-  chunked encoding, so the request arrives on the wire as valid chunked and is accepted rather
-  than returning 411; emptying or removing `Authorization` in boto3's `before-call` hook is
-  overwritten by the signer, so the PUT succeeds where the suite wants 403.
 - **`100-continue` and `Expect`.** `test_bucket_create_bad_contentlength_none` passes. The other
   two are structural: `test_100_continue` requires `PutBucketAcl` with `public-read-write`
   (anti-goal); `test_100_continue_error_retry` expects a PUT to a non-existent bucket to return
   404, but kavo treats buckets as prefixes so the write succeeds.
+
+The authorization/length header family (3 tests) is structural, not a gap. A signed request with
+neither `x-amz-date` nor `Date` is already `MissingSecurityHeader`; RFC 822 dates are accepted.
+What still fails: stripping `Content-Length` in Python makes urllib3 send chunked encoding (valid
+on the wire, so not 411); emptying or removing `Authorization` in a boto3 hook is overwritten by
+the signer before the request leaves the client. kavo's own tests cover the server side with raw
+HTTP (`TestMissingDateHeaderIsRefused`, `TestAuthErrors`).
 
 Three failures are deliberate rather than missing, and each is a case where the suite asks kavo to
 be more forgiving than it is willing to be:

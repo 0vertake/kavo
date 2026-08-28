@@ -1011,10 +1011,12 @@ implementation disagreeing is the only thing that catches a misreading.
    after a join is the placement the ring specifies, key for key.
 9. S3 subset + SigV4 (`aws s3 cp` end to end; s3-tests pass count — `docs/s3-compatibility.md`)
 10. Chaos suite in CI (invariants asserted under randomized faults; GitHub Actions runs it long
-    on every push, which is where a fixed heal deadline was caught measuring the keyspace)
+    on every push, which is where a fixed heal deadline was caught measuring the keyspace).
+    Replicated chaos has flaked once on a timing-dependent read; CI retries once before failing.
 11. Benchmarks + README (`docs/benchmarks.md`, including `warp` as an outside client and `make
     measure` for the cluster-level numbers). `make demo` is the recorded kill-and-heal on this
-    host. Still outstanding: separate machines over a real network.
+    host. **Still outstanding:** the same numbers on separate machines over a real network —
+    nothing measured on one laptop with one disk is a headline number.
 
 Milestones 6, 7, 10 are where the project stops being a tutorial — never skip them for API
 surface.
