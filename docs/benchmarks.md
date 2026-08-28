@@ -141,11 +141,11 @@ one node losing its entire disk while the cluster keeps serving, and nobody aski
 
 | repair cap | redundancy restored | effective rate |
 | --- | --- | --- |
-| 32 MB/s (the default) | 3.19 s | 110 MB/s |
-| unlimited | 560 ms | 633 MB/s |
+| 32 MB/s (the default) | 3.36 s | 105 MB/s |
+| unlimited | 430 ms | 814 MB/s |
 
 The node came back with nothing and 352 MB of copies had to be rebuilt (16 objects × 11 copies on
-the lost node). **110 MB/s under a 32 MB/s cap is not a broken limiter** — the cap is per node,
+the lost node). **105 MB/s under a 32 MB/s cap is not a broken limiter** — the cap is per node,
 and each node repairs the objects it is responsible for, so multiple nodes rebuilding at once
 multiply throughput while each one disturbs its own clients by no more than the cap. That is the
 property worth having: heal bandwidth grows with the cluster, and the blast radius per node does not.
@@ -157,7 +157,7 @@ requests on the same disks and the same network.
 The survey pass — checking which copies are still present before deciding what to rebuild — was
 previously one HTTP round trip per chunk copy (HEAD /peer/chunks/{id}). Replacing it with a batched
 POST that asks a node about all of its chunks in one request cut the capped heal time from 9.2 s to
-3.19 s (−65%) and the uncapped time from 1.1 s to 560 ms (−49%). The data movement is unchanged;
+3.36 s (−65%) and the uncapped time from 1.1 s to 430 ms (−49%). The data movement is unchanged;
 the difference is entirely round trips saved.
 
 The same wipe, 4+2, rebuilds by decode. 16 objects of 32 MB, same six-node cluster, the victim's
@@ -166,8 +166,8 @@ disk emptied, repair uncapped:
 | | replicated | coded 4+2 |
 | --- | --- | --- |
 | shards or copies on the lost node | 11 copies / 352 MB | 16 shards / 128 MB |
-| redundancy restored | 560 ms | 530 ms |
-| effective rate | 633 MB/s | 241 MB/s |
+| redundancy restored | 430 ms | 580 ms |
+| effective rate | 814 MB/s | 220 MB/s |
 
 The lost node held fewer bytes under coding — 1.5x stored instead of 3x — and it still took longer
 to come back. A replica is fetched from one peer; a shard is reconstructed from k of them, so the
