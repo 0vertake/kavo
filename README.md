@@ -14,7 +14,7 @@ a chaos suite whose job is to break the guarantees below rather than to demonstr
 The point of this project is not API surface. It is four durability guarantees that hold while nodes
 are being killed, and numbers honest enough to be worth reading.
 
-**Portfolio:** [case study](docs/case-study.md) · [demo walkthrough](docs/demo.md) ·
+**Portfolio:** [CV brief](docs/cv-brief.md) · [case study](docs/case-study.md) · [demo walkthrough](docs/demo.md) ·
 [design](docs/design.md) · [benchmarks](docs/benchmarks.md)
 
 ### Try the demo (≈10 s)
@@ -84,7 +84,7 @@ a healthy one: moving the shards is the expensive part, not the arithmetic.
 
 Three more that are about the cluster rather than a call (`make measure`):
 
-- **A node loses its entire disk: full redundancy is back in 3.4 s** at the default 32 MB/s repair
+- **A node loses its entire disk: full redundancy is back in 3.36 s** at the default 32 MB/s repair
   cap, 430 ms uncapped, rebuilding 1.09 GB of copies. Nobody asks for the repair. The cap is per
   node, so heal bandwidth grows with the cluster while the disturbance to any one node's clients
   does not.
@@ -134,7 +134,7 @@ acknowledge one it cannot make durable.
 ## How compatible is compatible
 
 Ceph's `s3-tests` is the suite S3 implementations are measured against, and nobody here chose what it
-asserts. It has 886 tests and kavo does not implement most of what they cover, on purpose. Of the 613
+asserts. It has 886 tests and kavo does not implement most of what they cover, on purpose. Of the 610
 that fail: **488 are explicit anti-goals** — ACLs, versioning, server-side encryption, object lock,
 bucket policy, lifecycle, logging, CORS, tagging, SigV2, browser form uploads — **47 are v1
 `ListObjects`**, which kavo answers only at v2, and **28 follow from buckets being prefixes** rather
@@ -165,7 +165,9 @@ the honest number — landing exactly where the measurement had started, which i
 distrusting, since the same count covered `CopyObject`, conditional reads, `Content-MD5`, user
 metadata and three multipart calls that did not exist at the outset. Implementing `UploadPartCopy`
 then took it to 176, and accepting RFC 822 dates (boto3's `-0000` UTC) to 178. A malformed CRC64NVME
-is `BadDigest` rather than `InvalidDigest`, which is 179. A pass count rewards a store for answering; only reading the failures tells you what
+is `BadDigest` rather than `InvalidDigest`, which is 179; ListObjectsV2 token echo and
+`allow-unordered` fixes took it to **182** (full history in
+[`docs/s3-compatibility.md`](docs/s3-compatibility.md)). A pass count rewards a store for answering; only reading the failures tells you what
 it answered with.
 
 That last one the suite did not find, and neither did kavo's own tests. It is also what led to the

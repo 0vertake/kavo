@@ -62,7 +62,7 @@ What the numbers are for:
 
 | measurement | result | meaning |
 | --- | --- | --- |
-| Heal after full disk wipe | 3.4 s capped / 430 ms uncapped | repair is rate-limited and automatic |
+| Heal after full disk wipe | 3.36 s capped / 430 ms uncapped | repair is rate-limited and automatic |
 | Seventh node joins | 4.6 s, exact copy count | rebalance matches the ring, key for key |
 | 4 GB streaming GET | 89 MB peak RSS | memory scales with chunk size, not object size |
 
@@ -82,6 +82,7 @@ as independent test oracles · `-race` on every CI test run.
 
 ## Links
 
+- [cv-brief.md](cv-brief.md) — **canonical facts for CV / résumé copy**
 - [README](../README.md) — guarantees table and quick start
 - [design.md](design.md) — full architecture and invariants
 - [benchmarks.md](benchmarks.md) — methodology and what was rejected
