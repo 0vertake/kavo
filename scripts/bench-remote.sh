@@ -16,7 +16,9 @@ envfile=${1:-deploy/cluster.env}
 [[ -f "$envfile" ]] || { echo "missing config: $envfile"; exit 1; }
 
 # shellcheck disable=SC1090
+set -a
 source "$envfile"
+set +a
 
 endpoint=${KAVO_BENCH_ENDPOINT:?set KAVO_BENCH_ENDPOINT in $envfile}
 export KAVO_BENCH_ENDPOINT

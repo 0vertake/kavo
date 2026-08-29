@@ -23,6 +23,8 @@ not API surface. Full design and milestones: `docs/design.md`. Research notes wi
  loses its disk, what a join moves, and a node's peak RSS under a multi-gigabyte object. They print
  rather than assert, so `make test` skips them; writes several GB and takes a few minutes. Results
  in `docs/benchmarks.md`.
+- `make measure-remote` — heal time against an already-running cluster over the network; needs
+ `KAVO_N*_HOST` and `KAVO_WIPE_CMD` (runbook in `deploy/README.md`).
 - `make lint` — `go vet` + `gofmt` check
 - `go test ./test -run TestChaos` — the chaos suite: a concurrent S3 workload against four real
  processes while faults arrive at random, then the four invariants checked against the recorded
