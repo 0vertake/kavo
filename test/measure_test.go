@@ -52,6 +52,8 @@ import (
 var (
 	measure = flag.Bool("measure", false,
 		"run the measurements in measure_test.go, which print numbers rather than asserting them")
+	measureRemote = flag.Bool("measure.remote", false,
+		"run remote measurements against KAVO_N*_HOST (see deploy/README.md)")
 	measureObject = flag.Int64("measure.object", 2<<30,
 		"how large an object the streaming measurement pushes through a node")
 	measureData = flag.Int64("measure.data", 512<<20,

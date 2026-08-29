@@ -1,4 +1,4 @@
-.PHONY: build test bench bench-remote measure demo lint up down etcd clean
+.PHONY: build test bench bench-remote measure measure-remote demo lint up down etcd clean
 
 build:
 	go build ./...
@@ -28,6 +28,13 @@ bench-remote:
 # and this runs them. Writes several GB and takes a few minutes.
 measure: etcd
 	go test ./test -run TestMeasure -measure -v -timeout 3600s
+
+# Heal time over a real network cluster. Set KAVO_N1_HOST … KAVO_N6_* and
+# KAVO_WIPE_CMD (see deploy/README.md). Runbook: ./scripts/measure-remote.sh
+measure-remote:
+	@test -n "$$KAVO_N1_HOST" || (echo "set KAVO_N1_HOST or source deploy/cluster.env; see deploy/README.md" && exit 1)
+	@test -n "$$KAVO_WIPE_CMD" || (echo "set KAVO_WIPE_CMD; see deploy/README.md" && exit 1)
+	go test ./test -run TestMeasureRemote -measure -measure.remote -v -timeout 3600s
 
 # Six nodes on this host, an object, one of its owners killed with SIGKILL, and
 # redundancy coming back on its own — every step checked rather than narrated. Real
