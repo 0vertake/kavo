@@ -2,12 +2,33 @@
 
 [![ci](https://github.com/0vertake/kavo/actions/workflows/ci.yml/badge.svg)](https://github.com/0vertake/kavo/actions/workflows/ci.yml)
 
-A distributed, S3-compatible object store in Go. Symmetric nodes, consistent-hash placement,
+**Go · etcd · SigV4 S3 · chaos testing · `-race` CI**
+
+A distributed, S3-compatible object store. Symmetric nodes, consistent-hash placement,
 quorum replication or Reed–Solomon erasure coding, etcd as the commit point, automatic repair — and
 a chaos suite whose job is to break the guarantees below rather than to demonstrate them.
 
+> **Chaos (45 min):** 51,623 acknowledged writes, 40 injected faults (including a wipe of 40,274
+> chunks), 43,329 survivors re-read byte-identical — zero loss.
+
 The point of this project is not API surface. It is four durability guarantees that hold while nodes
 are being killed, and numbers honest enough to be worth reading.
+
+**Portfolio:** [case study](docs/case-study.md) · [demo walkthrough](docs/demo.md) ·
+[design](docs/design.md) · [benchmarks](docs/benchmarks.md)
+
+### Try the demo (≈10 s)
+
+Needs `aws` and Docker (for etcd). Six **processes** on this host — not containers — so fsync means
+what it says:
+
+```sh
+make etcd          # once
+SIZE=1 make demo   # store object → SIGKILL an owner → redundancy returns (~7 s)
+```
+
+Full transcript: [`docs/demo-transcript.txt`](docs/demo-transcript.txt). Recording instructions:
+[`docs/demo.md`](docs/demo.md).
 
 ## The guarantees
 
@@ -63,8 +84,8 @@ a healthy one: moving the shards is the expensive part, not the arithmetic.
 
 Three more that are about the cluster rather than a call (`make measure`):
 
-- **A node loses its entire disk: full redundancy is back in 9.2 s** at the default 32 MB/s repair
-  cap, 1.1 s uncapped, rebuilding 1.09 GB of copies. Nobody asks for the repair. The cap is per
+- **A node loses its entire disk: full redundancy is back in 3.4 s** at the default 32 MB/s repair
+  cap, 430 ms uncapped, rebuilding 1.09 GB of copies. Nobody asks for the repair. The cap is per
   node, so heal bandwidth grows with the cluster while the disturbance to any one node's clients
   does not.
 - **A seventh node joins and converges in 4.6 s**, and the 34 copies of 192 that move onto it are
@@ -122,7 +143,7 @@ need arguing for rather than adding. **24 are named gaps**, led by SHA-256 and C
 checksums, and by `?partNumber` out of range answering 416 where S3 says 400. Two
 are artifacts of the suite's own environment.
 
-With that framing: **179 pass, 613 fail, 94 the suite skips, and nothing errors** — every test
+With that framing: **182 pass, 610 fail, 94 the suite skips, and nothing errors** — every test
 reaches a verdict rather than dying in setup, and every failure is accounted for in
 [`docs/s3-compatibility.md`](docs/s3-compatibility.md), which generates its breakdown from the
 suite's own output so it can be checked rather than believed. Of the tests covering the operations

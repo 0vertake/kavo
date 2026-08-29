@@ -3,5 +3,7 @@ bin/
 *.out
 *.prof
 .DS_Store
+__pycache__/
+*.pyc
 /data/
 deploy/cluster.env
