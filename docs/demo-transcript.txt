@@ -1,0 +1,27 @@
+ Container kavo-etcd Running 
+ Container kavo-etcd Waiting 
+ Container kavo-etcd Healthy 
+
+Starting 6 nodes
+✓ 6 nodes, each seeing all 6
+
+Storing a 1MB object
+✓ stored, md5 ea453e682763d0a37a6de07dbe320a0f
+→ the manifest places it on: n2 n1 n3
+→ the nodes holding its first chunk: n1 n2 n3
+✓ reads back byte-identical
+
+Killing an owner with SIGKILL, mid-read
+✓ the read that was in flight finished anyway
+✓ n2 is gone (no shutdown, no flush, no goodbye to etcd)
+✓ the cluster noticed: 5 members, by lease expiry alone
+✓ still reads back byte-identical, from the copies that remain
+→ the nodes holding its first chunk now: n1 n3
+
+Waiting for redundancy to come back
+✓ back to 3 copies after 1s, on n1 n3 n4
+→ the copies are back; the placement follows, since a move commits last
+✓ the manifest now places it on n1 n3 n4, every one of them alive (0s later)
+✓ and it is still the object that was stored, md5 ea453e682763d0a37a6de07dbe320a0f
+
+Nothing was lost, nothing was corrupted, and nobody was asked to intervene.
