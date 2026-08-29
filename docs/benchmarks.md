@@ -562,11 +562,15 @@ a run here: machine types, link speed, `KAVO_BENCH_ENDPOINT`, and the S3 benchma
 and eight clients at 4 KB / 1 MB / 64 MB), plus optional `warp` numbers. Use
 `./scripts/bench-remote.sh` or `make bench-remote` after following `deploy/README.md`.
 
+For heal time over the network, run `./scripts/measure-remote.sh` (or `make measure-remote`) and
+record the printed duration here too — repair rate follows however the nodes were started.
+
 | | one client | 8 clients |
 | --- | --- | --- |
 | PUT 4 KB | — | — |
 | PUT 64 MB | — | — |
 | GET 4 KB | — | — |
 | GET 64 MB | — | — |
+| Heal (512 MB lost, n6 wiped) | — | — |
 
 Until this table is filled, every number above remains loopback on one host.

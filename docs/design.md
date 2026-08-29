@@ -909,7 +909,8 @@ implementation disagreeing is the only thing that catches a misreading.
 - **Benchmarks** (milestone 11): in-repo benchmarks cover both APIs, both redundancy modes, repair,
   scrub and listing — what they measured, what it changed, and what it deliberately did not, is in
   `docs/benchmarks.md`. MinIO `warp` is there too, as an outside client. Multi-host deployment
-  and `make bench-remote` are in `deploy/README.md`. Still outstanding: measured numbers in the
+  and `make bench-remote` are in `deploy/README.md`. Remote heal measurement:
+  `make measure-remote`, `scripts/measure-remote.sh`. Still outstanding: measured numbers in the
   multi-host results table — nothing on one laptop with one disk is a headline number.
 
 ## Known limitations (publish these)
@@ -1015,9 +1016,10 @@ implementation disagreeing is the only thing that catches a misreading.
     Replicated chaos has flaked once on a timing-dependent read; CI retries once before failing.
 11. Benchmarks + README (`docs/benchmarks.md`, including `warp` as an outside client and `make
     measure` for the cluster-level numbers). `make demo` is the recorded kill-and-heal on this
-    host. Multi-host runbook: `deploy/README.md`, `make bench-remote`, `scripts/bench-remote.sh`.
-    **Still outstanding:** filling the multi-host results table in `docs/benchmarks.md` — the
-    harness exists; the headline numbers need six machines and a real network.
+    host. Multi-host runbook: `deploy/README.md`, `make bench-remote`, `scripts/bench-remote.sh`,
+    `make measure-remote`, `scripts/measure-remote.sh`. **Still outstanding:** filling the
+    multi-host results table in `docs/benchmarks.md` — the harness exists; the headline numbers
+    need six machines and a real network.
 
 Milestones 6, 7, 10 are where the project stops being a tutorial — never skip them for API
 surface.

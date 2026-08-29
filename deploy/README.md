@@ -112,12 +112,57 @@ WARP=1 ./scripts/bench-remote.sh deploy/cluster.env
 
 Record results in the **Multi-host results** section at the end of `docs/benchmarks.md`.
 
+## 7. Heal measurement (remote)
+
+The heal-time number in `docs/benchmarks.md` (`make measure`) starts six local processes and
+wipes a data directory on disk. Over a real network the cluster is already running and the wipe
+must happen on the victim host:
+
+```sh
+# In cluster.env — shell command run on the driver; {id} becomes n1 … n6
+KAVO_WIPE_CMD='rm -rf /var/lib/kavo/{id}/chunks/*/*'
+KAVO_MEASURE_VICTIM=n6
+
+./scripts/measure-remote.sh deploy/cluster.env
+# or, with cluster.env sourced:
+make measure-remote
+```
+
+The measurement writes objects under the `measure-remote/` prefix through the internal API on
+`KAVO_N1_HOST`, counts how many chunks the victim holds, wipes them, and polls repair through
+`POST /peer/chunks/check` until redundancy is back. Repair rate is whatever the nodes were started
+with; for numbers comparable to the unthrottled local run, start every node with `-repair-rate=0`.
+
+Docker dev cluster smoke test (after `make up`):
+
+```sh
+cat > deploy/cluster.env <<'EOF'
+KAVO_ETCD=127.0.0.1:2379
+KAVO_CLUSTER=/kavo
+KAVO_N1_HOST=127.0.0.1
+KAVO_N1_INTERNAL_PORT=8081
+KAVO_N2_HOST=127.0.0.1
+KAVO_N2_INTERNAL_PORT=8082
+KAVO_N3_HOST=127.0.0.1
+KAVO_N3_INTERNAL_PORT=8083
+KAVO_N4_HOST=127.0.0.1
+KAVO_N4_INTERNAL_PORT=8084
+KAVO_N5_HOST=127.0.0.1
+KAVO_N5_INTERNAL_PORT=8085
+KAVO_N6_HOST=127.0.0.1
+KAVO_N6_INTERNAL_PORT=8086
+KAVO_WIPE_CMD='docker exec deploy-{id}-1 sh -c "rm -rf /data/chunks/*/*"'
+KAVO_MEASURE_VICTIM=n6
+EOF
+./scripts/measure-remote.sh deploy/cluster.env
+```
+
 ## What stays local
 
-`make measure` (heal time, join rebalance, streaming RSS) and the internal-API benchmarks in
-`make bench` still start coordinators in the test process. Only the S3 gateway benchmarks — and
-`warp` — can run remote. Heal/join over a real network needs a follow-up harness that drives
-faults on named hosts; that is not wired yet.
+Join rebalance and streaming RSS still need local process control (`make measure`). The internal-API
+benchmarks in `make bench` also start coordinators in the test process. Remote heal and S3 gateway
+benchmarks (`make measure-remote`, `make bench-remote`) run against a cluster reachable over the
+network.
 
 ## Firewall
 
