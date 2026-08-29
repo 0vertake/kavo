@@ -1,14 +1,13 @@
-# Demo walkthrough
+# Demo
 
 The shortest proof that kavo's durability claims are checked, not narrated: six real processes, one
 object, `SIGKILL` to an owner, redundancy returns on its own.
 
-## Record a screen capture (2–3 minutes)
+## Run
 
-**What to show:** terminal only, font large enough to read on a phone.
+Requires Go, Docker (etcd), and the AWS CLI v2.
 
 ```sh
-# Prerequisites: Go, Docker, aws CLI
 make etcd
 SIZE=1 make demo
 ```
@@ -16,22 +15,7 @@ SIZE=1 make demo
 `SIZE=1` keeps the object at 1 MB so the AWS CLI read-back checks stay reliable on all versions.
 The default 32 MB demo is the same story with more chunks.
 
-**Optional — terminal recording with asciinema** (upload to asciinema.org, embed in README):
-
-```sh
-brew install asciinema   # or apt install asciinema
-asciinema rec kavo-demo.cast -c "cd $(pwd) && SIZE=1 make demo"
-```
-
-**What to say while it runs** (if you narrate):
-
-1. Six kavod nodes join through etcd; object stored with three replicas.
-2. One owner is killed mid-read — no graceful shutdown.
-3. Reads still work from surviving copies.
-4. Repair rebuilds the third copy; the manifest is updated to name only live nodes.
-5. Every step compares digests and asks each node whether it holds the chunk.
-
-A pre-recorded transcript lives in [`demo-transcript.txt`](demo-transcript.txt).
+A recorded transcript: [`demo-transcript.txt`](demo-transcript.txt).
 
 ## What each step checks
 
@@ -49,6 +33,8 @@ distorts fsync timing (see [`benchmarks.md`](benchmarks.md)). etcd alone runs in
 
 ## Troubleshooting
 
-- **`demo needs aws on PATH`** — install the AWS CLI v2.
-- **`demo needs docker`** — `make etcd` starts etcd via Compose.
-- **Download fails with `int too big to convert`** — use `SIZE=1` (some AWS CLI builds on macOS).
+| symptom | fix |
+| --- | --- |
+| `demo needs aws on PATH` | AWS CLI v2 required |
+| `demo needs docker` | `make etcd` starts etcd via Compose |
+| `int too big to convert` on download | use `SIZE=1` (some AWS CLI builds on macOS) |

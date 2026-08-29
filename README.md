@@ -14,21 +14,8 @@ a chaos suite whose job is to break the guarantees below rather than to demonstr
 The point of this project is not API surface. It is four durability guarantees that hold while nodes
 are being killed, and numbers honest enough to be worth reading.
 
-**Portfolio:** [CV brief](docs/cv-brief.md) · [case study](docs/case-study.md) · [demo walkthrough](docs/demo.md) ·
-[design](docs/design.md) · [benchmarks](docs/benchmarks.md)
-
-### Try the demo (≈10 s)
-
-Needs `aws` and Docker (for etcd). Six **processes** on this host — not containers — so fsync means
-what it says:
-
-```sh
-make etcd          # once
-SIZE=1 make demo   # store object → SIGKILL an owner → redundancy returns (~7 s)
-```
-
-Full transcript: [`docs/demo-transcript.txt`](docs/demo-transcript.txt). Recording instructions:
-[`docs/demo.md`](docs/demo.md).
+**Docs:** [project summary](docs/project-summary.md) · [case study](docs/case-study.md) ·
+[demo](docs/demo.md) · [design](docs/design.md) · [benchmarks](docs/benchmarks.md)
 
 ## The guarantees
 
