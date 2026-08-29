@@ -1,8 +1,7 @@
-# kavo — CV brief
+# kavo — project summary
 
-**Canonical facts for résumé / portfolio copy.** Prefer this file over older paragraphs elsewhere
-if numbers disagree — `docs/s3-compatibility.md` and `docs/benchmarks.md` are the other sources of
-truth.
+Canonical facts for external summaries. Prefer this file over older paragraphs elsewhere if numbers
+disagree — `docs/s3-compatibility.md` and `docs/benchmarks.md` are the other sources of truth.
 
 ## Identity
 
@@ -11,7 +10,7 @@ truth.
 | **Name** | kavo |
 | **URL** | https://github.com/0vertake/kavo |
 | **One line** | Distributed, S3-compatible object store in Go with proven durability invariants |
-| **Status** | Complete as a portfolio / research project; not a production deployment |
+| **Status** | Complete as a research project; not a production deployment |
 
 ## Stack
 
@@ -25,7 +24,7 @@ erasure coding (optional) · SigV4 S3 subset · HTTP chunk transfer · chaos tes
 3. Every read returns checksum-valid data or an explicit error — never silent corruption.
 4. After healing completes, redundancy is back to the configured level.
 
-## Proof (use these in CV bullets)
+## Proof
 
 | claim | evidence |
 | --- | --- |
@@ -43,8 +42,8 @@ erasure coding (optional) · SigV4 S3 subset · HTTP chunk transfer · chaos tes
 | 4 GB object streaming | **89 MB** peak node RSS (vs 33 MB for 64 MB object) | flat memory claim |
 
 Benchmark methodology and honest limits: [`benchmarks.md`](benchmarks.md). Multi-host harness exists
-(`make bench-remote`, `make measure-remote`); **multi-host results table not filled** — needs six
-separate machines; Docker on one laptop is explicitly not valid for publication.
+(`make bench-remote`, `make measure-remote`); the multi-host results table is unfilled — it needs
+six separate machines; Docker on one laptop is not valid for publication.
 
 ## S3 compatibility (Ceph s3-tests)
 
@@ -57,39 +56,36 @@ Most failures are **anti-goals** (ACLs, versioning, SSE, lifecycle, etc.) or **d
 Implemented subset includes: PUT/GET/HEAD/DELETE, ListObjectsV2, multipart (+ UploadPartCopy),
 CopyObject, SigV4, conditional reads, CRC32/CRC32C/CRC64NVME on upload, user metadata.
 
-## Anti-goals (do not claim on CV)
+## Out of scope (anti-goals)
 
 IAM, ACLs, versioning, bucket policies, lifecycle, SSE, object lock, CORS, tagging writes, SigV2,
-conditional writes (commit-point change).
+conditional writes (commit-point change). Multi-host network benchmarks are not published until the
+table in `benchmarks.md` is filled from a real six-host run.
 
-## Suggested CV bullets (pick 1–2)
+## Example summary lines
 
-- Built a distributed S3-compatible object store in Go (consistent hashing, quorum replication,
-  Reed–Solomon EC, etcd commit point); proved four durability invariants under randomized faults
-  (51k+ acked writes, zero loss in 45-min chaos run).
+- Distributed S3-compatible object store in Go (consistent hashing, quorum replication, Reed–Solomon
+  EC, etcd commit point); four durability invariants proved under randomized faults (51k+ acked
+  writes, zero loss in a 45-min chaos run).
 
-- Designed commit-point semantics (W fsyncs + etcd manifest before ack); chaos-tested with node
-  kills, disk wipes, and bit rot; `-race` CI on every push.
+- Commit-point semantics (W fsyncs + etcd manifest before ack); chaos-tested with node kills, disk
+  wipes, and bit rot; `-race` CI on every push.
 
 - Measured cluster guarantees: 3.36 s heal after full disk loss, flat memory under 4 GB streaming
-  (89 MB RSS), join rebalance exact to the ring — with methodology and caveats documented.
+  (89 MB RSS), join rebalance exact to the ring — methodology and caveats documented.
 
-## Best docs for an agent to read
+## Related documentation
 
-1. **This file** — canonical numbers
-2. [`case-study.md`](case-study.md) — narrative for portfolio / cover letter
-3. [`../README.md`](../README.md) — guarantees table, demo, benchmark snapshot
-4. [`design.md`](design.md) — architecture and invariants (long)
-5. [`benchmarks.md`](benchmarks.md) — all performance numbers and what was rejected
-6. [`s3-compatibility.md`](s3-compatibility.md) — s3-tests breakdown
+1. [`case-study.md`](case-study.md) — design narrative
+2. [`../README.md`](../README.md) — guarantees table and quick start
+3. [`design.md`](design.md) — architecture and invariants
+4. [`benchmarks.md`](benchmarks.md) — performance numbers and rejected optimisations
+5. [`s3-compatibility.md`](s3-compatibility.md) — s3-tests breakdown
 
-## Commands (for “I built and tested it” claims)
+## Verification commands
 
 ```sh
 make test      # unit + integration + short chaos, -race
-make demo      # kill-and-heal smoke test (needs aws, Docker for etcd)
+make demo      # kill-and-heal smoke test (aws CLI + Docker for etcd)
 make measure   # heal / join / RSS numbers (minutes, writes GB)
 ```
-
-Do **not** claim multi-host network benchmarks unless the table in `benchmarks.md` has been filled
-from a real six-host run.

@@ -9,9 +9,8 @@ test that injects the failure the invariant is about.
 ## Problem
 
 Object stores promise durability, but durability is a property of the **commit point** — the moment
-a client is told the write succeeded. If that moment comes before data is safe, you have acknowledged
-loss. If readers can see data before the commit point, you have torn reads. If repair is best-effort,
-you have silent degradation.
+a client is told the write succeeded. An ack before data is safe is acknowledged loss. Readers that
+see data before the commit point get torn reads. Best-effort repair is silent degradation.
 
 The design question is not "how do I implement S3?" It is "where do I draw the line between
 acknowledged and visible?"
@@ -66,7 +65,7 @@ What the numbers are for:
 | Seventh node joins | 4.6 s, exact copy count | rebalance matches the ring, key for key |
 | 4 GB streaming GET | 89 MB peak RSS | memory scales with chunk size, not object size |
 
-## What I would do in production
+## Production considerations
 
 - Run etcd as a real cluster (three or five nodes), not a single dev instance.
 - Separate the internal API from the S3 port at the network layer — the internal port can delete
@@ -82,9 +81,9 @@ as independent test oracles · `-race` on every CI test run.
 
 ## Links
 
-- [cv-brief.md](cv-brief.md) — **canonical facts for CV / résumé copy**
+- [project-summary.md](project-summary.md) — canonical facts and numbers
 - [README](../README.md) — guarantees table and quick start
 - [design.md](design.md) — full architecture and invariants
 - [benchmarks.md](benchmarks.md) — methodology and what was rejected
-- [demo.md](demo.md) — record the kill-and-heal demo
+- [demo.md](demo.md) — kill-and-heal demo
 - [s3-compatibility.md](s3-compatibility.md) — 182/886 s3-tests, every failure classified
