@@ -1,7 +1,5 @@
 # kavo
 
-[![ci](https://github.com/0vertake/kavo/actions/workflows/ci.yml/badge.svg)](https://github.com/0vertake/kavo/actions/workflows/ci.yml)
-
 **Go · etcd · SigV4 S3 · chaos testing · `-race` CI**
 
 A distributed, S3-compatible object store. Symmetric nodes, consistent-hash placement,
