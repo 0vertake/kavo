@@ -1008,9 +1008,7 @@ implementation disagreeing is the only thing that catches a misreading.
 11. Benchmarks + README (`docs/benchmarks.md`, including `warp` as an outside client and `make
     measure` for the cluster-level numbers). `make demo` is the recorded kill-and-heal on this
     host. Multi-host runbook: `deploy/README.md`, `make bench-remote`, `scripts/bench-remote.sh`,
-    `make measure-remote`, `scripts/measure-remote.sh`. **Still outstanding:** filling the
-    multi-host results table in `docs/benchmarks.md` — the harness exists; the headline numbers
-    need six machines and a real network.
+    `make measure-remote`, `scripts/measure-remote.sh`.
 
 Milestones 6, 7, 10 are where the project stops being a tutorial — never skip them for API
 surface.
